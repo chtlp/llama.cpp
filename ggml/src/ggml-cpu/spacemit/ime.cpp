@@ -1489,6 +1489,9 @@ class tensor_traits_common : public tensor_traits_base {
                 return true;
             case GGML_OP_CONCAT:
                 {
+                    if (spacemit_kernels::rvv::forward_concat_dim0_transposed_f32(params, op)) {
+                        return true;
+                    }
                     const int32_t dim = ggml_get_op_params_i32(op, 0);
                     if (dim == 0 && op->type == op->src[0]->type) {
                         switch (op->src[0]->type) {
@@ -1506,9 +1509,16 @@ class tensor_traits_common : public tensor_traits_base {
                     ggml_compute_forward_concat(params, op);
                 }
                 return true;
-            // TODO For GGML_OP_GATED_DELTA_NET
-            // case GGML_OP_GATED_DELTA_NET:
-            //     return true;
+            case GGML_OP_SSM_CONV:
+                if (!spacemit_kernels::rvv::forward_ssm_conv_f32(params, op)) {
+                    ggml_compute_forward_ssm_conv(params, op);
+                }
+                return true;
+            case GGML_OP_GATED_DELTA_NET:
+                if (!spacemit_kernels::rvv::forward_gated_delta_net_f32(params, op)) {
+                    ggml_compute_forward_gated_delta_net(params, op);
+                }
+                return true;
             default:
                 break;
         }
@@ -2027,7 +2037,8 @@ class extra_buffer_type : ggml::cpu::extra_buffer_type {
             case GGML_OP_SUM_ROWS:
             case GGML_OP_GET_ROWS:
             case GGML_OP_CONCAT:
-                // case GGML_OP_GATED_DELTA_NET:
+            case GGML_OP_SSM_CONV:
+            case GGML_OP_GATED_DELTA_NET:
                 return (ggml::cpu::tensor_traits *) (&ggml::cpu::riscv64_spacemit::rvv_impl);
             case GGML_OP_UNARY:
                 if (ggml_get_unary_op(op) == GGML_UNARY_OP_TANH && op->src[0]->type == GGML_TYPE_F32 &&
