@@ -159,6 +159,24 @@ static bool mmid_m4_enabled() {
     return enabled;
 }
 
+// Debug: GGML_SPACEMIT_RVV_OFF=ADD,MUL,... (ggml_op_name) or ALL routes those ops to the generic CPU path.
+static bool rvv_op_disabled(const ggml_tensor * op) {
+    static const std::vector<bool> off = [] {
+        std::vector<bool> v(GGML_OP_COUNT, false);
+        const char * e = getenv("GGML_SPACEMIT_RVV_OFF");
+        if (!e) {
+            return v;
+        }
+        const std::string s = std::string(",") + e + ",";
+        for (int i = 0; i < GGML_OP_COUNT; i++) {
+            const std::string name = ggml_op_name((ggml_op) i);
+            v[i] = s.find(",ALL,") != std::string::npos || s.find("," + name + ",") != std::string::npos;
+        }
+        return v;
+    }();
+    return off[op->op];
+}
+
 // extra MUL_MAT_ID workspace for the 4-row path: grouped q8 rows, per-expert offsets, group list, per-thread scratch
 static size_t mmid_m4_work_size(int n_threads, const ggml_tensor * op, size_t nbw1) {
     const int64_t n_rows = op->src[2]->ne[0] * op->src[2]->ne[1];  // n_expert_used * n_tokens
@@ -1587,7 +1605,28 @@ static const tensor_traits_common               rvv_impl;
 
 }  // namespace ggml::cpu::riscv64_spacemit
 
+// Debug: GGML_SPACEMIT_REPACK_OFF=q4_1,q8_0,... (ggml_type_name) keeps those weights on the generic CPU path.
+static bool repack_type_disabled(ggml_type type) {
+    static const std::vector<bool> off = [] {
+        std::vector<bool> v(GGML_TYPE_COUNT, false);
+        const char * e = getenv("GGML_SPACEMIT_REPACK_OFF");
+        if (!e) {
+            return v;
+        }
+        const std::string s = std::string(",") + e + ",";
+        for (int i = 0; i < GGML_TYPE_COUNT; i++) {
+            const char * name = ggml_type_name((ggml_type) i);
+            v[i] = name && s.find("," + std::string(name) + ",") != std::string::npos;
+        }
+        return v;
+    }();
+    return off[type];
+}
+
 static const ggml::cpu::tensor_traits * ggml_riscv64_spacemit_get_optimal_repack_type(const ggml_tensor * cur) {
+    if (repack_type_disabled(cur->type)) {
+        return nullptr;
+    }
     switch (cur->type) {
         case GGML_TYPE_Q2_K:
             {
@@ -1712,7 +1751,13 @@ static const ggml::cpu::tensor_traits * ggml_riscv64_spacemit_get_optimal_repack
         case GGML_TYPE_Q5_0:
             {
 #if defined(RISCV64_SPACEMIT_IME2)
-                if (cur->ne[1] % 32 == 0 && (ggml::cpu::riscv64_spacemit::global_spine_env_info.use_ime2)) {
+                // The q5_0 32x32 IME2 path garbles Qwen3.6-35B-A3B (Q5_0 shared experts), so it is
+                // opt-in until fixed: GGML_SPACEMIT_Q5_0_IME=1.
+                static const bool q5_0_ime = [] {
+                    const char * e = getenv("GGML_SPACEMIT_Q5_0_IME");
+                    return e && e[0] == '1';
+                }();
+                if (q5_0_ime && cur->ne[1] % 32 == 0 && (ggml::cpu::riscv64_spacemit::global_spine_env_info.use_ime2)) {
                     return &ggml::cpu::riscv64_spacemit::q5_0_32x32_q8_0;
                 }
 #endif
@@ -1944,6 +1989,9 @@ class extra_buffer_type : ggml::cpu::extra_buffer_type {
     }
 
     ggml::cpu::tensor_traits * get_tensor_traits(const ggml_tensor * op) override {
+        if (op->op != GGML_OP_MUL_MAT && op->op != GGML_OP_MUL_MAT_ID && rvv_op_disabled(op)) {
+            return nullptr;
+        }
         switch (op->op) {
             case GGML_OP_MUL_MAT:
             case GGML_OP_MUL_MAT_ID:
