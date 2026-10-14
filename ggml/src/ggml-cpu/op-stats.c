@@ -152,6 +152,11 @@ static void node_key(const struct ggml_tensor * t, char * buf, size_t n) {
         }
     }
     const char * op = t->op == GGML_OP_UNARY ? ggml_unary_op_name(ggml_get_unary_op(t)) : ggml_op_name(t->op);
+    if ((t->op == GGML_OP_MUL_MAT || t->op == GGML_OP_MUL_MAT_ID) && t->src[0]) {
+        // split matmuls by weight type, e.g. MUL_MAT:ffn_up[q8_0]
+        snprintf(buf, n, "%s:%s[%s]", op, name[0] ? name : "?", ggml_type_name(t->src[0]->type));
+        return;
+    }
     snprintf(buf, n, "%s:%s", op, name[0] ? name : "?");
 }
 
