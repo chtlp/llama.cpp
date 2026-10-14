@@ -518,6 +518,8 @@ function(ggml_add_cpu_backend_variant_impl tag_name)
             list(APPEND GGML_CPU_SOURCES
                 ggml-cpu/spacemit/spacemit_spert_adapter.h
                 ggml-cpu/spacemit/spacemit_spert_adapter.cpp
+                ggml-cpu/op-stats.h
+                ggml-cpu/op-stats.c
                 ggml-cpu/spacemit/ime.cpp
                 ggml-cpu/spacemit/ime.h
                 ggml-cpu/spacemit/spine_mem_pool.cpp
