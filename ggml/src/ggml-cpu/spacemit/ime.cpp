@@ -1536,7 +1536,7 @@ class tensor_traits_common : public tensor_traits_base {
 
         const bool supported_prec  = (dst->op_params[3] == GGML_PREC_F32 || dst->op_params[3] == GGML_PREC_DEFAULT);
         const bool supported_types = (q->type == GGML_TYPE_F32 && k->type == GGML_TYPE_F16 && v->type == GGML_TYPE_F16);
-        const bool supported_shape = (DK > 0 && DK <= 128 && DV > 0 && DV <= 128);
+        const bool supported_shape = (DK > 0 && DK <= 256 && DV > 0 && DV <= 256);
         const bool supported_vlen  = (__riscv_vlenb() == 128);
 
         if (!(supported_prec && supported_types && supported_shape && supported_vlen)) {

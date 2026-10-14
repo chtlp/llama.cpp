@@ -38,8 +38,11 @@ auto align_up(size_t value, size_t alignment) {
     return (value + alignment - 1) / alignment * alignment;
 }
 
+// head dims above vlmax(e16m2) = 128 are processed in 128-wide segments
+static constexpr int64_t FA_VLEN1024_MAX_D = 256;
+
 static inline bool flash_attn_ext_supported_d_vlen1024_vf16(int64_t d) {
-    return d > 0 && d <= 128;
+    return d > 0 && d <= FA_VLEN1024_MAX_D;
 }
 
 static inline bool flash_attn_ext_supported_shape_vlen1024_vf16(int64_t DK, int64_t DV) {
@@ -50,6 +53,82 @@ static inline float reduce_sum_f32m4_vlen1024(vfloat32m4_t v, size_t vl) {
     vfloat32m1_t s_v = __riscv_vfmv_v_f_f32m1(0.0f, 1);
     s_v              = __riscv_vfredusum_vs_f32m4_f32m1(v, s_v, vl);
     return __riscv_vfmv_f_s_f32m1_f32(s_v);
+}
+
+static inline void rvv_fill_f16(_Float16 * dst, float value, int64_t n) {
+    for (int64_t d0 = 0; d0 < n;) {
+        const size_t vl = __riscv_vsetvl_e16m2(n - d0);
+        __riscv_vse16_v_f16m2(dst + d0, __riscv_vfmv_v_f_f16m2((_Float16) value, vl), vl);
+        d0 += vl;
+    }
+}
+
+static inline void rvv_scale_f16(_Float16 * dst, float scale, int64_t n) {
+    for (int64_t d0 = 0; d0 < n;) {
+        const size_t vl = __riscv_vsetvl_e16m2(n - d0);
+        vfloat16m2_t v  = __riscv_vle16_v_f16m2(dst + d0, vl);
+        __riscv_vse16_v_f16m2(dst + d0, __riscv_vfmul_vf_f16m2(v, scale, vl), vl);
+        d0 += vl;
+    }
+}
+
+// acc = acc * ms + vs * v (the multiply by ms is skipped when ms == 1, as in the online-softmax update)
+static inline void rvv_scale_mad_f16(_Float16 * acc, float ms, float vs, const _Float16 * v, int64_t n) {
+    for (int64_t d0 = 0; d0 < n;) {
+        const size_t vl = __riscv_vsetvl_e16m2(n - d0);
+        vfloat16m2_t a  = __riscv_vle16_v_f16m2(acc + d0, vl);
+        if (ms != 1.0f) {
+            a = __riscv_vfmul_vf_f16m2(a, ms, vl);
+        }
+        a = __riscv_vfmacc_vf_f16m2(a, vs, __riscv_vle16_v_f16m2(v + d0, vl), vl);
+        __riscv_vse16_v_f16m2(acc + d0, a, vl);
+        d0 += vl;
+    }
+}
+
+// f16 . f16 with f32 products, reduced per segment
+static inline float rvv_dot_f16_f32(const _Float16 * a, const _Float16 * b, int64_t n) {
+    float s = 0.0f;
+    for (int64_t d0 = 0; d0 < n;) {
+        const size_t       vl = __riscv_vsetvl_e16m2(n - d0);
+        const vfloat32m4_t p =
+            __riscv_vfwmul_vv_f32m4(__riscv_vle16_v_f16m2(a + d0, vl), __riscv_vle16_v_f16m2(b + d0, vl), vl);
+        vfloat32m1_t r = __riscv_vfmv_v_f_f32m1(0.0f, 1);
+        s += __riscv_vfmv_f_s_f32m1_f32(__riscv_vfredusum_vs_f32m4_f32m1(p, r, vl));
+        d0 += vl;
+    }
+    return s;
+}
+
+// dst = VKQ16 / S, after folding in the attention sink (if any)
+static inline void flash_attn_ext_finalize_row_f16(float *          dst,
+                                                   const _Float16 * vkq16,
+                                                   int64_t          dv,
+                                                   float            S,
+                                                   float            M,
+                                                   const float *    sink) {
+    float ms = 1.0f;
+    if (sink) {
+        const float s  = *sink;
+        float       vs = 1.0f;
+        if (s > M) {
+            ms = expf(M - s);
+        } else {
+            vs = expf(s - M);
+        }
+        S = S * ms + vs;
+    }
+    const float S_inv = S == 0.0f ? 0.0f : 1.0f / S;
+
+    for (int64_t d0 = 0; d0 < dv;) {
+        const size_t vl = __riscv_vsetvl_e16m2(dv - d0);
+        vfloat32m4_t v  = __riscv_vfwcvt_f_f_v_f32m4(__riscv_vle16_v_f16m2(vkq16 + d0, vl), vl);
+        if (ms != 1.0f) {
+            v = __riscv_vfmul_vf_f32m4(v, ms, vl);
+        }
+        __riscv_vse32_v_f32m4(dst + d0, __riscv_vfmul_vf_f32m4(v, S_inv, vl), vl);
+        d0 += vl;
+    }
 }
 
 static inline float reduce_sum_f32m2_vlen1024(vfloat32m2_t v, size_t vl) {
@@ -696,20 +775,27 @@ static void flash_attn_ext_f16_one_chunk_inner_vlen1024_vf16_mrow(float **      
                                                                   void *              tcm_buffer,
                                                                   size_t              tcm_buffer_size) {
     GGML_ASSERT(flash_attn_ext_supported_shape_vlen1024_vf16(DK, DV));
-    float S[QLEN] = { 0.0f };       // sum
-    float M[QLEN] = { -INFINITY };  // maximum KQ value
+    float S[QLEN];  // sum
+    float M[QLEN];  // maximum KQ value
+    for (size_t i = 0; i < QLEN; ++i) {
+        S[i] = 0.0f;
+        M[i] = -INFINITY;
+    }
+
+    // rows longer than vlmax(e16m2) = 128 are processed in segments
+    const int64_t seg = (int64_t) __riscv_vsetvlmax_e16m2();
 
     _Float16 *   kq16_buffer          = (_Float16 *) tcm_buffer;
     _Float16 *   qv_buffer            = kq16_buffer + QLEN * DV;
     const size_t qkv_temp_buffer_size = (QLEN * DV + QLEN * DK) * sizeof(_Float16);
     char *       kv_tile_buffer       = (char *) (qv_buffer + QLEN * DK);
 
-    {
-        vfloat16m2_t VKQ16_v = __riscv_vfmv_v_f_f16m2(0.0f, DV);
-        for (int64_t i = 0; i < QLEN; ++i) {
-            __riscv_vse16_v_f16m2(kq16_buffer + i * DV, VKQ16_v, DV);
-            vfloat16m2_t Q_q_v = __riscv_vfncvt_f_f_w_f16m2(__riscv_vle32_v_f32m4(pq[i], DK), DK);
-            __riscv_vse16_v_f16m2(qv_buffer + i * DK, Q_q_v, DK);
+    for (size_t i = 0; i < QLEN; ++i) {
+        rvv_fill_f16(kq16_buffer + i * DV, 0.0f, DV);
+        for (int64_t d0 = 0; d0 < DK; d0 += seg) {
+            const size_t vl = __riscv_vsetvl_e16m2(DK - d0);
+            __riscv_vse16_v_f16m2(qv_buffer + i * DK + d0,
+                                  __riscv_vfncvt_f_f_w_f16m2(__riscv_vle32_v_f32m4(pq[i] + d0, vl), vl), vl);
         }
     }
 
@@ -744,10 +830,18 @@ static void flash_attn_ext_f16_one_chunk_inner_vlen1024_vf16_mrow(float **      
                 const _Float16 * k_data = (const _Float16 *) (k_data_row + ic * nbk1);
                 const _Float16 * v_data = (const _Float16 *) (v_data_row + ic * nbv1);
 
-                const vfloat16m2_t k_data_v = __riscv_vle16_v_f16m2(k_data, DK);
-                const vfloat16m2_t v_data_v = __riscv_vle16_v_f16m2(v_data, DV);
-                __riscv_vsse16_v_f16m2(k_tile_pack + ic_step, k_tile_byte_stride, k_data_v, DK);
-                __riscv_vse16_v_f16m2(v_tile_pack + ic_step * DV, v_data_v, DV);
+                // K tile is stored transposed (d-major), V tile row-major
+                for (int64_t d0 = 0; d0 < DK; d0 += seg) {
+                    const size_t       vl       = __riscv_vsetvl_e16m2(DK - d0);
+                    const vfloat16m2_t k_data_v = __riscv_vle16_v_f16m2(k_data + d0, vl);
+                    __riscv_vsse16_v_f16m2(k_tile_pack + d0 * ic_tile_step + ic_step, k_tile_byte_stride, k_data_v,
+                                           vl);
+                }
+                for (int64_t d0 = 0; d0 < DV; d0 += seg) {
+                    const size_t       vl       = __riscv_vsetvl_e16m2(DV - d0);
+                    const vfloat16m2_t v_data_v = __riscv_vle16_v_f16m2(v_data + d0, vl);
+                    __riscv_vse16_v_f16m2(v_tile_pack + ic_step * DV + d0, v_data_v, vl);
+                }
                 mv_tile_pack[ic_step] = mv;
                 ic_step++;
             }
@@ -797,7 +891,7 @@ static void flash_attn_ext_f16_one_chunk_inner_vlen1024_vf16_mrow(float **      
                     __riscv_vse32_v_f32m2(kq_tile_buffer + 1 * ic_tile_step, qk_acc1, qk_vl);
                 }
 
-                for (int i = 0; i < QLEN; ++i) {
+                for (size_t i = 0; i < QLEN; ++i) {
                     float *     row_ptr = kq_tile_buffer + i * ic_tile_step;
                     const float tile_max =
                         rvv_softcap_add_max_inplace_f32(row_ptr, mv_tile_pack, ic_step, logit_softcap);
@@ -808,52 +902,51 @@ static void flash_attn_ext_f16_one_chunk_inner_vlen1024_vf16_mrow(float **      
                         const float ms = expf(Mold - tile_max);
                         M[i]           = tile_max;
                         S[i] *= ms;
-
-                        vfloat16m2_t VKQ16_v = __riscv_vle16_v_f16m2(kq16_buffer + i * DV, DV);
-                        VKQ16_v              = __riscv_vfmul_vf_f16m2(VKQ16_v, (_Float16) ms, DV);
-                        __riscv_vse16_v_f16m2(kq16_buffer + i * DV, VKQ16_v, DV);
+                        rvv_scale_f16(kq16_buffer + i * DV, ms, DV);
                     }
 
                     S[i] += rvv_softmax_exp_inplace_f32(row_ptr, ic_step, M[i]);
                 }
 
-                if constexpr (QLEN == 4) {
-                    vfloat16m2_t pv_acc0 = __riscv_vle16_v_f16m2(kq16_buffer + 0 * DV, DV);
-                    vfloat16m2_t pv_acc1 = __riscv_vle16_v_f16m2(kq16_buffer + 1 * DV, DV);
-                    vfloat16m2_t pv_acc2 = __riscv_vle16_v_f16m2(kq16_buffer + 2 * DV, DV);
-                    vfloat16m2_t pv_acc3 = __riscv_vle16_v_f16m2(kq16_buffer + 3 * DV, DV);
+                for (int64_t d0 = 0; d0 < DV; d0 += seg) {
+                    const size_t vl = __riscv_vsetvl_e16m2(DV - d0);
+                    if constexpr (QLEN == 4) {
+                        vfloat16m2_t pv_acc0 = __riscv_vle16_v_f16m2(kq16_buffer + 0 * DV + d0, vl);
+                        vfloat16m2_t pv_acc1 = __riscv_vle16_v_f16m2(kq16_buffer + 1 * DV + d0, vl);
+                        vfloat16m2_t pv_acc2 = __riscv_vle16_v_f16m2(kq16_buffer + 2 * DV + d0, vl);
+                        vfloat16m2_t pv_acc3 = __riscv_vle16_v_f16m2(kq16_buffer + 3 * DV + d0, vl);
 
-                    for (int64_t tk = 0; tk < ic_step; ++tk) {
-                        const vfloat16m2_t v16 = __riscv_vle16_v_f16m2(v_tile_pack + tk * DV, DV);
-                        pv_acc0 =
-                            __riscv_vfmacc_vf_f16m2(pv_acc0, (_Float16) kq_tile_buffer[0 * ic_tile_step + tk], v16, DV);
-                        pv_acc1 =
-                            __riscv_vfmacc_vf_f16m2(pv_acc1, (_Float16) kq_tile_buffer[1 * ic_tile_step + tk], v16, DV);
-                        pv_acc2 =
-                            __riscv_vfmacc_vf_f16m2(pv_acc2, (_Float16) kq_tile_buffer[2 * ic_tile_step + tk], v16, DV);
-                        pv_acc3 =
-                            __riscv_vfmacc_vf_f16m2(pv_acc3, (_Float16) kq_tile_buffer[3 * ic_tile_step + tk], v16, DV);
+                        for (int64_t tk = 0; tk < ic_step; ++tk) {
+                            const vfloat16m2_t v16 = __riscv_vle16_v_f16m2(v_tile_pack + tk * DV + d0, vl);
+                            pv_acc0 = __riscv_vfmacc_vf_f16m2(pv_acc0, (_Float16) kq_tile_buffer[0 * ic_tile_step + tk],
+                                                              v16, vl);
+                            pv_acc1 = __riscv_vfmacc_vf_f16m2(pv_acc1, (_Float16) kq_tile_buffer[1 * ic_tile_step + tk],
+                                                              v16, vl);
+                            pv_acc2 = __riscv_vfmacc_vf_f16m2(pv_acc2, (_Float16) kq_tile_buffer[2 * ic_tile_step + tk],
+                                                              v16, vl);
+                            pv_acc3 = __riscv_vfmacc_vf_f16m2(pv_acc3, (_Float16) kq_tile_buffer[3 * ic_tile_step + tk],
+                                                              v16, vl);
+                        }
+
+                        __riscv_vse16_v_f16m2(kq16_buffer + 0 * DV + d0, pv_acc0, vl);
+                        __riscv_vse16_v_f16m2(kq16_buffer + 1 * DV + d0, pv_acc1, vl);
+                        __riscv_vse16_v_f16m2(kq16_buffer + 2 * DV + d0, pv_acc2, vl);
+                        __riscv_vse16_v_f16m2(kq16_buffer + 3 * DV + d0, pv_acc3, vl);
+                    } else {
+                        vfloat16m2_t pv_acc0 = __riscv_vle16_v_f16m2(kq16_buffer + 0 * DV + d0, vl);
+                        vfloat16m2_t pv_acc1 = __riscv_vle16_v_f16m2(kq16_buffer + 1 * DV + d0, vl);
+
+                        for (int64_t tk = 0; tk < ic_step; ++tk) {
+                            const vfloat16m2_t v16 = __riscv_vle16_v_f16m2(v_tile_pack + tk * DV + d0, vl);
+                            pv_acc0 = __riscv_vfmacc_vf_f16m2(pv_acc0, (_Float16) kq_tile_buffer[0 * ic_tile_step + tk],
+                                                              v16, vl);
+                            pv_acc1 = __riscv_vfmacc_vf_f16m2(pv_acc1, (_Float16) kq_tile_buffer[1 * ic_tile_step + tk],
+                                                              v16, vl);
+                        }
+
+                        __riscv_vse16_v_f16m2(kq16_buffer + 0 * DV + d0, pv_acc0, vl);
+                        __riscv_vse16_v_f16m2(kq16_buffer + 1 * DV + d0, pv_acc1, vl);
                     }
-
-                    __riscv_vse16_v_f16m2(kq16_buffer + 0 * DV, pv_acc0, DV);
-                    __riscv_vse16_v_f16m2(kq16_buffer + 1 * DV, pv_acc1, DV);
-                    __riscv_vse16_v_f16m2(kq16_buffer + 2 * DV, pv_acc2, DV);
-                    __riscv_vse16_v_f16m2(kq16_buffer + 3 * DV, pv_acc3, DV);
-                } else {
-                    static_assert(QLEN == 2, "unsupported QLEN");
-                    vfloat16m2_t pv_acc0 = __riscv_vle16_v_f16m2(kq16_buffer + 0 * DV, DV);
-                    vfloat16m2_t pv_acc1 = __riscv_vle16_v_f16m2(kq16_buffer + 1 * DV, DV);
-
-                    for (int64_t tk = 0; tk < ic_step; ++tk) {
-                        const vfloat16m2_t v16 = __riscv_vle16_v_f16m2(v_tile_pack + tk * DV, DV);
-                        pv_acc0 =
-                            __riscv_vfmacc_vf_f16m2(pv_acc0, (_Float16) kq_tile_buffer[0 * ic_tile_step + tk], v16, DV);
-                        pv_acc1 =
-                            __riscv_vfmacc_vf_f16m2(pv_acc1, (_Float16) kq_tile_buffer[1 * ic_tile_step + tk], v16, DV);
-                    }
-
-                    __riscv_vse16_v_f16m2(kq16_buffer + 0 * DV, pv_acc0, DV);
-                    __riscv_vse16_v_f16m2(kq16_buffer + 1 * DV, pv_acc1, DV);
                 }
 
                 ic_step = 0;
@@ -862,25 +955,15 @@ static void flash_attn_ext_f16_one_chunk_inner_vlen1024_vf16_mrow(float **      
     } else {
         for (int64_t ic = 0; ic < nek1; ++ic) {
             const float mv = mp ? slope * ((_Float16 *) mp)[ic] : 0.0f;
-
-            const char * k_data = k_data_row + ic * nbk1;
-            const char * v_data = v_data_row + ic * nbv1;
-
-            vfloat16m2_t k_data_v;
-            vfloat16m2_t v_data_v;
-
-            if (mv != -INFINITY) {
-                k_data_v = __riscv_vle16_v_f16m2((_Float16 *) k_data, DK);
-                v_data_v = __riscv_vle16_v_f16m2((_Float16 *) v_data, DV);
-            } else {
+            if (mv == -INFINITY) {
                 continue;
             }
 
-            for (int i = 0; i < QLEN; ++i) {
-                vfloat16m2_t Q_q_v    = __riscv_vle16_v_f16m2(qv_buffer + i * DK, DK);
-                vfloat32m4_t qk_acc_v = __riscv_vfwmul_vv_f32m4(k_data_v, Q_q_v, DK);
-                float        s        = reduce_sum_f32m4_vlen1024(qk_acc_v, DK);
-                s                     = s * scale;
+            const _Float16 * k_data = (const _Float16 *) (k_data_row + ic * nbk1);
+            const _Float16 * v_data = (const _Float16 *) (v_data_row + ic * nbv1);
+
+            for (size_t i = 0; i < QLEN; ++i) {
+                float s = rvv_dot_f16_f32(k_data, qv_buffer + i * DK, DK) * scale;
                 if (logit_softcap != 0.0f) {
                     s = logit_softcap * tanhf(s);
                 }
@@ -891,53 +974,22 @@ static void flash_attn_ext_f16_one_chunk_inner_vlen1024_vf16_mrow(float **      
                 float ms = 1.0f;  // upon new higher max val, scale VKQ and KQ sum with this value
                 float vs = 1.0f;  // post-softmax KQ value, expf(s - M)
 
-                vfloat16m2_t VKQ16_v = __riscv_vle16_v_f16m2(kq16_buffer + i * DV, DV);
                 if (s > M[i]) {
                     // s is new maximum, ms < 1.0f, vs == expf(s - s) == 1.0f
                     M[i] = s;
                     ms   = expf(Mold - M[i]);
-
-                    // V = V*expf(Mold - M)
-                    VKQ16_v = __riscv_vfmul_vf_f16m2(VKQ16_v, ms, DV);
                 } else {
                     // no new maximum, ms == 1.0f, vs != 1.0f
                     vs = expf(s - M[i]);
                 }
-                VKQ16_v = __riscv_vfmacc_vf_f16m2(VKQ16_v, vs, v_data_v, DV);
-                __riscv_vse16_v_f16m2(kq16_buffer + i * DV, VKQ16_v, DV);
+                rvv_scale_mad_f16(kq16_buffer + i * DV, ms, vs, v_data, DV);
                 S[i] = S[i] * ms + vs;  // scale and increment sum with partial sum
             }
         }
     }
 
-    for (int i = 0; i < QLEN; ++i) {
-        vfloat16m2_t VKQ16_v = __riscv_vle16_v_f16m2(kq16_buffer + i * DV, DV);
-        vfloat32m4_t VKQ32_v = __riscv_vfwcvt_f_f_v_f32m4(VKQ16_v, DV);
-
-        // sinks
-        if (sinks[i]) {
-            const float s = *(sinks[i]);
-
-            float ms = 1.0f;
-            float vs = 1.0f;
-
-            if (s > M[i]) {
-                ms      = expf(M[i] - s);
-                M[i]    = s;
-                VKQ32_v = __riscv_vfmul_vf_f32m4(VKQ32_v, ms, DV);
-            } else {
-                vs = expf(s - M[i]);
-            }
-
-            S[i] = S[i] * ms + vs;
-        }
-
-        // V /= S
-        const float S_inv = S[i] == 0.0f ? 0.0f : 1.0f / S[i];
-
-        VKQ32_v = __riscv_vfmul_vf_f32m4(VKQ32_v, S_inv, DV);
-
-        __riscv_vse32_v_f32m4(dst[i], VKQ32_v, DV);
+    for (size_t i = 0; i < QLEN; ++i) {
+        flash_attn_ext_finalize_row_f16(dst[i], kq16_buffer + i * DV, DV, S[i], M[i], sinks[i]);
     }
 }
 
@@ -960,9 +1012,15 @@ static void flash_attn_ext_f16_one_chunk_inner_vlen1024_vf16_m1(const float *   
     float S = 0.0f;       // sum
     float M = -INFINITY;  // maximum KQ value
 
-    vfloat16m2_t VKQ16_v = __riscv_vfmv_v_f_f16m2(0.0f, DV);
+    _Float16 VKQ16[FA_VLEN1024_MAX_D];
+    _Float16 Q16[FA_VLEN1024_MAX_D];
 
-    vfloat16m2_t Q_q_v = __riscv_vfncvt_f_f_w_f16m2(__riscv_vle32_v_f32m4(pq, DK), DK);
+    const int64_t seg = (int64_t) __riscv_vsetvlmax_e16m2();
+    rvv_fill_f16(VKQ16, 0.0f, DV);
+    for (int64_t d0 = 0; d0 < DK; d0 += seg) {
+        const size_t vl = __riscv_vsetvl_e16m2(DK - d0);
+        __riscv_vse16_v_f16m2(Q16 + d0, __riscv_vfncvt_f_f_w_f16m2(__riscv_vle32_v_f32m4(pq + d0, vl), vl), vl);
+    }
 
     for (int64_t ic = 0; ic < nek1; ++ic) {
         const float mv = mp ? slope * ((_Float16 *) mp)[ic] : 0.0f;
@@ -970,12 +1028,9 @@ static void flash_attn_ext_f16_one_chunk_inner_vlen1024_vf16_m1(const float *   
             continue;
         }
 
-        const char * k_data = k_data_row + ic * nbk1;
+        const _Float16 * k_data = (const _Float16 *) (k_data_row + ic * nbk1);
 
-        vfloat16m2_t k_data_v = __riscv_vle16_v_f16m2((_Float16 *) k_data, DK);
-
-        vfloat32m4_t qk_acc_v = __riscv_vfwmul_vv_f32m4(k_data_v, Q_q_v, DK);
-        float        s        = reduce_sum_f32m4_vlen1024(qk_acc_v, DK);
+        float s = rvv_dot_f16_f32(k_data, Q16, DK);
 
         s = s * scale;  // scale KQ value
 
@@ -990,53 +1045,22 @@ static void flash_attn_ext_f16_one_chunk_inner_vlen1024_vf16_m1(const float *   
         float ms = 1.0f;  // upon new higher max val, scale VKQ and KQ sum with this value
         float vs = 1.0f;  // post-softmax KQ value, expf(s - M)
 
-        const char * v_data = v_data_row + ic * nbv1;
-
-        vfloat16m2_t v_data_v = __riscv_vle16_v_f16m2((_Float16 *) v_data, DV);
-
         if (s > M) {
             // s is new maximum, ms < 1.0f, vs == expf(s - s) == 1.0f
             M  = s;
             ms = expf(Mold - M);
-
-            // V = V*expf(Mold - M)
-            VKQ16_v = __riscv_vfmul_vf_f16m2(VKQ16_v, ms, DV);
         } else {
             // no new maximum, ms == 1.0f, vs != 1.0f
             vs = expf(s - M);
         }
 
-        VKQ16_v = __riscv_vfmacc_vf_f16m2(VKQ16_v, vs, v_data_v, DV);
+        // V = V*expf(Mold - M) + vs*v
+        rvv_scale_mad_f16(VKQ16, ms, vs, (const _Float16 *) (v_data_row + ic * nbv1), DV);
 
         S = S * ms + vs;  // scale and increment sum with partial sum
     }
 
-    vfloat32m4_t VKQ32_v = __riscv_vfwcvt_f_f_v_f32m4(VKQ16_v, DV);
-
-    // sinks
-    if (sinks) {
-        const float s = *sinks;
-
-        float ms = 1.0f;
-        float vs = 1.0f;
-
-        if (s > M) {
-            ms      = expf(M - s);
-            M       = s;
-            VKQ32_v = __riscv_vfmul_vf_f32m4(VKQ32_v, ms, DV);
-        } else {
-            vs = expf(s - M);
-        }
-
-        S = S * ms + vs;
-    }
-
-    // V /= S
-    const float S_inv = S == 0.0f ? 0.0f : 1.0f / S;
-
-    VKQ32_v = __riscv_vfmul_vf_f32m4(VKQ32_v, S_inv, DV);
-
-    __riscv_vse32_v_f32m4(dst, VKQ32_v, DV);
+    flash_attn_ext_finalize_row_f16(dst, VKQ16, DV, S, M, sinks);
 }
 
 }  // namespace
