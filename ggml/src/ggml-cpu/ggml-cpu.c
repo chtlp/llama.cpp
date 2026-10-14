@@ -18,6 +18,7 @@
 
 #ifdef GGML_USE_CPU_RISCV64_SPACEMIT
 #include "spacemit/spacemit_spert_adapter.h"
+#include "op-stats.h"
 #endif
 
 #if defined(_MSC_VER) || defined(__MINGW32__)
@@ -3091,6 +3092,8 @@ static void ggml_graph_compute_spert_kernel(int ith, int nth, void * user_data) 
         /*.use_ref    =*/ cplan->use_ref,
     };
     
+    const bool op_stats = ggml_op_stats_enabled();
+
     // Traverse the entire graph (same logic as ggml_graph_compute_thread)
     for (int node_n = 0; node_n < cgraph->n_nodes; node_n++) {
         struct ggml_tensor * node = cgraph->nodes[node_n];
@@ -3103,6 +3106,9 @@ static void ggml_graph_compute_spert_kernel(int ith, int nth, void * user_data) 
             continue;
         }
         
+        const int     node_first = node_n;
+        const int64_t t_begin    = op_stats ? ggml_op_stats_now_ns() : 0;
+
         // Execute the operator (all ops go through here, including IME-accelerated ones)
         const int n_fused = ggml_cpu_try_fuse_ops(cgraph, node_n, &params, cplan);
         if (n_fused > 0) {
@@ -3110,10 +3116,21 @@ static void ggml_graph_compute_spert_kernel(int ith, int nth, void * user_data) 
         } else {
             ggml_compute_forward(&params, node);
         }
+
+        if (op_stats) {
+            ggml_op_stats_record(ith, node_first, t_begin, ggml_op_stats_now_ns());
+        }
         
         // Sync after each node (replaces ggml_barrier in original threadpool path)
         if (node_n + 1 < cgraph->n_nodes) {
             spacemit_spert_grid_sync();
+        }
+    }
+
+    if (op_stats) {
+        spacemit_spert_grid_sync();
+        if (ith == 0) {
+            ggml_op_stats_graph_done(cgraph, nth);
         }
     }
 }
@@ -3465,11 +3482,17 @@ enum ggml_status ggml_graph_compute(struct ggml_cgraph * cgraph, struct ggml_cpl
         spert_ctx.tp.cplan      = cplan;
         atomic_store_explicit(&spert_ctx.tp.current_chunk, 0, memory_order_relaxed);
 
+        const int64_t t_launch = ggml_op_stats_enabled() ? ggml_op_stats_now_ns() : 0;
+
         int launch_result = spacemit_spert_launch_graph_kernel(
             ggml_graph_compute_spert_kernel,
             &spert_ctx,
             n_tiles
         );
+
+        if (t_launch) {
+            ggml_op_stats_add_launch(cgraph, ggml_op_stats_now_ns() - t_launch);
+        }
 
         clear_numa_thread_affinity();
         return (launch_result == 0) ? GGML_STATUS_SUCCESS : GGML_STATUS_FAILED;
