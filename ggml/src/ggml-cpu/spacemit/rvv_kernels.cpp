@@ -2,12 +2,16 @@
 
 #include "common.h"
 #include "ggml.h"
+#include "op-stats.h"
 #include "ops.h"
 #include "string.h"
 
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <cstdio>
+#include <cstdlib>
+#include <mutex>
 #include <stdexcept>
 
 #if !defined(__riscv_v) || !defined(__riscv_v_intrinsic)
@@ -280,6 +284,33 @@ static void rvv_pack_scaled_f16_as_f32(void *       dst,
             remaining -= vl;
         }
     }
+}
+
+// Classify a tile_rows x n (n <= 128) f16 mask tile without unpacking it:
+// 0 = every entry is -inf (tile can be skipped), 1 = every entry is zero (no mask add needed), 2 = mixed.
+static int rvv_classify_mask_tile_f16(const void * src, int64_t src_row_stride, int64_t tile_rows, int64_t n) {
+    const size_t vl        = __riscv_vsetvl_e16m2(n);
+    vbool8_t     any_finite = __riscv_vmclr_m_b8(vl);
+    vbool8_t     any_nonzero = __riscv_vmclr_m_b8(vl);
+    for (int64_t tq = 0; tq < tile_rows; ++tq) {
+        const _Float16 *   row = (const _Float16 *) ((const char *) src + tq * src_row_stride);
+        const vfloat16m2_t v   = __riscv_vle16_v_f16m2(row, vl);
+        any_finite  = __riscv_vmor_mm_b8(any_finite, __riscv_vmfne_vf_f16m2_b8(v, (_Float16) -INFINITY, vl), vl);
+        any_nonzero = __riscv_vmor_mm_b8(any_nonzero, __riscv_vmfne_vf_f16m2_b8(v, (_Float16) 0.0f, vl), vl);
+    }
+    if (__riscv_vcpop_m_b8(any_finite, vl) == 0) {
+        return 0;
+    }
+    return __riscv_vcpop_m_b8(any_nonzero, vl) == 0 ? 1 : 2;
+}
+
+// GGML_SPACEMIT_FA_FASTMASK=0 restores the original per-element mask scan (for A/B).
+static bool fa_fastmask_enabled() {
+    static const bool enabled = [] {
+        const char * e = getenv("GGML_SPACEMIT_FA_FASTMASK");
+        return !(e && e[0] == '0');
+    }();
+    return enabled;
 }
 
 static void rvv_pack_scaled_f32_as_f32(void *       dst,
@@ -1302,6 +1333,70 @@ void forward_flash_attn_ext_f16_one_chunk_vlen1024_vf16(const ggml_compute_param
     }
 }
 
+// Tiled flash-attention sub-phase stats, enabled with GGML_OP_STATS=1.
+struct alignas(64) fa_tiled_stats {
+    int64_t q_tiles;
+    int64_t pairs;
+    int64_t pairs_skipped;
+    int64_t t_total;
+    int64_t t_qpack;
+    int64_t t_zero;
+    int64_t t_mask;
+    int64_t t_kpack;
+    int64_t t_qk;
+    int64_t t_softmax;
+    int64_t t_vpack;
+    int64_t t_pv;
+    int64_t t_out;
+};
+
+static constexpr int  fa_stats_max_threads = 64;
+static fa_tiled_stats g_fa_stats[fa_stats_max_threads];
+static std::once_flag g_fa_stats_once;
+
+static void fa_stats_dump() {
+    fa_tiled_stats sum = {};
+    int            nth = 0;
+    for (const auto & t : g_fa_stats) {
+        if (t.q_tiles == 0) {
+            continue;
+        }
+        nth++;
+        sum.q_tiles += t.q_tiles;
+        sum.pairs += t.pairs;
+        sum.pairs_skipped += t.pairs_skipped;
+        sum.t_total += t.t_total;
+        sum.t_qpack += t.t_qpack;
+        sum.t_zero += t.t_zero;
+        sum.t_mask += t.t_mask;
+        sum.t_kpack += t.t_kpack;
+        sum.t_qk += t.t_qk;
+        sum.t_softmax += t.t_softmax;
+        sum.t_vpack += t.t_vpack;
+        sum.t_pv += t.t_pv;
+        sum.t_out += t.t_out;
+    }
+    if (nth == 0) {
+        return;
+    }
+    fprintf(stderr, "\n== spacemit tiled FLASH_ATTN_EXT sub-phases: threads=%d q_tiles=%lld pairs=%lld skipped=%lld ==\n",
+            nth, (long long) sum.q_tiles, (long long) sum.pairs, (long long) sum.pairs_skipped);
+    fprintf(stderr, "  %-34s %10.1f ms/thread\n", "total", sum.t_total / 1e6 / nth);
+    auto phase = [&](const char * name, int64_t ns) {
+        fprintf(stderr, "  %-34s %10.1f ms/thread %6.2f%%  %8.2f us/pair\n", name, ns / 1e6 / nth,
+                100.0 * ns / sum.t_total, sum.pairs ? ns / 1e3 / sum.pairs : 0.0);
+    };
+    phase("Q pack (f32->scaled f16)", sum.t_qpack);
+    phase("zero K/V scratch", sum.t_zero);
+    phase("mask pack + skip check", sum.t_mask);
+    phase("K transpose", sum.t_kpack);
+    phase("QK^T (f16 x f16 -> f32)", sum.t_qk);
+    phase("pad/mask add/max/exp", sum.t_softmax);
+    phase("V copy", sum.t_vpack);
+    phase("PV (f32 accumulate)", sum.t_pv);
+    phase("output scale/store", sum.t_out);
+}
+
 void forward_flash_attn_ext_f16_tiled_vlen1024_vf16(const ggml_compute_params * params,
                                                     ggml_tensor *               dst,
                                                     int                         ir0,
@@ -1375,6 +1470,23 @@ void forward_flash_attn_ext_f16_tiled_vlen1024_vf16(const ggml_compute_params * 
     const float m1 = powf(2.0f, -(max_bias / 2.0f) / n_head_log2);
 
     int ith = params->ith;
+
+    const bool       fa_stats = ggml_op_stats_enabled() && ith < fa_stats_max_threads;
+    fa_tiled_stats * fst      = fa_stats ? &g_fa_stats[ith] : nullptr;
+    int64_t          fst_t    = fa_stats ? ggml_op_stats_now_ns() : 0;
+    const int64_t    fst_t0   = fst_t;
+    auto             fst_lap  = [&](int64_t fa_tiled_stats::*field) {
+        if (fa_stats) {
+            const int64_t now = ggml_op_stats_now_ns();
+            fst->*field += now - fst_t;
+            fst_t = now;
+        }
+    };
+    if (fa_stats) {
+        std::call_once(g_fa_stats_once, [] { atexit(fa_stats_dump); });
+    }
+
+    const bool fastmask = fa_fastmask_enabled();
 
     static constexpr int Q_TILE_SZ  = ggml_fa_tile_config::Q;
     static constexpr int KV_TILE_SZ = ggml_fa_tile_config::KV;
@@ -1452,11 +1564,51 @@ void forward_flash_attn_ext_f16_tiled_vlen1024_vf16(const ggml_compute_params * 
             memcpy2d(Q_f32, DK * sizeof(float), pq, nbq1, tile_rows, DK * sizeof(float));
         }
 
+        if (fa_stats) {
+            fst->q_tiles++;
+        }
+        fst_lap(&fa_tiled_stats::t_qpack);
+
         for (int64_t ic = 0; ic < nek1; ic += KV_TILE_SZ) {
             const int kv_tile = (int) std::min((int64_t) KV_TILE_SZ, nek1 - ic);
 
+            bool mask_needed = mask != nullptr;
+
+            if (fastmask) {
+                if (mask) {
+                    const ggml_fp16_t * mp_row =
+                        (const ggml_fp16_t *) ((const char *) mask->data + iq1 * mask->nb[1] +
+                                               (iq2 % mask->ne[2]) * mask->nb[2] + (iq3 % mask->ne[3]) * mask->nb[3]);
+                    const int mask_class = rvv_classify_mask_tile_f16(mp_row + ic, mask->nb[1], tile_rows, kv_tile);
+                    if (mask_class == 0) {
+                        if (fa_stats) {
+                            fst->pairs_skipped++;
+                        }
+                        fst_lap(&fa_tiled_stats::t_mask);
+                        continue;
+                    }
+                    mask_needed = mask_class == 2;
+                    if (mask_needed) {
+                        rvv_pack_scaled_f16_as_f32(mask32, KV_TILE_SZ * sizeof(float), mp_row + ic, mask->nb[1],
+                                                   tile_rows, kv_tile, slope);
+                        for (int tq = 0; tq < tile_rows && kv_tile < KV_TILE_SZ; tq++) {
+                            for (int tk = kv_tile; tk < KV_TILE_SZ; tk++) {
+                                mask32[tq * KV_TILE_SZ + tk] = -INFINITY;
+                            }
+                        }
+                    }
+                }
+                fst_lap(&fa_tiled_stats::t_mask);
+                // only a partial tile reads past kv_tile (PV iterates the full KV_TILE_SZ rows of V)
+                if (kv_tile < KV_TILE_SZ) {
+                    rvv_zero_f32(K_f32, DK * KV_TILE_SZ);
+                    rvv_zero_f32(V32, KV_TILE_SZ * DV);
+                }
+                fst_lap(&fa_tiled_stats::t_zero);
+            } else {
             rvv_zero_f32(K_f32, DK * KV_TILE_SZ);
             rvv_zero_f32(V32, KV_TILE_SZ * DV);
+            fst_lap(&fa_tiled_stats::t_zero);
 
             // skip the tile entirely if all the masks are -inf
             if (mask) {
@@ -1480,14 +1632,24 @@ void forward_flash_attn_ext_f16_tiled_vlen1024_vf16(const ggml_compute_params * 
                 }
 
                 if (can_skip) {
+                    if (fa_stats) {
+                        fst->pairs_skipped++;
+                    }
+                    fst_lap(&fa_tiled_stats::t_mask);
                     continue;
                 }
+            }
+            fst_lap(&fa_tiled_stats::t_mask);
+            }
+            if (fa_stats) {
+                fst->pairs++;
             }
 
             if (kv_type == GGML_TYPE_F16) {
                 rvv_transposed_s16_mn_to_nm((int8_t *) K_f16, KV_TILE_SZ * sizeof(_Float16),
                                             (int8_t *) k->data + ic * nbk1 + ik2 * nbk2 + ik3 * nbk3, nbk1, kv_tile,
                                             DK);
+                fst_lap(&fa_tiled_stats::t_kpack);
 
                 int tq = 0;
                 for (; tq + 3 < tile_rows; tq += 4) {
@@ -1499,6 +1661,7 @@ void forward_flash_attn_ext_f16_tiled_vlen1024_vf16(const ggml_compute_params * 
                 for (; tq < tile_rows; ++tq) {
                     rvv_qk_dot_tile_f16_x1(KQ + tq * KV_TILE_SZ, Q_f16 + tq * DK, K_f16, DK, kv_tile);
                 }
+                fst_lap(&fa_tiled_stats::t_qk);
             } else {
                 for (int tk = 0; tk < kv_tile; tk++) {
                     const char *  k_data = (const char *) k->data + (ic + tk) * nbk1 + ik2 * nbk2 + ik3 * nbk3;
@@ -1527,7 +1690,7 @@ void forward_flash_attn_ext_f16_tiled_vlen1024_vf16(const ggml_compute_params * 
                 rvv_softcap_tanh_inplace_f32(KQ, KV_TILE_SZ, tile_rows, KV_TILE_SZ, logit_softcap);
             }
 
-            if (mask) {
+            if (mask_needed) {
                 rvv_add_inplace_f32(KQ, KV_TILE_SZ, mask32, KV_TILE_SZ, tile_rows, KV_TILE_SZ);
             }
 
@@ -1556,10 +1719,13 @@ void forward_flash_attn_ext_f16_tiled_vlen1024_vf16(const ggml_compute_params * 
                 S[tq] += rvv_softmax_exp_inplace_f32(kq_row, KV_TILE_SZ, Mnew);
             }
 
+            fst_lap(&fa_tiled_stats::t_softmax);
+
             // Pack V as contiguous [KV_TILE_SZ][DV].
             if (kv_type == GGML_TYPE_F16) {
                 const char * v_data = (const char *) v->data + ic * nbv1 + iv2 * nbv2 + iv3 * nbv3;
                 memcpy2d(V_f16, DV * sizeof(_Float16), v_data, nbv1, kv_tile, DV * sizeof(_Float16));
+                fst_lap(&fa_tiled_stats::t_vpack);
 
                 int tq = 0;
                 for (; tq + 3 < tile_rows; tq += 4) {
@@ -1593,6 +1759,7 @@ void forward_flash_attn_ext_f16_tiled_vlen1024_vf16(const ggml_compute_params * 
                     }
                 }
             }
+            fst_lap(&fa_tiled_stats::t_pv);
         }
 
         // sinks (apply only to valid rows in the tile)
@@ -1622,8 +1789,13 @@ void forward_flash_attn_ext_f16_tiled_vlen1024_vf16(const ggml_compute_params * 
 
         float * dst_ptr = (float *) ((char *) dst->data + (iq3 * ne2 * ne1 + iq2 + (iq1) *ne1) * nb1);
         rvv_pack_scaled_f32_as_f32(dst_ptr, nb1 * ne1, VKQ32, DV * sizeof(float), tile_rows, DV, S);
+        fst_lap(&fa_tiled_stats::t_out);
 
         ir += tile_rows;
+    }
+
+    if (fa_stats) {
+        fst->t_total += fst_t - fst_t0;
     }
 }
 
