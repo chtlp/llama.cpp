@@ -25,7 +25,7 @@ void ggml_op_stats_graph_done(const struct ggml_cgraph * cgraph, int nth);
 // called by the launching thread with the wall time of the whole graph launch
 void ggml_op_stats_add_launch(const struct ggml_cgraph * cgraph, int64_t ns);
 
-// n_tokens of the graph being computed (from the "inp_embd" node), -1 if unknown
+// n_tokens of the graph being computed (from the embedding GET_ROWS node), -1 if unknown
 int ggml_op_stats_graph_ntok(const struct ggml_cgraph * cgraph);
 
 #ifdef __cplusplus

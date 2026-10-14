@@ -89,7 +89,7 @@ void ggml_op_stats_record(int ith, int node_n, int64_t t_begin, int64_t t_end) {
 int ggml_op_stats_graph_ntok(const struct ggml_cgraph * cgraph) {
     for (int i = 0; i < cgraph->n_nodes && i < 64; i++) {
         const struct ggml_tensor * t = cgraph->nodes[i];
-        if (strcmp(t->name, "inp_embd") == 0) {
+        if (t->op == GGML_OP_GET_ROWS && (strcmp(t->name, "inp_embd") == 0 || strcmp(t->name, "embd") == 0)) {
             return (int) t->ne[1];
         }
     }
