@@ -132,8 +132,10 @@ struct alignas(64) mmid_phase_stats {
     int64_t t_wcopy;
     int64_t t_agather;
     int64_t t_kernel;
+    int64_t rows_m4;
     int64_t rows_m2;
     int64_t rows_m1;
+    int64_t t_quant4;
     int64_t w_tcm_hit;
     int64_t w_tcm_miss;
     int64_t fast_path;
@@ -147,6 +149,27 @@ struct mmid_route_stats {
     int64_t hist[9];  // rows per active expert: 1, 2-3, 4-7, ..., 128-255, >=256
     int64_t tcm_size;
 };
+
+// Prototype: run MoE expert rows through the 4-row hp kernel (GGML_SPACEMIT_MOE_M4=0 disables).
+static bool mmid_m4_enabled() {
+    static const bool enabled = [] {
+        const char * e = getenv("GGML_SPACEMIT_MOE_M4");
+        return !(e && e[0] == '0');
+    }();
+    return enabled;
+}
+
+// extra MUL_MAT_ID workspace for the 4-row path: grouped q8 rows, per-expert offsets, group list, per-thread scratch
+static size_t mmid_m4_work_size(int n_threads, const ggml_tensor * op, size_t nbw1) {
+    const int64_t n_rows = op->src[2]->ne[0] * op->src[2]->ne[1];  // n_expert_used * n_tokens
+    const int64_t n_as   = op->src[0]->ne[2];
+    size_t        size   = 64;
+    size += GGML_PAD(n_rows * nbw1, 64);
+    size += GGML_PAD(n_as * sizeof(int64_t), 64);
+    size += GGML_PAD((n_rows / 4 + 1) * 2 * sizeof(int32_t) + sizeof(int64_t), 64);
+    size += (size_t) n_threads * GGML_PAD((4 * op->src[1]->ne[0] + 4 * op->src[0]->ne[1]) * sizeof(float), 64);
+    return size;
+}
 
 static constexpr int     mmid_stats_max_threads = 64;
 static mmid_phase_stats  g_mmid_stats[2][mmid_stats_max_threads];
@@ -175,6 +198,8 @@ static void mmid_stats_dump() {
             sum.t_wcopy += t.t_wcopy;
             sum.t_agather += t.t_agather;
             sum.t_kernel += t.t_kernel;
+            sum.rows_m4 += t.rows_m4;
+            sum.t_quant4 += t.t_quant4;
             sum.rows_m2 += t.rows_m2;
             sum.rows_m1 += t.rows_m1;
             sum.w_tcm_hit += t.w_tcm_hit;
@@ -195,17 +220,18 @@ static void mmid_stats_dump() {
         phase("quantize activations", sum.t_quant);
         phase("routing (thread 0 only)", sum.t_route);
         phase("grid sync after routing", sum.t_sync);
+        phase("4-row quantize + sync", sum.t_quant4);
         phase("weight copy to TCM", sum.t_wcopy);
         phase("activation gather to TCM", sum.t_agather);
         phase("gemm kernels", sum.t_kernel);
-        phase("other", sum.t_total - sum.t_quant - sum.t_route - sum.t_sync - sum.t_wcopy - sum.t_agather -
-                           sum.t_kernel);
+        phase("other", sum.t_total - sum.t_quant - sum.t_route - sum.t_sync - sum.t_quant4 - sum.t_wcopy -
+                           sum.t_agather - sum.t_kernel);
         const double kernel_s = sum.t_kernel / 1e9 / nth;
         fprintf(stderr, "  kernel throughput: %.1f GOP/s over %d threads (%.2f GOP/s/thread)\n",
                 kernel_s > 0 ? sum.kernel_flops / 1e9 / kernel_s : 0.0, nth,
                 kernel_s > 0 ? sum.kernel_flops / 1e9 / kernel_s / nth : 0.0);
-        fprintf(stderr, "  rows via m2 kernel: %lld, via m1 kernel: %lld (summed over threads)\n",
-                (long long) sum.rows_m2, (long long) sum.rows_m1);
+        fprintf(stderr, "  rows via m4 kernel: %lld, m2 kernel: %lld, m1 kernel: %lld (summed over threads)\n",
+                (long long) sum.rows_m4, (long long) sum.rows_m2, (long long) sum.rows_m1);
         fprintf(stderr, "  expert weight slice in TCM: %lld, not in TCM: %lld, fast-path calls: %lld\n",
                 (long long) sum.w_tcm_hit, (long long) sum.w_tcm_miss, (long long) sum.fast_path);
         fprintf(stderr, "  active experts/call: %.1f, rows/active expert: %.2f\n",
@@ -225,7 +251,7 @@ class tensor_traits_base : public ggml::cpu::tensor_traits {
 };
 
 template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS> class tensor_traits : public tensor_traits_base {
-    bool work_size(int /* n_threads */, const ggml_tensor * op, size_t & size) override {
+    bool work_size(int n_threads, const ggml_tensor * op, size_t & size) override {
         switch (op->op) {
             case GGML_OP_MUL_MAT:
                 {
@@ -274,6 +300,13 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS> class tensor_
                     size += sizeof_mmid_row_mapping * ne02 * (ne12 + 1) + (ne02 + 1) * sizeof(int64_t);
 
                     size = GGML_PAD(size, sizeof(int64_t));
+
+                    if constexpr (INTER_SIZE == 256 && !std::is_same_v<BLOC_TYPE, block_q2_K> &&
+                                  !std::is_same_v<BLOC_TYPE, block_q3_K>) {
+                        const size_t nbw1 = spacemit_kernels::div_round_up(op->src[1]->ne[0], 256) *
+                                            spacemit_kernels::q8_hp_blk_size(256, true, true);
+                        size += mmid_m4_work_size(n_threads, op, nbw1);
+                    }
 
                     return true;
                 }
@@ -722,7 +755,8 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS> class tensor_
 
         spacemit_kernels::quantize_a_row_def           quantize_a_row_i8;
         spacemit_kernels::gemm_kernel_quantize_def     gemm_kernel;
-        spacemit_kernels::moe_gemm_kernel_quantize_def moe_gemm_kernel_m2;
+        spacemit_kernels::moe_gemm_kernel_quantize_def moe_gemm_kernel_m2 = nullptr;
+        spacemit_kernels::quantize_a_row_def           quantize_a_4row_i8 = nullptr;
         bool                                           set_kernel_impl = false;
         size_t                                         block_stride_a  = spacemit_kernels::q8_blk_size(QK4_0);
 
@@ -740,7 +774,10 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS> class tensor_
                     gemm_kernel       = spacemit_kernels::ime2::gemm_kernel_i8i4_hp;
                     quantize_a_row_i8 = spacemit_kernels::rvv::quantize_a_row_i8_hp;
                     block_stride_a    = spacemit_kernels::q8_hp_blk_size(a_blk_len, true, true);
-                    set_kernel_impl   = true;
+                    if (mmid_m4_enabled()) {
+                        quantize_a_4row_i8 = spacemit_kernels::rvv::quantize_a_4row_i8_hp;
+                    }
+                    set_kernel_impl = true;
                 } else {
                     gemm_kernel        = spacemit_kernels::ime2::gemm_kernel_i8i4;
                     moe_gemm_kernel_m2 = spacemit_kernels::ime2::moe_m2_gemm_kernel_i8i4;
@@ -826,6 +863,25 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS> class tensor_
         int64_t *          valid_matrix_row_counts = (int64_t *) (valid_act_count + 1);
         mmid_row_mapping * matrix_rows             = (mmid_row_mapping *) (valid_matrix_row_counts + n_as);
 
+        // 4-row path workspace (sized by mmid_m4_work_size)
+        const bool use_m4  = quantize_a_4row_i8 != nullptr && ne01 % 32 == 0;
+        const int64_t n_rows_all = (int64_t) n_ids * ids->ne[1];
+        auto align64 = [](uintptr_t p) { return (p + 63) & ~(uintptr_t) 63; };
+        uintptr_t m4_ptr           = align64(reinterpret_cast<uintptr_t>(matrix_rows + n_as * ne12));
+        uint8_t * m4_quant         = reinterpret_cast<uint8_t *>(m4_ptr);
+        m4_ptr                     = align64(m4_ptr + n_rows_all * nbw1);
+        int64_t * m4_expert_offset = reinterpret_cast<int64_t *>(m4_ptr);
+        m4_ptr                     = align64(m4_ptr + n_as * sizeof(int64_t));
+        int64_t * m4_n_groups      = reinterpret_cast<int64_t *>(m4_ptr);
+        int32_t * m4_groups        = reinterpret_cast<int32_t *>(m4_n_groups + 1);  // (expert, first row) pairs
+        m4_ptr                     = align64(m4_ptr + sizeof(int64_t) + (n_rows_all / 4 + 1) * 2 * sizeof(int32_t));
+        const size_t m4_scratch_sz = GGML_PAD((4 * ne10 + 4 * ne01) * sizeof(float), 64);
+        float *      m4_a_f32      = reinterpret_cast<float *>(m4_ptr + ith * m4_scratch_sz);
+        float *      m4_c_tmp      = m4_a_f32 + 4 * ne10;
+        if (use_m4 && ith == 0) {
+            GGML_ASSERT(m4_ptr + nth * m4_scratch_sz <= reinterpret_cast<uintptr_t>(params->wdata) + params->wsize);
+        }
+
         if (ith == 0) {
             // initialize matrix_row_counts
             memset(matrix_row_counts, 0, n_as * sizeof(int64_t));
@@ -856,6 +912,22 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS> class tensor_
             }
             valid_ep_count[0]  = valid_ep_count_t;
             valid_act_count[0] = valid_act_count_t;
+
+            if (use_m4) {
+                int64_t n_groups = 0;
+                int64_t offset   = 0;
+                for (int cur_a = 0; cur_a < n_as; ++cur_a) {
+                    const int64_t cne1 = matrix_row_counts[cur_a];
+                    m4_expert_offset[cur_a] = offset;
+                    for (int64_t r = 0; r + 4 <= cne1; r += 4) {
+                        m4_groups[2 * n_groups + 0] = cur_a;
+                        m4_groups[2 * n_groups + 1] = (int32_t) r;
+                        n_groups++;
+                    }
+                    offset += (cne1 / 4) * 4;
+                }
+                m4_n_groups[0] = n_groups;
+            }
 
             if (op_stats) {
                 mmid_route_stats & r = g_mmid_route[st_kind];
@@ -890,6 +962,22 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS> class tensor_
         spacemit_spert_grid_sync();
 
         st_lap(op_stats ? st->t_sync : st_t);
+
+        if (use_m4 && m4_n_groups[0] > 0) {
+            const int64_t n_groups = m4_n_groups[0];
+            for (int64_t gi = ith; gi < n_groups; gi += nth) {
+                const int     cur_a = m4_groups[2 * gi + 0];
+                const int64_t r0    = m4_groups[2 * gi + 1];
+                for (int r = 0; r < 4; ++r) {
+                    const mmid_row_mapping rm = MMID_MATRIX_ROW(cur_a, r0 + r);
+                    const float * src = (const float *) ((const char *) src1->data + (rm.i1 % ne11) * nb11 + rm.i2 * nb12);
+                    memcpy(m4_a_f32 + r * ne10, src, ne10 * sizeof(float));
+                }
+                quantize_a_4row_i8(a_blk_len, m4_a_f32, ne10, m4_quant + (m4_expert_offset[cur_a] + r0) * nbw1);
+            }
+            spacemit_spert_grid_sync();
+            st_lap(op_stats ? st->t_quant4 : st_t);
+        }
 
         const size_t row_stride_b      = b_k_blks * get_repacked_block_type_size<BLOC_TYPE, INTER_SIZE, NB_COLS>();
         const size_t expert_b_stride   = ne01 * row_stride_b;
@@ -1030,6 +1118,23 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS> class tensor_
                 }
 
                 int ir1 = src1_cur_start;
+
+                const int64_t n_cols = src0_cur_end - src0_cur_start;
+                if (use_m4 && n_cols % 32 == 0 && cne1 >= 4) {
+                    const uint8_t * a_grp = m4_quant + m4_expert_offset[cur_a] * nbw1;
+                    for (; ir1 + 4 <= src1_cur_end; ir1 += 4, a_grp += 4 * nbw1) {
+                        gemm_kernel(b_blk_len, a_grp, src0_cur, b_col_zp, m4_c_tmp, 4, n_cols, b_k_blks, n_cols);
+                        for (int r = 0; r < 4; ++r) {
+                            const mmid_row_mapping rm = MMID_MATRIX_ROW(cur_a, ir1 + r);
+                            float * dst_row = (float *) ((char *) dst->data + (rm.i1 * nb1 + rm.i2 * nb2)) + src0_cur_start;
+                            memcpy(dst_row, m4_c_tmp + r * n_cols, n_cols * sizeof(float));
+                        }
+                    }
+                    if (op_stats) {
+                        st->rows_m4 += (cne1 / 4) * 4;
+                    }
+                    st_lap(op_stats ? st->t_kernel : st_t);
+                }
 
                 if (extra_tcm_buffer_size >= nbw1 && extra_tcm_buffer != nullptr) {
                     int64_t quant_a_tile_size = extra_tcm_buffer_size / nbw1;
