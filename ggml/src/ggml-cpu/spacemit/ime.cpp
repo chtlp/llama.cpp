@@ -1307,7 +1307,9 @@ class tensor_traits_common : public tensor_traits_base {
                     // Decode path: n_kv_chunks = n_tasks (one chunk per thread)
                     // Per-thread: VKQ accmulator (DV), partial M, partial S + intra-thread scratch for V, Q and VKQ
                     size_t n_chunks = n_tasks;
-                    size_t decode   = sizeof(float) * (neq2 * n_chunks * (2 + DV) + n_tasks * (DK + 2 * DV));
+                    // split-KV partials cover up to 4 query tokens (see FA_SPLIT_KV_MAX_Q)
+                    const size_t n_q = (size_t) std::min<int64_t>(op->src[0]->ne[1], 4);
+                    size_t decode    = sizeof(float) * (n_q * neq2 * n_chunks * (2 + DV) + n_tasks * (DK + 2 * DV));
 
                     size = MAX(prefill, decode);
                 }
@@ -1587,6 +1589,21 @@ class tensor_traits_common : public tensor_traits_base {
         const int n_split = (split_kv && !use_tiled && tcm_buf != nullptr) ?
                                 spacemit_kernels::rvv::flash_attn_ext_f16_split_kv_chunks_vlen1024_vf16(dst, nth) :
                                 0;
+        // GGML_SPACEMIT_FA_DEBUG=N: log the path taken by the first N small-batch FA calls (thread 0)
+        static const int fa_debug = [] {
+            const char * e = getenv("GGML_SPACEMIT_FA_DEBUG");
+            return e ? atoi(e) : 0;
+        }();
+        static std::atomic<int> fa_debug_count{ 0 };
+        if (fa_debug > 0 && ith == 0 && !use_tiled && fa_debug_count.fetch_add(1) < fa_debug) {
+            const ggml_tensor * m = dst->src[3];
+            GGML_LOG_INFO("spacemit FA: q=[%lld,%lld,%lld,%lld] k=[%lld,%lld,%lld,%lld] mask=[%lld,%lld,%lld,%lld] "
+                          "split=%d tcm=%p\n",
+                          (long long) q->ne[0], (long long) q->ne[1], (long long) q->ne[2], (long long) q->ne[3],
+                          (long long) k->ne[0], (long long) k->ne[1], (long long) k->ne[2], (long long) k->ne[3],
+                          (long long) (m ? m->ne[0] : 0), (long long) (m ? m->ne[1] : 0),
+                          (long long) (m ? m->ne[2] : 0), (long long) (m ? m->ne[3] : 0), n_split, tcm_buf);
+        }
         if (n_split > 0) {
             float * partials = (float *) params->wdata;
             spacemit_kernels::rvv::forward_flash_attn_ext_f16_split_kv_partial_vlen1024_vf16(params, dst, n_split,
