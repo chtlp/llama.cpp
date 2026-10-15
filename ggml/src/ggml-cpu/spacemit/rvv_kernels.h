@@ -107,9 +107,10 @@ void forward_glu_geglu_f32(ggml_compute_params * params, ggml_tensor * op);
 
 template <typename T> void forward_sum_rows(const ggml_compute_params * params, ggml_tensor * op);
 
-bool forward_concat_dim0_transposed_f32(const ggml_compute_params * params, ggml_tensor * op);
+bool forward_concat_dim0_transposed_f32(const ggml_compute_params * params, ggml_tensor * op, int64_t col0 = 0);
 
 bool forward_ssm_conv_f32(const ggml_compute_params * params, ggml_tensor * dst);
+bool forward_ssm_conv_concat_f32(const ggml_compute_params * params, ggml_tensor * dst);
 
 bool forward_gated_delta_net_f32(const ggml_compute_params * params, ggml_tensor * dst);
 
