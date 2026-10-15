@@ -272,7 +272,9 @@ static void graph_prepare_fusions(ggml_cgraph * gf) {
             if (s->op == GGML_OP_CONCAT && ggml_get_op_params_i32(s, FUSE_P_STATE)) {
                 if (t->view_src == s) {
                     // the view node itself, handled above
-                } else if (t->op == GGML_OP_SSM_CONV && j == 0 && t->src[1]->ne[0] == 4 && !rvv_op_disabled(t)) {
+                } else if (t->op == GGML_OP_SSM_CONV && j == 0 && t->src[1]->ne[0] == 4 && !rvv_op_disabled(t) &&
+                           t->src[2] == s->src[1] && t->src[3] == s->src[0]) {
+                    // the graph keeps the concat inputs alive until this node (build_ssm_conv)
                     ggml_set_op_params_i32(s, FUSE_P_USES, ggml_get_op_params_i32(s, FUSE_P_USES) + 1);
                 } else {
                     ggml_set_op_params_i32(s, FUSE_P_STATE, 0);
