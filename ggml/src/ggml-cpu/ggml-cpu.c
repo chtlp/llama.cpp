@@ -3538,6 +3538,8 @@ enum ggml_status ggml_graph_compute(struct ggml_cgraph * cgraph, struct ggml_cpl
         spert_ctx.tp.cplan      = cplan;
         atomic_store_explicit(&spert_ctx.tp.current_chunk, 0, memory_order_relaxed);
 
+        ggml_backend_cpu_riscv64_spacemit_graph_prepare(cgraph);
+
         const int64_t t_launch = ggml_op_stats_enabled() ? ggml_op_stats_now_ns() : 0;
 
         int launch_result = spacemit_spert_launch_graph_kernel(

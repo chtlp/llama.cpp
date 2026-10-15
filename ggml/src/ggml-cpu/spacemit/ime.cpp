@@ -32,6 +32,7 @@
 #include <mutex>
 #include <stdexcept>
 #include <thread>
+#include <unordered_map>
 // clang-format off
 #if defined(__riscv)
 
@@ -157,6 +158,203 @@ static bool mmid_m4_enabled() {
         return !(e && e[0] == '0');
     }();
     return enabled;
+}
+
+// Graph-level fusions, decided once per graph compute by ggml_backend_cpu_riscv64_spacemit_graph_prepare()
+// and recorded in spare op_params slots of the nodes involved:
+//  - conv: concat(conv_states, transpose(qkv)) -> ssm_conv. SSM_CONV reads the two concat inputs directly
+//    and CONCAT only writes the trailing columns that are read back through views (the conv state update).
+//  - moe_w: mul(mul_mat_id(...), weights). MUL_MAT_ID scales each output row by its routing weight as it
+//    writes it, and the MUL becomes a no-op (or a copy when it is not in place).
+// GGML_SPACEMIT_FUSE_CONV=0 / GGML_SPACEMIT_FUSE_MOE_W=0 disable them.
+static bool fuse_env_enabled(const char * name) {
+    const char * e = getenv(name);
+    return !(e && e[0] == '0');
+}
+
+static bool fuse_conv_enabled() {
+    static const bool enabled = fuse_env_enabled("GGML_SPACEMIT_FUSE_CONV");
+    return enabled;
+}
+
+static bool fuse_moe_w_enabled() {
+    static const bool enabled = fuse_env_enabled("GGML_SPACEMIT_FUSE_MOE_W");
+    return enabled;
+}
+
+// op_params slots (int32 index); CONCAT uses [0] (dim), MUL_MAT_ID and MUL use none.
+constexpr int FUSE_P_PTR     = 8;   // MUL_MAT_ID: weights tensor pointer (2 slots)
+constexpr int FUSE_P_USES    = 11;  // scratch during graph prepare
+constexpr int FUSE_P_APPLIED = 12;  // MUL_MAT_ID: set to 1 by the kernel once it applied the weights
+constexpr int FUSE_P_AUX     = 14;  // scratch during graph prepare
+constexpr int FUSE_P_STATE   = 15;  // CONCAT: first column to write + 1 (0 = not fused); MUL_MAT_ID: 1 = fused
+
+static void fuse_set_ptr(ggml_tensor * t, const ggml_tensor * p) {
+    memcpy((char *) t->op_params + FUSE_P_PTR * sizeof(int32_t), &p, sizeof(p));
+}
+
+static const ggml_tensor * fuse_get_ptr(const ggml_tensor * t) {
+    const ggml_tensor * p;
+    memcpy(&p, (const char *) t->op_params + FUSE_P_PTR * sizeof(int32_t), sizeof(p));
+    return p;
+}
+
+static bool is_transposed_concat_f32(const ggml_tensor * t) {
+    if (t->op != GGML_OP_CONCAT || ggml_get_op_params_i32(t, 0) != 0) {
+        return false;
+    }
+    const ggml_tensor * s0 = t->src[0];
+    const ggml_tensor * s1 = t->src[1];
+    return t->type == GGML_TYPE_F32 && s0->type == GGML_TYPE_F32 && s1->type == GGML_TYPE_F32 &&
+           t->nb[0] == sizeof(float) && s0->nb[0] == sizeof(float) && s1->nb[1] == sizeof(float) &&
+           s1->nb[0] != sizeof(float) && s0->ne[1] == t->ne[1] && s1->ne[1] == t->ne[1] && s0->ne[2] == t->ne[2] &&
+           s1->ne[2] == t->ne[2] && t->ne[3] == 1 && !(t->flags & GGML_TENSOR_FLAG_OUTPUT);
+}
+
+// First column of concat c covered by view v, or -1 if v is not a plain window of whole rows' trailing
+// columns (same row/plane strides, starting in row 0).
+static int64_t concat_view_first_col(const ggml_tensor * c, const ggml_tensor * v) {
+    if (v->type != c->type || v->nb[0] != c->nb[0] || (v->ne[1] > 1 && v->nb[1] != c->nb[1]) ||
+        (v->ne[2] > 1 && v->nb[2] != c->nb[2]) || v->ne[3] != 1 || v->view_offs / c->nb[1] != 0) {
+        return -1;
+    }
+    const int64_t col = (int64_t) ((v->view_offs % c->nb[1]) / c->nb[0]);
+    if (col + v->ne[0] > c->ne[0] || v->ne[1] > c->ne[1] || v->ne[2] > c->ne[2]) {
+        return -1;
+    }
+    return col;
+}
+
+static bool rvv_op_disabled(const ggml_tensor * op);
+
+// Both halves of a fusion must run in this backend's kernels (a generic fallback would read unwritten
+// concat columns or apply the routing weights twice), so ops routed elsewhere by GGML_SPACEMIT_RVV_OFF
+// are never fused.
+static void graph_prepare_fusions(ggml_cgraph * gf) {
+    const int n = ggml_graph_n_nodes(gf);
+
+    // reset; mark candidates
+    for (int i = 0; i < n; ++i) {
+        ggml_tensor * t = ggml_graph_node(gf, i);
+        if (t->op == GGML_OP_CONCAT) {
+            const bool cand = fuse_conv_enabled() && is_transposed_concat_f32(t) && !rvv_op_disabled(t) &&
+                              t->src[0]->ne[0] == 3;
+            ggml_set_op_params_i32(t, FUSE_P_STATE, cand ? -1 : 0);  // -1: candidate, still valid
+            ggml_set_op_params_i32(t, FUSE_P_AUX, (int32_t) t->ne[0]);  // min column read through views
+            ggml_set_op_params_i32(t, FUSE_P_USES, 0);                  // ssm_conv users
+        } else if (t->op == GGML_OP_MUL_MAT_ID) {
+            ggml_set_op_params_i32(t, FUSE_P_STATE, 0);
+            ggml_set_op_params_i32(t, FUSE_P_APPLIED, 0);
+            ggml_set_op_params_i32(t, FUSE_P_USES, 0);
+        }
+    }
+
+    auto concat_view_use = [](ggml_tensor * c, const ggml_tensor * v) {
+        const int64_t col = concat_view_first_col(c, v);
+        if (col < 0) {
+            ggml_set_op_params_i32(c, FUSE_P_STATE, 0);
+        } else if (col < ggml_get_op_params_i32(c, FUSE_P_AUX)) {
+            ggml_set_op_params_i32(c, FUSE_P_AUX, (int32_t) col);
+        }
+    };
+
+    // scan all uses
+    for (int i = 0; i < n; ++i) {
+        ggml_tensor * t = ggml_graph_node(gf, i);
+        if (t->view_src && t->view_src->op == GGML_OP_CONCAT && ggml_get_op_params_i32(t->view_src, FUSE_P_STATE)) {
+            concat_view_use(t->view_src, t);
+        }
+        for (int j = 0; j < GGML_MAX_SRC; ++j) {
+            ggml_tensor * s = t->src[j];
+            if (s == nullptr) {
+                continue;
+            }
+            if (s->op == GGML_OP_CONCAT && ggml_get_op_params_i32(s, FUSE_P_STATE)) {
+                if (t->view_src == s) {
+                    // the view node itself, handled above
+                } else if (t->op == GGML_OP_SSM_CONV && j == 0 && t->src[1]->ne[0] == 4 && !rvv_op_disabled(t)) {
+                    ggml_set_op_params_i32(s, FUSE_P_USES, ggml_get_op_params_i32(s, FUSE_P_USES) + 1);
+                } else {
+                    ggml_set_op_params_i32(s, FUSE_P_STATE, 0);
+                }
+            } else if (s->view_src && s->view_src->op == GGML_OP_CONCAT &&
+                       ggml_get_op_params_i32(s->view_src, FUSE_P_STATE)) {
+                concat_view_use(s->view_src, s);
+            }
+            const ggml_tensor * m = s->view_src ? s->view_src : s;
+            if (m->op == GGML_OP_MUL_MAT_ID) {
+                ggml_tensor * mm = const_cast<ggml_tensor *>(m);
+                ggml_set_op_params_i32(mm, FUSE_P_USES, ggml_get_op_params_i32(mm, FUSE_P_USES) + 1);
+            }
+        }
+    }
+
+    std::unordered_map<const ggml_tensor *, int> node_idx;
+    if (fuse_moe_w_enabled()) {
+        node_idx.reserve(n);
+        for (int i = 0; i < n; ++i) {
+            node_idx[ggml_graph_node(gf, i)] = i;
+        }
+    }
+    auto computed_before = [&](const ggml_tensor * a, const ggml_tensor * b) {
+        const ggml_tensor * ab = a->view_src ? a->view_src : a;
+        const auto          ia = node_idx.find(a);
+        const auto          iab = node_idx.find(ab);
+        const auto          ib = node_idx.find(b);
+        if (ib == node_idx.end()) {
+            return false;
+        }
+        // a leaf (not a node) is always available; otherwise a and its base must come first
+        return (ia == node_idx.end() || ia->second < ib->second) && (iab == node_idx.end() || iab->second < ib->second);
+    };
+
+    for (int i = 0; i < n; ++i) {
+        ggml_tensor * t = ggml_graph_node(gf, i);
+        if (t->op == GGML_OP_CONCAT) {
+            const bool ok = ggml_get_op_params_i32(t, FUSE_P_STATE) == -1 && ggml_get_op_params_i32(t, FUSE_P_USES) > 0;
+            ggml_set_op_params_i32(t, FUSE_P_STATE, ok ? ggml_get_op_params_i32(t, FUSE_P_AUX) + 1 : 0);
+        } else if (t->op == GGML_OP_MUL && fuse_moe_w_enabled() && !rvv_op_disabled(t)) {
+            ggml_tensor *       m = t->src[0];
+            const ggml_tensor * w = t->src[1];
+            if (m->op == GGML_OP_MUL_MAT_ID && m->view_src == nullptr && ggml_get_op_params_i32(m, FUSE_P_USES) == 1 &&
+                !(m->flags & GGML_TENSOR_FLAG_OUTPUT) && m->type == GGML_TYPE_F32 && t->type == GGML_TYPE_F32 &&
+                w->type == GGML_TYPE_F32 && w->ne[0] == 1 && w->ne[1] == m->ne[1] && w->ne[2] == m->ne[2] &&
+                m->ne[3] == 1 && w->ne[3] == 1 && ggml_are_same_shape(t, m) && ggml_is_contiguous(m) &&
+                ggml_is_contiguous(t) && computed_before(w, m)) {
+                ggml_set_op_params_i32(m, FUSE_P_STATE, 1);
+                fuse_set_ptr(m, w);
+            }
+        }
+    }
+}
+
+// MUL_MAT_ID side of the moe_w fusion: routing weight for output row (i1 = slot, i2 = token), or nullptr
+// when the op is not fused.
+static const ggml_tensor * mmid_fused_weights(ggml_tensor * op) {
+    if (ggml_get_op_params_i32(op, FUSE_P_STATE) != 1) {
+        return nullptr;
+    }
+    ggml_set_op_params_i32(op, FUSE_P_APPLIED, 1);
+    return fuse_get_ptr(op);
+}
+
+static inline void mmid_scale_row(float * y, int64_t n, const ggml_tensor * w, int64_t i1, int64_t i2) {
+    if (w == nullptr) {
+        return;
+    }
+    const float s = *(const float *) ((const char *) w->data + i1 * w->nb[1] + i2 * w->nb[2]);
+    for (int64_t i = 0; i < n;) {
+        const size_t vl = __riscv_vsetvl_e32m8(n - i);
+        __riscv_vse32_v_f32m8(y + i, __riscv_vfmul_vf_f32m8(__riscv_vle32_v_f32m8(y + i, vl), s, vl), vl);
+        i += vl;
+    }
+}
+
+// MUL side: true if src0 already carries the weights (dst then only needs src0's values).
+static bool mul_is_fused_moe_w(const ggml_tensor * op) {
+    const ggml_tensor * m = op->src[0];
+    return m->op == GGML_OP_MUL_MAT_ID && ggml_get_op_params_i32(m, FUSE_P_STATE) == 1 &&
+           ggml_get_op_params_i32(m, FUSE_P_APPLIED) == 1 && fuse_get_ptr(m) == op->src[1];
 }
 
 // Debug: GGML_SPACEMIT_RVV_OFF=ADD,MUL,... (ggml_op_name) or ALL routes those ops to the generic CPU path.
@@ -782,6 +980,8 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS> class tensor_
         const int n_ids = ids->ne[0];  // n_expert_used
         const int n_as  = ne02;        // n_expert
 
+        const ggml_tensor * fw = mmid_fused_weights(op);  // routing weights folded into the output, or nullptr
+
         const bool         op_stats = ggml_op_stats_enabled() && ith < mmid_stats_max_threads;
         const int          st_kind  = ids->ne[1] > 1 ? 1 : 0;
         mmid_phase_stats * st       = op_stats ? &g_mmid_stats[st_kind][ith] : nullptr;
@@ -1118,6 +1318,7 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS> class tensor_
                     }
 
                     gemm_kernel(b_blk_len, a_row, b_col, b_col_zp, c_blk + ni, 1, nb_real, b_k_blks, ne01);
+                    mmid_scale_row(c_blk + ni, nb_real, fw, i1, i2);
 
                     if (has_pair && ith % 2 == 0) {
                         spine_barrier_wait(cur_barrier);
@@ -1190,6 +1391,7 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS> class tensor_
                             const mmid_row_mapping rm = MMID_MATRIX_ROW(cur_a, ir1 + r);
                             float * dst_row = (float *) ((char *) dst->data + (rm.i1 * nb1 + rm.i2 * nb2)) + src0_cur_start;
                             memcpy(dst_row, m4_c_tmp + r * n_cols, n_cols * sizeof(float));
+                            mmid_scale_row(dst_row, n_cols, fw, rm.i1, rm.i2);
                         }
                     }
                     if (op_stats) {
@@ -1241,6 +1443,10 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS> class tensor_
                                 moe_gemm_kernel_m2(b_blk_len, src_workspaces.data(), src0_cur, b_col_zp,
                                                    dst_workspaces.data(), 1, src0_cur_end - src0_cur_start, b_k_blks,
                                                    ne01);
+                                mmid_scale_row(dst_workspaces[0], src0_cur_end - src0_cur_start, fw, row_mapping_0.i1,
+                                               row_mapping_0.i2);
+                                mmid_scale_row(dst_workspaces[1], src0_cur_end - src0_cur_start, fw, row_mapping_1.i1,
+                                               row_mapping_1.i2);
                                 if (op_stats) {
                                     st->rows_m2 += 2;
                                 }
@@ -1253,11 +1459,11 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS> class tensor_
                                 st->rows_m1++;
                             }
 
-                            gemm_kernel(
-                                b_blk_len, quant_a_tile_buffer, src0_cur, b_col_zp,
-                                (float *) ((char *) dst->data + (row_mapping_0.i1 * nb1 + row_mapping_0.i2 * nb2)) +
-                                    src0_cur_start,
-                                1, src0_cur_end - src0_cur_start, b_k_blks, ne01);
+                            float * y = (float *) ((char *) dst->data + (row_mapping_0.i1 * nb1 + row_mapping_0.i2 * nb2)) +
+                                        src0_cur_start;
+                            gemm_kernel(b_blk_len, quant_a_tile_buffer, src0_cur, b_col_zp, y, 1,
+                                        src0_cur_end - src0_cur_start, b_k_blks, ne01);
+                            mmid_scale_row(y, src0_cur_end - src0_cur_start, fw, row_mapping_0.i1, row_mapping_0.i2);
                         }
 
                         st_lap(op_stats ? st->t_kernel : st_t);
@@ -1286,6 +1492,13 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS> class tensor_
 
                             moe_gemm_kernel_m2(b_blk_len, src_workspaces.data(), src0_cur, b_col_zp,
                                                dst_workspaces.data(), 1, src0_cur_end - src0_cur_start, b_k_blks, ne01);
+                            if (fw != nullptr) {
+                                for (int iir1 = 0; iir1 < 2; ++iir1) {
+                                    const mmid_row_mapping rm = MMID_MATRIX_ROW(cur_a, ir1 + iir1);
+                                    mmid_scale_row(dst_workspaces[iir1], src0_cur_end - src0_cur_start, fw, rm.i1,
+                                                   rm.i2);
+                                }
+                            }
                             if (op_stats) {
                                 st->rows_m2 += 2;
                             }
@@ -1308,9 +1521,10 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS> class tensor_
 
                         auto * src1_col = quant_a_buffer + (i11 * nbw1 + i12 * nbw2);
 
-                        gemm_kernel(b_blk_len, src1_col, src0_cur, b_col_zp,
-                                    (float *) ((char *) dst->data + (i1 * nb1 + i2 * nb2)) + src0_cur_start, 1,
-                                    src0_cur_end - src0_cur_start, b_k_blks, ne01);
+                        float * y = (float *) ((char *) dst->data + (i1 * nb1 + i2 * nb2)) + src0_cur_start;
+                        gemm_kernel(b_blk_len, src1_col, src0_cur, b_col_zp, y, 1, src0_cur_end - src0_cur_start,
+                                    b_k_blks, ne01);
+                        mmid_scale_row(y, src0_cur_end - src0_cur_start, fw, i1, i2);
                     }
                     st_lap(op_stats ? st->t_kernel : st_t);
                 }
@@ -1407,6 +1621,19 @@ class tensor_traits_common : public tensor_traits_base {
                         return true;
                 }
             case GGML_OP_MUL:
+                if (mul_is_fused_moe_w(op)) {
+                    // src0 already holds the weighted rows
+                    if (op->data != op->src[0]->data) {
+                        const size_t n  = ggml_nbytes(op);
+                        const size_t dn = (n / params->nth + 63) & ~(size_t) 63;
+                        const size_t b0 = std::min(n, dn * params->ith);
+                        const size_t b1 = std::min(n, b0 + dn);
+                        if (b1 > b0) {
+                            memcpy((char *) op->data + b0, (const char *) op->src[0]->data + b0, b1 - b0);
+                        }
+                    }
+                    return true;
+                }
                 switch (op->src[0]->type) {
                     case GGML_TYPE_F32:
                         spacemit_kernels::rvv::forward_binary<GGML_OP_MUL, float>(params, op);
@@ -1535,7 +1762,9 @@ class tensor_traits_common : public tensor_traits_base {
                 return true;
             case GGML_OP_CONCAT:
                 {
-                    if (spacemit_kernels::rvv::forward_concat_dim0_transposed_f32(params, op)) {
+                    const int32_t fused_col = ggml_get_op_params_i32(op, FUSE_P_STATE);
+                    if (spacemit_kernels::rvv::forward_concat_dim0_transposed_f32(params, op,
+                                                                                  fused_col > 0 ? fused_col - 1 : 0)) {
                         return true;
                     }
                     const int32_t dim = ggml_get_op_params_i32(op, 0);
@@ -1556,6 +1785,13 @@ class tensor_traits_common : public tensor_traits_base {
                 }
                 return true;
             case GGML_OP_SSM_CONV:
+                if (op->src[0]->op == GGML_OP_CONCAT && ggml_get_op_params_i32(op->src[0], FUSE_P_STATE) > 0) {
+                    // the concat only materialized its trailing columns; read its inputs directly
+                    if (!spacemit_kernels::rvv::forward_ssm_conv_concat_f32(params, op)) {
+                        GGML_ABORT("fused ssm_conv: unsupported shape");
+                    }
+                    return true;
+                }
                 if (!spacemit_kernels::rvv::forward_ssm_conv_f32(params, op)) {
                     ggml_compute_forward_ssm_conv(params, op);
                 }
@@ -2237,5 +2473,9 @@ static int bind_ai_thread() {
 
 int ggml_backend_cpu_riscv64_spacemit_num_prefer_cores(void) {
     return ggml::cpu::riscv64_spacemit::global_spine_env_info.num_perfer_cores;
+}
+
+void ggml_backend_cpu_riscv64_spacemit_graph_prepare(struct ggml_cgraph * cgraph) {
+    ggml::cpu::riscv64_spacemit::graph_prepare_fusions(cgraph);
 }
 }
