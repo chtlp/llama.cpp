@@ -443,6 +443,15 @@ std::pair<ggml_tensor *, ggml_tensor *> llm_build_delta_net_base::build_delta_ne
     return build_delta_net_chunking(q, k, v, g, b, s, il);
 }
 
+ggml_tensor * llm_build_delta_net_base::build_ssm_conv(ggml_tensor * conv_input, ggml_tensor * conv_kernel) {
+    ggml_tensor * conv_out = ggml_ssm_conv(ctx0, conv_input, conv_kernel);
+    if (conv_input->op == GGML_OP_CONCAT) {
+        conv_out->src[2] = conv_input->src[1];
+        conv_out->src[3] = conv_input->src[0];
+    }
+    return conv_out;
+}
+
 ggml_tensor * llm_build_delta_net_base::build_conv_state(
         llm_graph_input_rs * inp,
         ggml_tensor *        conv_states_all,
