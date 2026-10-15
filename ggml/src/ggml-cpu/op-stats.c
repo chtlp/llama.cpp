@@ -10,7 +10,7 @@
 #include <time.h>
 
 #define OP_STATS_MAX_THREADS 64
-#define OP_STATS_TABLE_SIZE  2048
+#define OP_STATS_TABLE_SIZE  16384
 #define OP_STATS_KEY_LEN     96
 
 typedef struct {
@@ -89,8 +89,17 @@ void ggml_op_stats_record(int ith, int node_n, int64_t t_begin, int64_t t_end) {
 int ggml_op_stats_graph_ntok(const struct ggml_cgraph * cgraph) {
     for (int i = 0; i < cgraph->n_nodes && i < 64; i++) {
         const struct ggml_tensor * t = cgraph->nodes[i];
-        if (t->op == GGML_OP_GET_ROWS && (strcmp(t->name, "inp_embd") == 0 || strcmp(t->name, "embd") == 0)) {
+        if (t->op == GGML_OP_GET_ROWS && (strcmp(t->name, "inp_embd") == 0 || strcmp(t->name, "embd") == 0 ||
+                                          (t->src[0] && strcmp(t->src[0]->name, "token_embd.weight") == 0))) {
             return (int) t->ne[1];
+        }
+    }
+    // graphs without a token embedding lookup (e.g. an MTP draft head fed with hidden states):
+    // the activation rows of the first matmul
+    for (int i = 0; i < cgraph->n_nodes; i++) {
+        const struct ggml_tensor * t = cgraph->nodes[i];
+        if (t->op == GGML_OP_MUL_MAT && t->src[1]) {
+            return (int) t->src[1]->ne[1];
         }
     }
     return -1;

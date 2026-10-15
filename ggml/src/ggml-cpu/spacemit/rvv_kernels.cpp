@@ -40,6 +40,8 @@ auto align_up(size_t value, size_t alignment) {
 
 // head dims above vlmax(e16m2) = 128 are processed in 128-wide segments
 static constexpr int64_t FA_VLEN1024_MAX_D = 256;
+// split-KV decode handles up to this many query tokens (speculative-decoding verification)
+static constexpr int64_t FA_SPLIT_KV_MAX_Q = 4;
 
 static inline bool flash_attn_ext_supported_d_vlen1024_vf16(int64_t d) {
     return d > 0 && d <= FA_VLEN1024_MAX_D;
@@ -774,12 +776,20 @@ static void flash_attn_ext_f16_one_chunk_inner_vlen1024_vf16_mrow(float **      
                                                                   int64_t             DK,
                                                                   void *              tcm_buffer,
                                                                   size_t              tcm_buffer_size,
-                                                                  float *             partial        = nullptr,
-                                                                  int64_t             partial_stride = 0) {
+                                                                  float **            partial         = nullptr,
+                                                                  int64_t             n_mask_rows     = 1,
+                                                                  size_t              mask_row_stride = 0) {
     // QLEN rows share K/V; groups of 4 rows are computed from the packed K/V tile in TCM.
-    // With partial != nullptr row i writes {M, S, unnormalized VKQ[DV]} to partial + i * partial_stride
-    // (for a later split-KV reduction) instead of the normalized output to dst[i].
-    static_assert(QLEN == 2 || QLEN == 4 || QLEN == 8, "unsupported QLEN");
+    // Rows may come from n_mask_rows query tokens (QLEN / n_mask_rows consecutive rows per token), each with
+    // its own mask row at mp + m * mask_row_stride bytes; a KV position is packed if any token can see it.
+    // With partial != nullptr row i writes {M, S, unnormalized VKQ[DV]} to partial[i] (for a later split-KV
+    // reduction) instead of the normalized output to dst[i].
+    static_assert(QLEN == 2 || QLEN == 4 || QLEN == 8 || QLEN == 16, "unsupported QLEN");
+    GGML_ASSERT(n_mask_rows >= 1 && QLEN % n_mask_rows == 0 && n_mask_rows <= 16);
+    const int64_t rows_per_mask = QLEN / n_mask_rows;
+    auto          mask_at       = [&](int64_t m, int64_t ic) -> float {
+        return mp ? slope * ((const _Float16 *) ((const char *) mp + m * mask_row_stride))[ic] : 0.0f;
+    };
     GGML_ASSERT(flash_attn_ext_supported_shape_vlen1024_vf16(DK, DV));
     float S[QLEN];  // sum
     float M[QLEN];  // maximum KQ value
@@ -810,7 +820,7 @@ static void flash_attn_ext_f16_one_chunk_inner_vlen1024_vf16_mrow(float **      
     const uintptr_t kq_tile_addr = align_up(scratch_addr, alignof(float));
     const size_t    scratch_prefix = kq_tile_addr - scratch_addr;
     const size_t    packed_tile_size =
-        QLEN * sizeof(float) + DK * sizeof(_Float16) + DV * sizeof(_Float16) + sizeof(float);
+        QLEN * sizeof(float) + DK * sizeof(_Float16) + DV * sizeof(_Float16) + n_mask_rows * sizeof(float);
     const int64_t max_ic_tile_step = ((int64_t) __riscv_vsetvlmax_e16m1()) & ~((int64_t) 7);
     const int64_t max_fit_by_tcm =
         scratch_size > scratch_prefix ? (int64_t) ((scratch_size - scratch_prefix) / packed_tile_size) : 0;
@@ -830,9 +840,14 @@ static void flash_attn_ext_f16_one_chunk_inner_vlen1024_vf16_mrow(float **      
 
         int64_t ic_step = 0;
         for (int64_t ic = 0; ic < nek1; ++ic) {
-            const float mv = mp ? slope * ((_Float16 *) mp)[ic] : 0.0f;
+            float mvs[16];
+            bool  visible = false;
+            for (int64_t m = 0; m < n_mask_rows; ++m) {
+                mvs[m] = mask_at(m, ic);
+                visible |= mvs[m] != -INFINITY;
+            }
 
-            if (mv != -INFINITY) {
+            if (visible) {
                 const _Float16 * k_data = (const _Float16 *) (k_data_row + ic * nbk1);
                 const _Float16 * v_data = (const _Float16 *) (v_data_row + ic * nbv1);
 
@@ -848,7 +863,9 @@ static void flash_attn_ext_f16_one_chunk_inner_vlen1024_vf16_mrow(float **      
                     const vfloat16m2_t v_data_v = __riscv_vle16_v_f16m2(v_data + d0, vl);
                     __riscv_vse16_v_f16m2(v_tile_pack + ic_step * DV + d0, v_data_v, vl);
                 }
-                mv_tile_pack[ic_step] = mv;
+                for (int64_t m = 0; m < n_mask_rows; ++m) {
+                    mv_tile_pack[m * ic_tile_step + ic_step] = mvs[m];
+                }
                 ic_step++;
             }
 
@@ -903,8 +920,8 @@ static void flash_attn_ext_f16_one_chunk_inner_vlen1024_vf16_mrow(float **      
 
                 for (size_t i = 0; i < QLEN; ++i) {
                     float *     row_ptr = kq_tile_buffer + i * ic_tile_step;
-                    const float tile_max =
-                        rvv_softcap_add_max_inplace_f32(row_ptr, mv_tile_pack, ic_step, logit_softcap);
+                    const float tile_max = rvv_softcap_add_max_inplace_f32(
+                        row_ptr, mv_tile_pack + (i / rows_per_mask) * ic_tile_step, ic_step, logit_softcap);
 
                     const float Mold = M[i];
 
@@ -971,15 +988,14 @@ static void flash_attn_ext_f16_one_chunk_inner_vlen1024_vf16_mrow(float **      
         }
     } else {
         for (int64_t ic = 0; ic < nek1; ++ic) {
-            const float mv = mp ? slope * ((_Float16 *) mp)[ic] : 0.0f;
-            if (mv == -INFINITY) {
-                continue;
-            }
-
             const _Float16 * k_data = (const _Float16 *) (k_data_row + ic * nbk1);
             const _Float16 * v_data = (const _Float16 *) (v_data_row + ic * nbv1);
 
             for (size_t i = 0; i < QLEN; ++i) {
+                const float mv = mask_at(i / rows_per_mask, ic);
+                if (mv == -INFINITY) {
+                    continue;
+                }
                 float s = rvv_dot_f16_f32(k_data, qv_buffer + i * DK, DK) * scale;
                 if (logit_softcap != 0.0f) {
                     s = logit_softcap * tanhf(s);
@@ -1007,7 +1023,7 @@ static void flash_attn_ext_f16_one_chunk_inner_vlen1024_vf16_mrow(float **      
 
     for (size_t i = 0; i < QLEN; ++i) {
         if (partial) {
-            float * pr = partial + i * partial_stride;
+            float * pr = partial[i];
             pr[0]      = M[i];
             pr[1]      = S[i];
             for (int64_t d0 = 0; d0 < DV; d0 += seg) {
@@ -1386,10 +1402,11 @@ void forward_flash_attn_ext_f16_one_chunk_vlen1024_vf16(const ggml_compute_param
     }
 }
 
-// Split-KV decode (flash-decoding) for a single query token: one work unit is (KV head, KV chunk) and
-// computes all rk2 query heads that share that KV head, so every K/V row is read once instead of once
-// per thread. Partials {M, S, VKQ[DV]} go to a shared buffer laid out [q head][chunk]; a second pass
-// (after a grid barrier) merges the chunks of each head.
+// Split-KV decode (flash-decoding) for 1..FA_SPLIT_KV_MAX_Q query tokens (single-token decode and
+// speculative-decoding verification): one work unit is (KV head, KV chunk) and computes all rk2 query
+// heads that share that KV head, token by token (each token has its own mask row), so every K/V row is
+// read once per token instead of once per query row. Partials {M, S, VKQ[DV]} go to a shared buffer laid
+// out [token][q head][chunk]; a second pass (after a grid barrier) merges the chunks of each row.
 int flash_attn_ext_f16_split_kv_chunks_vlen1024_vf16(const ggml_tensor * dst, int nth) {
     const ggml_tensor * q    = dst->src[0];
     const ggml_tensor * k    = dst->src[1];
@@ -1398,7 +1415,7 @@ int flash_attn_ext_f16_split_kv_chunks_vlen1024_vf16(const ggml_tensor * dst, in
 
     const float max_bias = ((const float *) dst->op_params)[1];
 
-    if (q->ne[1] != 1 || q->ne[3] != 1 || k->ne[3] != 1 || v->ne[3] != 1 || k->ne[2] != v->ne[2] ||
+    if (q->ne[1] < 1 || q->ne[1] > FA_SPLIT_KV_MAX_Q || q->ne[3] != 1 || k->ne[3] != 1 || v->ne[3] != 1 || k->ne[2] != v->ne[2] ||
         q->ne[2] % k->ne[2] != 0 || max_bias != 0.0f || (mask && (mask->ne[2] != 1 || mask->ne[3] != 1))) {
         return 0;
     }
@@ -1429,7 +1446,9 @@ void forward_flash_attn_ext_f16_split_kv_partial_vlen1024_vf16(const ggml_comput
     const int64_t DV    = v->ne[0];
     const int64_t n_kv  = k->ne[1];
     const int64_t n_kvh = k->ne[2];
-    const int64_t rk2   = q->ne[2] / n_kvh;
+    const int64_t nh    = q->ne[2];
+    const int64_t nq    = q->ne[1];
+    const int64_t rk2   = nh / n_kvh;
 
     float scale         = ((const float *) dst->op_params)[0];
     float logit_softcap = ((const float *) dst->op_params)[2];
@@ -1440,8 +1459,15 @@ void forward_flash_attn_ext_f16_split_kv_partial_vlen1024_vf16(const ggml_comput
     const int64_t chunk  = (n_kv + n_chunks - 1) / n_chunks;
     const int64_t stride = n_chunks * (2 + DV);
 
-    std::array<float *, 8> pq;
-    std::array<float *, 8> unused = {};
+    std::array<float *, 16> pq;
+    std::array<float *, 16> pr;
+    std::array<float *, 16> unused = {};
+
+    // all query tokens of a unit in one pass (one K/V pack) when rk2 * nq is a supported row count
+    const int64_t rows   = rk2 * nq;
+    const bool    fused  = rows == 2 || rows == 4 || rows == 8 || rows == 16;
+    const int64_t n_pass = fused ? 1 : nq;
+    const int64_t prows  = fused ? rows : rk2;
 
     for (int64_t u = params->ith; u < n_kvh * n_chunks; u += params->nth) {
         const int64_t kvh = u / n_chunks;
@@ -1449,26 +1475,35 @@ void forward_flash_attn_ext_f16_split_kv_partial_vlen1024_vf16(const ggml_comput
         const int64_t c0  = std::min(n_kv, c * chunk);
         const int64_t c1  = std::min(n_kv, c0 + chunk);
         const int64_t h0  = kvh * rk2;
+        const char *  kd  = (const char *) k->data + kvh * k->nb[2] + c0 * k->nb[1];
+        const char *  vd  = (const char *) v->data + kvh * v->nb[2] + c0 * v->nb[1];
 
-        for (int64_t i = 0; i < rk2; ++i) {
-            pq[i] = (float *) ((char *) q->data + (h0 + i) * q->nb[2]);
-        }
-        const ggml_fp16_t * mp = mask ? (const ggml_fp16_t *) mask->data + c0 : nullptr;
-        const char *        kd = (const char *) k->data + kvh * k->nb[2] + c0 * k->nb[1];
-        const char *        vd = (const char *) v->data + kvh * v->nb[2] + c0 * v->nb[1];
-        float *             pr = partials + (h0 * n_chunks + c) * (2 + DV);
+        for (int64_t p = 0; p < n_pass; ++p) {
+            for (int64_t r = 0; r < prows; ++r) {
+                const int64_t t = fused ? r / rk2 : p;
+                const int64_t i = fused ? r % rk2 : r;
+                pq[r] = (float *) ((char *) q->data + t * q->nb[1] + (h0 + i) * q->nb[2]);
+                pr[r] = partials + ((t * nh + h0 + i) * n_chunks + c) * (2 + DV);
+            }
+            const int64_t       t0 = fused ? 0 : p;
+            const ggml_fp16_t * mp =
+                mask ? (const ggml_fp16_t *) ((const char *) mask->data + t0 * mask->nb[1]) + c0 : nullptr;
+            const int64_t n_mask_rows = fused ? nq : 1;
+            const size_t  mstride     = mask ? mask->nb[1] : 0;
 
-#define FA_SPLIT_MROW(QL)                                                                                      \
-    flash_attn_ext_f16_one_chunk_inner_vlen1024_vf16_mrow<QL>(pq.data(), kd, vd, mp, unused.data(), unused.data(), \
-                                                              scale, logit_softcap, 1.0f, c1 - c0, k->nb[1],      \
-                                                              v->nb[1], DV, DK, tcm_buffer, tcm_buffer_size, pr,  \
-                                                              stride)
-        switch (rk2) {
-            case 2: FA_SPLIT_MROW(2); break;
-            case 4: FA_SPLIT_MROW(4); break;
-            default: FA_SPLIT_MROW(8); break;
-        }
+#define FA_SPLIT_MROW(QL)                                                                                          \
+    flash_attn_ext_f16_one_chunk_inner_vlen1024_vf16_mrow<QL>(pq.data(), kd, vd, mp, unused.data(), unused.data(),     \
+                                                              scale, logit_softcap, 1.0f, c1 - c0, k->nb[1],          \
+                                                              v->nb[1], DV, DK, tcm_buffer, tcm_buffer_size, pr.data(), \
+                                                              n_mask_rows, mstride)
+            switch (prows) {
+                case 2: FA_SPLIT_MROW(2); break;
+                case 4: FA_SPLIT_MROW(4); break;
+                case 8: FA_SPLIT_MROW(8); break;
+                default: FA_SPLIT_MROW(16); break;
+            }
 #undef FA_SPLIT_MROW
+        }
     }
 }
 
@@ -1482,11 +1517,14 @@ void forward_flash_attn_ext_f16_split_kv_reduce_vlen1024_vf16(const ggml_compute
 
     const int64_t DV = v->ne[0];
     const int64_t nh = q->ne[2];
+    const int64_t nq = q->ne[1];
 
     float acc[FA_VLEN1024_MAX_D];
 
-    for (int64_t h = params->ith; h < nh; h += params->nth) {
-        const float * pr = partials + h * n_chunks * (2 + DV);
+    for (int64_t r = params->ith; r < nq * nh; r += params->nth) {
+        const int64_t t  = r / nh;
+        const int64_t h  = r % nh;
+        const float * pr = partials + r * n_chunks * (2 + DV);
 
         float M = -INFINITY;
         for (int c = 0; c < n_chunks; ++c) {
@@ -1526,7 +1564,7 @@ void forward_flash_attn_ext_f16_split_kv_reduce_vlen1024_vf16(const ggml_compute
         }
         const float f = S == 0.0f ? 0.0f : ms / S;
 
-        float * out = (float *) ((char *) dst->data + h * dst->nb[1]);
+        float * out = (float *) ((char *) dst->data + (t * dst->ne[1] + h) * dst->nb[1]);
         for (int64_t d0 = 0; d0 < DV;) {
             const size_t vl = __riscv_vsetvl_e32m4(DV - d0);
             __riscv_vse32_v_f32m4(out + d0, __riscv_vfmul_vf_f32m4(__riscv_vle32_v_f32m4(acc + d0, vl), f, vl), vl);
@@ -3798,9 +3836,11 @@ bool forward_ssm_conv_f32(const ggml_compute_params * params, ggml_tensor * dst)
     return true;
 }
 
-// Gated delta net, K=1 (final state only). Same math as ggml_compute_forward_gated_delta_net_one_chunk, but
+// Gated delta net. Same math and output layout as ggml_compute_forward_gated_delta_net_one_chunk, but
 // every step touches only row j of the transposed state, so each row is loaded once, updated in registers
 // (decay, k-dot, rank-1 update, q-dot) and stored once, instead of a memcpy plus four passes over the state.
+// With K > 1 snapshot slots (speculative-decoding rollback), each token writes its state straight into its
+// slot (or a per-thread scratch when it is older than the K kept states) and the next token reads it back.
 // Returns false for unsupported shapes so the caller can use the generic path.
 bool forward_gated_delta_net_f32(const ggml_compute_params * params, ggml_tensor * dst) {
     const ggml_tensor * src_q     = dst->src[0];
@@ -3815,7 +3855,8 @@ bool forward_gated_delta_net_f32(const ggml_compute_params * params, ggml_tensor
     const int64_t n_tokens = src_v->ne[2];
     const int64_t n_seqs   = src_v->ne[3];
 
-    if (ggml_get_op_params_i32(dst, 0) != 1 || S_v > (int64_t) __riscv_vsetvlmax_e32m4() || S_v > 1024 ||
+    const int64_t K = ggml_get_op_params_i32(dst, 0);
+    if (K < 1 || S_v > (int64_t) __riscv_vsetvlmax_e32m4() || S_v > 1024 ||
         src_q->type != GGML_TYPE_F32 || src_k->type != GGML_TYPE_F32 || src_v->type != GGML_TYPE_F32 ||
         src_g->type != GGML_TYPE_F32 || src_beta->type != GGML_TYPE_F32 || src_state->type != GGML_TYPE_F32 ||
         !ggml_is_contiguous_rows(src_q) || !ggml_is_contiguous_rows(src_k) || !ggml_is_contiguous_rows(src_v) ||
@@ -3838,10 +3879,15 @@ bool forward_gated_delta_net_f32(const ggml_compute_params * params, ggml_tensor
     const int64_t rk3              = n_seqs / nek3;
     const float   scale            = 1.0f / sqrtf((float) S_v);
 
-    // output layout: [attn_scores (S_v * H * n_tokens * n_seqs) | new_state (S_v * S_v * H * n_seqs)]
-    float *       attn_out_base  = (float *) dst->data;
-    float *       state_out_base = (float *) dst->data + S_v * H * n_tokens * n_seqs;
-    const float * state_in_base  = (const float *) src_state->data;
+    // output layout: [attn_scores (S_v * H * n_tokens * n_seqs) | K state snapshots (S_v * S_v * H * n_seqs each)]
+    float *       attn_out_base       = (float *) dst->data;
+    float *       state_out_base      = (float *) dst->data + S_v * H * n_tokens * n_seqs;
+    const float * state_in_base       = (const float *) src_state->data;
+    const int64_t state_size_per_snap = S_v * S_v * H * n_seqs;
+
+    // same per-thread scratch layout as the generic op (its work size): [delta S_v | state_work S_v*S_v]
+    float * state_work = K > 1 ? (float *) params->wdata + params->ith * (S_v + S_v * S_v) + CACHE_LINE_SIZE_F32 + S_v :
+                                 nullptr;
 
     const int64_t nr  = H * n_seqs;
     const int64_t dr  = (nr + params->nth - 1) / params->nth;
@@ -3861,7 +3907,7 @@ bool forward_gated_delta_net_f32(const ggml_compute_params * params, ggml_tensor
         const int64_t ik3 = iv3 / rk3;
 
         // state is stored transposed: row j of s holds column j of S
-        float *       s_out     = state_out_base + (iv3 * H + iv1) * S_v * S_v;
+        const int64_t head_off  = (iv3 * H + iv1) * S_v * S_v;
         const float * s_src     = state_in_base + iv3 * state_seq_stride + iv1 * S_v * S_v;
         float *       attn_data = attn_out_base + (iv3 * n_tokens * H + iv1) * S_v;
 
@@ -3874,6 +3920,12 @@ bool forward_gated_delta_net_f32(const ggml_compute_params * params, ggml_tensor
 
             const vfloat32m4_t vq = __riscv_vle32_v_f32m4(q_d, vl);
             const vfloat32m4_t vk = __riscv_vle32_v_f32m4(k_d, vl);
+
+            // snapshot slot 0 = state after the last token, slot s = s tokens back
+            const int64_t slot  = n_tokens - 1 - t;
+            float *       s_out = K == 1    ? state_out_base + head_off :
+                                  slot < K ? state_out_base + slot * state_size_per_snap + head_off :
+                                             state_work;
 
             vfloat32m4_t veg   = vk;  // only used when kda
             float        decay = 0.0f;
@@ -3905,7 +3957,7 @@ bool forward_gated_delta_net_f32(const ggml_compute_params * params, ggml_tensor
                 attn_data[j] = sq * scale;
             }
 
-            s_src = s_out;  // later tokens update the output state in place
+            s_src = s_out;  // the next token continues from this token's state
             attn_data += S_v * H;
         }
     }
