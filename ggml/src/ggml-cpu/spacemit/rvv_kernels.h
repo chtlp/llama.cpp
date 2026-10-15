@@ -30,6 +30,21 @@ constexpr size_t q8_hp_blk_size(size_t blk_len, bool with_blk_sum = false, bool 
     return blk_size;
 }
 
+// Aligned 4-row Q8 HP layout used with signed-int4 Q4_0 weights (GGML_SPACEMIT_HP_ALIGNED, see
+// hp_aligned_enabled()). Per K256 block of 4 rows:
+//   [8 x 128B int8 4x32 subblock data][8 x 8B subblock scale headers (fp16 scale + pad)]
+//   [72B trailer: fp16 a_sum[4][8] + fp16 scale_avg at +64][56B pad]                    = 1216B
+// The int8 data must be 64B aligned: misaligned whole-register vector loads are 2.7x-7.7x slower on A100.
+// The trailer sits at +1088 like the original layout; the original 1160B layout puts data at k*136+8.
+constexpr size_t q8_hp_m4al_blk_size = 1216;
+// per-row stride per K256 block when 4-row aligned groups and 1-row (q8_hp_blk_size) rows share a buffer
+constexpr size_t q8_hp_al_row_blk_size = q8_hp_m4al_blk_size / 4;
+constexpr size_t q8_hp_al_align        = 128;
+
+// GGML_SPACEMIT_HP_ALIGNED=0 disables the aligned-A / signed-B Q4_0 hp path (default on). Read once, so the
+// weight repack and the kernels always agree.
+bool hp_aligned_enabled();
+
 // Q8K Blk [f32] [s16 * (blk_len / 16)] [int8 * blk_len]
 // Q8K Blk N [f32 * N] [s16 * (blk_len / 16) * N] [int8 * blk_len * N]
 constexpr size_t q8k_blk_size(size_t blk_len) {
@@ -109,6 +124,9 @@ void quantize_a_4row_i8(size_t blk_len, const float * a_ptr, size_t count_k, uin
 void quantize_a_row_i8_hp(size_t blk_len, const float * a_ptr, size_t count_k, uint8_t * quant_a_ptr);
 
 void quantize_a_4row_i8_hp(size_t blk_len, const float * a_ptr, size_t count_k, uint8_t * quant_a_ptr);
+
+// aligned 4-row layout (q8_hp_m4al_blk_size per K256 block)
+void quantize_a_4row_i8_hp_al(size_t blk_len, const float * a_ptr, size_t count_k, uint8_t * quant_a_ptr);
 
 void quantize_a_row_i8k(size_t blk_len, const float * a_ptr, size_t count_k, uint8_t * quant_a_ptr);
 
