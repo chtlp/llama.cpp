@@ -51,6 +51,19 @@ void forward_flash_attn_ext_f16_one_chunk_vlen1024_vf16(const ggml_compute_param
                                                         void *                      tcm_buffer,
                                                         size_t                      tcm_buffer_size);
 
+// split-KV decode: returns KV chunks per KV head when applicable, else 0
+int  flash_attn_ext_f16_split_kv_chunks_vlen1024_vf16(const ggml_tensor * dst, int nth);
+void forward_flash_attn_ext_f16_split_kv_partial_vlen1024_vf16(const ggml_compute_params * params,
+                                                               ggml_tensor *               dst,
+                                                               int                         n_chunks,
+                                                               float *                     partials,
+                                                               void *                      tcm_buffer,
+                                                               size_t                      tcm_buffer_size);
+void forward_flash_attn_ext_f16_split_kv_reduce_vlen1024_vf16(const ggml_compute_params * params,
+                                                              ggml_tensor *               dst,
+                                                              int                         n_chunks,
+                                                              const float *               partials);
+
 void forward_flash_attn_ext_f16_tiled_vlen1024_vf16(const ggml_compute_params * params,
                                                     ggml_tensor *               dst,
                                                     int                         ir0,
