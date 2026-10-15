@@ -773,7 +773,13 @@ static void flash_attn_ext_f16_one_chunk_inner_vlen1024_vf16_mrow(float **      
                                                                   int64_t             DV,
                                                                   int64_t             DK,
                                                                   void *              tcm_buffer,
-                                                                  size_t              tcm_buffer_size) {
+                                                                  size_t              tcm_buffer_size,
+                                                                  float *             partial        = nullptr,
+                                                                  int64_t             partial_stride = 0) {
+    // QLEN rows share K/V; groups of 4 rows are computed from the packed K/V tile in TCM.
+    // With partial != nullptr row i writes {M, S, unnormalized VKQ[DV]} to partial + i * partial_stride
+    // (for a later split-KV reduction) instead of the normalized output to dst[i].
+    static_assert(QLEN == 2 || QLEN == 4 || QLEN == 8, "unsupported QLEN");
     GGML_ASSERT(flash_attn_ext_supported_shape_vlen1024_vf16(DK, DV));
     float S[QLEN];  // sum
     float M[QLEN];  // maximum KQ value
@@ -847,48 +853,52 @@ static void flash_attn_ext_f16_one_chunk_inner_vlen1024_vf16_mrow(float **      
             }
 
             if (ic_step > 0 && (ic_step == ic_tile_step || ic == (nek1 - 1))) {
-                if constexpr (QLEN == 4) {
-                    const size_t qk_vl   = __riscv_vsetvl_e16m1(ic_step);
-                    vfloat32m2_t qk_acc0 = __riscv_vfmv_v_f_f32m2(0.0f, qk_vl);
-                    vfloat32m2_t qk_acc1 = __riscv_vfmv_v_f_f32m2(0.0f, qk_vl);
-                    vfloat32m2_t qk_acc2 = __riscv_vfmv_v_f_f32m2(0.0f, qk_vl);
-                    vfloat32m2_t qk_acc3 = __riscv_vfmv_v_f_f32m2(0.0f, qk_vl);
+                const size_t qk_vl = __riscv_vsetvl_e16m1(ic_step);
+                for (size_t g = 0; g < QLEN; g += 4) {
+                    if constexpr (QLEN >= 4) {
+                        const _Float16 * q0 = qv_buffer + (g + 0) * DK;
+                        const _Float16 * q1 = qv_buffer + (g + 1) * DK;
+                        const _Float16 * q2 = qv_buffer + (g + 2) * DK;
+                        const _Float16 * q3 = qv_buffer + (g + 3) * DK;
 
-                    for (int64_t d = 0; d < DK; ++d) {
-                        const vfloat16m1_t k_vec = __riscv_vle16_v_f16m1(k_tile_pack + d * ic_tile_step, qk_vl);
-                        qk_acc0 = __riscv_vfwmacc_vf_f32m2(qk_acc0, qv_buffer[0 * DK + d], k_vec, qk_vl);
-                        qk_acc1 = __riscv_vfwmacc_vf_f32m2(qk_acc1, qv_buffer[1 * DK + d], k_vec, qk_vl);
-                        qk_acc2 = __riscv_vfwmacc_vf_f32m2(qk_acc2, qv_buffer[2 * DK + d], k_vec, qk_vl);
-                        qk_acc3 = __riscv_vfwmacc_vf_f32m2(qk_acc3, qv_buffer[3 * DK + d], k_vec, qk_vl);
+                        vfloat32m2_t qk_acc0 = __riscv_vfmv_v_f_f32m2(0.0f, qk_vl);
+                        vfloat32m2_t qk_acc1 = __riscv_vfmv_v_f_f32m2(0.0f, qk_vl);
+                        vfloat32m2_t qk_acc2 = __riscv_vfmv_v_f_f32m2(0.0f, qk_vl);
+                        vfloat32m2_t qk_acc3 = __riscv_vfmv_v_f_f32m2(0.0f, qk_vl);
+
+                        for (int64_t d = 0; d < DK; ++d) {
+                            const vfloat16m1_t k_vec = __riscv_vle16_v_f16m1(k_tile_pack + d * ic_tile_step, qk_vl);
+                            qk_acc0 = __riscv_vfwmacc_vf_f32m2(qk_acc0, q0[d], k_vec, qk_vl);
+                            qk_acc1 = __riscv_vfwmacc_vf_f32m2(qk_acc1, q1[d], k_vec, qk_vl);
+                            qk_acc2 = __riscv_vfwmacc_vf_f32m2(qk_acc2, q2[d], k_vec, qk_vl);
+                            qk_acc3 = __riscv_vfwmacc_vf_f32m2(qk_acc3, q3[d], k_vec, qk_vl);
+                        }
+
+                        qk_acc0 = __riscv_vfmul_vf_f32m2(qk_acc0, scale, qk_vl);
+                        qk_acc1 = __riscv_vfmul_vf_f32m2(qk_acc1, scale, qk_vl);
+                        qk_acc2 = __riscv_vfmul_vf_f32m2(qk_acc2, scale, qk_vl);
+                        qk_acc3 = __riscv_vfmul_vf_f32m2(qk_acc3, scale, qk_vl);
+
+                        __riscv_vse32_v_f32m2(kq_tile_buffer + (g + 0) * ic_tile_step, qk_acc0, qk_vl);
+                        __riscv_vse32_v_f32m2(kq_tile_buffer + (g + 1) * ic_tile_step, qk_acc1, qk_vl);
+                        __riscv_vse32_v_f32m2(kq_tile_buffer + (g + 2) * ic_tile_step, qk_acc2, qk_vl);
+                        __riscv_vse32_v_f32m2(kq_tile_buffer + (g + 3) * ic_tile_step, qk_acc3, qk_vl);
+                    } else {
+                        vfloat32m2_t qk_acc0 = __riscv_vfmv_v_f_f32m2(0.0f, qk_vl);
+                        vfloat32m2_t qk_acc1 = __riscv_vfmv_v_f_f32m2(0.0f, qk_vl);
+
+                        for (int64_t d = 0; d < DK; ++d) {
+                            const vfloat16m1_t k_vec = __riscv_vle16_v_f16m1(k_tile_pack + d * ic_tile_step, qk_vl);
+                            qk_acc0 = __riscv_vfwmacc_vf_f32m2(qk_acc0, qv_buffer[0 * DK + d], k_vec, qk_vl);
+                            qk_acc1 = __riscv_vfwmacc_vf_f32m2(qk_acc1, qv_buffer[1 * DK + d], k_vec, qk_vl);
+                        }
+
+                        qk_acc0 = __riscv_vfmul_vf_f32m2(qk_acc0, scale, qk_vl);
+                        qk_acc1 = __riscv_vfmul_vf_f32m2(qk_acc1, scale, qk_vl);
+
+                        __riscv_vse32_v_f32m2(kq_tile_buffer + 0 * ic_tile_step, qk_acc0, qk_vl);
+                        __riscv_vse32_v_f32m2(kq_tile_buffer + 1 * ic_tile_step, qk_acc1, qk_vl);
                     }
-
-                    qk_acc0 = __riscv_vfmul_vf_f32m2(qk_acc0, scale, qk_vl);
-                    qk_acc1 = __riscv_vfmul_vf_f32m2(qk_acc1, scale, qk_vl);
-                    qk_acc2 = __riscv_vfmul_vf_f32m2(qk_acc2, scale, qk_vl);
-                    qk_acc3 = __riscv_vfmul_vf_f32m2(qk_acc3, scale, qk_vl);
-
-                    __riscv_vse32_v_f32m2(kq_tile_buffer + 0 * ic_tile_step, qk_acc0, qk_vl);
-                    __riscv_vse32_v_f32m2(kq_tile_buffer + 1 * ic_tile_step, qk_acc1, qk_vl);
-                    __riscv_vse32_v_f32m2(kq_tile_buffer + 2 * ic_tile_step, qk_acc2, qk_vl);
-                    __riscv_vse32_v_f32m2(kq_tile_buffer + 3 * ic_tile_step, qk_acc3, qk_vl);
-                } else {
-                    static_assert(QLEN == 2, "unsupported QLEN");
-
-                    const size_t qk_vl   = __riscv_vsetvl_e16m1(ic_step);
-                    vfloat32m2_t qk_acc0 = __riscv_vfmv_v_f_f32m2(0.0f, qk_vl);
-                    vfloat32m2_t qk_acc1 = __riscv_vfmv_v_f_f32m2(0.0f, qk_vl);
-
-                    for (int64_t d = 0; d < DK; ++d) {
-                        const vfloat16m1_t k_vec = __riscv_vle16_v_f16m1(k_tile_pack + d * ic_tile_step, qk_vl);
-                        qk_acc0 = __riscv_vfwmacc_vf_f32m2(qk_acc0, qv_buffer[0 * DK + d], k_vec, qk_vl);
-                        qk_acc1 = __riscv_vfwmacc_vf_f32m2(qk_acc1, qv_buffer[1 * DK + d], k_vec, qk_vl);
-                    }
-
-                    qk_acc0 = __riscv_vfmul_vf_f32m2(qk_acc0, scale, qk_vl);
-                    qk_acc1 = __riscv_vfmul_vf_f32m2(qk_acc1, scale, qk_vl);
-
-                    __riscv_vse32_v_f32m2(kq_tile_buffer + 0 * ic_tile_step, qk_acc0, qk_vl);
-                    __riscv_vse32_v_f32m2(kq_tile_buffer + 1 * ic_tile_step, qk_acc1, qk_vl);
                 }
 
                 for (size_t i = 0; i < QLEN; ++i) {
@@ -910,42 +920,49 @@ static void flash_attn_ext_f16_one_chunk_inner_vlen1024_vf16_mrow(float **      
 
                 for (int64_t d0 = 0; d0 < DV; d0 += seg) {
                     const size_t vl = __riscv_vsetvl_e16m2(DV - d0);
-                    if constexpr (QLEN == 4) {
-                        vfloat16m2_t pv_acc0 = __riscv_vle16_v_f16m2(kq16_buffer + 0 * DV + d0, vl);
-                        vfloat16m2_t pv_acc1 = __riscv_vle16_v_f16m2(kq16_buffer + 1 * DV + d0, vl);
-                        vfloat16m2_t pv_acc2 = __riscv_vle16_v_f16m2(kq16_buffer + 2 * DV + d0, vl);
-                        vfloat16m2_t pv_acc3 = __riscv_vle16_v_f16m2(kq16_buffer + 3 * DV + d0, vl);
+                    for (size_t g = 0; g < QLEN; g += 4) {
+                        if constexpr (QLEN >= 4) {
+                            _Float16 *    o0 = kq16_buffer + (g + 0) * DV + d0;
+                            _Float16 *    o1 = kq16_buffer + (g + 1) * DV + d0;
+                            _Float16 *    o2 = kq16_buffer + (g + 2) * DV + d0;
+                            _Float16 *    o3 = kq16_buffer + (g + 3) * DV + d0;
+                            const float * p0 = kq_tile_buffer + (g + 0) * ic_tile_step;
+                            const float * p1 = kq_tile_buffer + (g + 1) * ic_tile_step;
+                            const float * p2 = kq_tile_buffer + (g + 2) * ic_tile_step;
+                            const float * p3 = kq_tile_buffer + (g + 3) * ic_tile_step;
 
-                        for (int64_t tk = 0; tk < ic_step; ++tk) {
-                            const vfloat16m2_t v16 = __riscv_vle16_v_f16m2(v_tile_pack + tk * DV + d0, vl);
-                            pv_acc0 = __riscv_vfmacc_vf_f16m2(pv_acc0, (_Float16) kq_tile_buffer[0 * ic_tile_step + tk],
-                                                              v16, vl);
-                            pv_acc1 = __riscv_vfmacc_vf_f16m2(pv_acc1, (_Float16) kq_tile_buffer[1 * ic_tile_step + tk],
-                                                              v16, vl);
-                            pv_acc2 = __riscv_vfmacc_vf_f16m2(pv_acc2, (_Float16) kq_tile_buffer[2 * ic_tile_step + tk],
-                                                              v16, vl);
-                            pv_acc3 = __riscv_vfmacc_vf_f16m2(pv_acc3, (_Float16) kq_tile_buffer[3 * ic_tile_step + tk],
-                                                              v16, vl);
+                            vfloat16m2_t pv_acc0 = __riscv_vle16_v_f16m2(o0, vl);
+                            vfloat16m2_t pv_acc1 = __riscv_vle16_v_f16m2(o1, vl);
+                            vfloat16m2_t pv_acc2 = __riscv_vle16_v_f16m2(o2, vl);
+                            vfloat16m2_t pv_acc3 = __riscv_vle16_v_f16m2(o3, vl);
+
+                            for (int64_t tk = 0; tk < ic_step; ++tk) {
+                                const vfloat16m2_t v16 = __riscv_vle16_v_f16m2(v_tile_pack + tk * DV + d0, vl);
+                                pv_acc0 = __riscv_vfmacc_vf_f16m2(pv_acc0, (_Float16) p0[tk], v16, vl);
+                                pv_acc1 = __riscv_vfmacc_vf_f16m2(pv_acc1, (_Float16) p1[tk], v16, vl);
+                                pv_acc2 = __riscv_vfmacc_vf_f16m2(pv_acc2, (_Float16) p2[tk], v16, vl);
+                                pv_acc3 = __riscv_vfmacc_vf_f16m2(pv_acc3, (_Float16) p3[tk], v16, vl);
+                            }
+
+                            __riscv_vse16_v_f16m2(o0, pv_acc0, vl);
+                            __riscv_vse16_v_f16m2(o1, pv_acc1, vl);
+                            __riscv_vse16_v_f16m2(o2, pv_acc2, vl);
+                            __riscv_vse16_v_f16m2(o3, pv_acc3, vl);
+                        } else {
+                            vfloat16m2_t pv_acc0 = __riscv_vle16_v_f16m2(kq16_buffer + 0 * DV + d0, vl);
+                            vfloat16m2_t pv_acc1 = __riscv_vle16_v_f16m2(kq16_buffer + 1 * DV + d0, vl);
+
+                            for (int64_t tk = 0; tk < ic_step; ++tk) {
+                                const vfloat16m2_t v16 = __riscv_vle16_v_f16m2(v_tile_pack + tk * DV + d0, vl);
+                                pv_acc0 = __riscv_vfmacc_vf_f16m2(
+                                    pv_acc0, (_Float16) kq_tile_buffer[0 * ic_tile_step + tk], v16, vl);
+                                pv_acc1 = __riscv_vfmacc_vf_f16m2(
+                                    pv_acc1, (_Float16) kq_tile_buffer[1 * ic_tile_step + tk], v16, vl);
+                            }
+
+                            __riscv_vse16_v_f16m2(kq16_buffer + 0 * DV + d0, pv_acc0, vl);
+                            __riscv_vse16_v_f16m2(kq16_buffer + 1 * DV + d0, pv_acc1, vl);
                         }
-
-                        __riscv_vse16_v_f16m2(kq16_buffer + 0 * DV + d0, pv_acc0, vl);
-                        __riscv_vse16_v_f16m2(kq16_buffer + 1 * DV + d0, pv_acc1, vl);
-                        __riscv_vse16_v_f16m2(kq16_buffer + 2 * DV + d0, pv_acc2, vl);
-                        __riscv_vse16_v_f16m2(kq16_buffer + 3 * DV + d0, pv_acc3, vl);
-                    } else {
-                        vfloat16m2_t pv_acc0 = __riscv_vle16_v_f16m2(kq16_buffer + 0 * DV + d0, vl);
-                        vfloat16m2_t pv_acc1 = __riscv_vle16_v_f16m2(kq16_buffer + 1 * DV + d0, vl);
-
-                        for (int64_t tk = 0; tk < ic_step; ++tk) {
-                            const vfloat16m2_t v16 = __riscv_vle16_v_f16m2(v_tile_pack + tk * DV + d0, vl);
-                            pv_acc0 = __riscv_vfmacc_vf_f16m2(pv_acc0, (_Float16) kq_tile_buffer[0 * ic_tile_step + tk],
-                                                              v16, vl);
-                            pv_acc1 = __riscv_vfmacc_vf_f16m2(pv_acc1, (_Float16) kq_tile_buffer[1 * ic_tile_step + tk],
-                                                              v16, vl);
-                        }
-
-                        __riscv_vse16_v_f16m2(kq16_buffer + 0 * DV + d0, pv_acc0, vl);
-                        __riscv_vse16_v_f16m2(kq16_buffer + 1 * DV + d0, pv_acc1, vl);
                     }
                 }
 
@@ -989,7 +1006,19 @@ static void flash_attn_ext_f16_one_chunk_inner_vlen1024_vf16_mrow(float **      
     }
 
     for (size_t i = 0; i < QLEN; ++i) {
-        flash_attn_ext_finalize_row_f16(dst[i], kq16_buffer + i * DV, DV, S[i], M[i], sinks[i]);
+        if (partial) {
+            float * pr = partial + i * partial_stride;
+            pr[0]      = M[i];
+            pr[1]      = S[i];
+            for (int64_t d0 = 0; d0 < DV; d0 += seg) {
+                const size_t vl = __riscv_vsetvl_e16m2(DV - d0);
+                __riscv_vse32_v_f32m4(pr + 2 + d0,
+                                      __riscv_vfwcvt_f_f_v_f32m4(__riscv_vle16_v_f16m2(kq16_buffer + i * DV + d0, vl), vl),
+                                      vl);
+            }
+        } else {
+            flash_attn_ext_finalize_row_f16(dst[i], kq16_buffer + i * DV, DV, S[i], M[i], sinks[i]);
+        }
     }
 }
 
@@ -1353,6 +1382,155 @@ void forward_flash_attn_ext_f16_one_chunk_vlen1024_vf16(const ggml_compute_param
                 sinks ? ((float *) ((char *) sinks->data)) + h : nullptr,                    //
                 (float *) ((char *) dst->data + (iq3 * ne2 * ne1 + iq2 + iq1 * ne1) * nb1),  //
                 scale, logit_softcap, slope, nek1, nbk1, nbv1, DV, DK);
+        }
+    }
+}
+
+// Split-KV decode (flash-decoding) for a single query token: one work unit is (KV head, KV chunk) and
+// computes all rk2 query heads that share that KV head, so every K/V row is read once instead of once
+// per thread. Partials {M, S, VKQ[DV]} go to a shared buffer laid out [q head][chunk]; a second pass
+// (after a grid barrier) merges the chunks of each head.
+int flash_attn_ext_f16_split_kv_chunks_vlen1024_vf16(const ggml_tensor * dst, int nth) {
+    const ggml_tensor * q    = dst->src[0];
+    const ggml_tensor * k    = dst->src[1];
+    const ggml_tensor * v    = dst->src[2];
+    const ggml_tensor * mask = dst->src[3];
+
+    const float max_bias = ((const float *) dst->op_params)[1];
+
+    if (q->ne[1] != 1 || q->ne[3] != 1 || k->ne[3] != 1 || v->ne[3] != 1 || k->ne[2] != v->ne[2] ||
+        q->ne[2] % k->ne[2] != 0 || max_bias != 0.0f || (mask && (mask->ne[2] != 1 || mask->ne[3] != 1))) {
+        return 0;
+    }
+    const int64_t rk2 = q->ne[2] / k->ne[2];
+    if (rk2 != 2 && rk2 != 4 && rk2 != 8) {
+        return 0;
+    }
+    const int64_t n_chunks = std::max<int64_t>(1, nth / k->ne[2]);
+    // short contexts: the per-row path is already cheap
+    if (k->ne[1] < 128 * n_chunks) {
+        return 0;
+    }
+    return (int) n_chunks;
+}
+
+void forward_flash_attn_ext_f16_split_kv_partial_vlen1024_vf16(const ggml_compute_params * params,
+                                                               ggml_tensor *               dst,
+                                                               int                         n_chunks,
+                                                               float *                     partials,
+                                                               void *                      tcm_buffer,
+                                                               size_t                      tcm_buffer_size) {
+    const ggml_tensor * q    = dst->src[0];
+    const ggml_tensor * k    = dst->src[1];
+    const ggml_tensor * v    = dst->src[2];
+    const ggml_tensor * mask = dst->src[3];
+
+    const int64_t DK    = k->ne[0];
+    const int64_t DV    = v->ne[0];
+    const int64_t n_kv  = k->ne[1];
+    const int64_t n_kvh = k->ne[2];
+    const int64_t rk2   = q->ne[2] / n_kvh;
+
+    float scale         = ((const float *) dst->op_params)[0];
+    float logit_softcap = ((const float *) dst->op_params)[2];
+    if (logit_softcap != 0) {
+        scale /= logit_softcap;
+    }
+
+    const int64_t chunk  = (n_kv + n_chunks - 1) / n_chunks;
+    const int64_t stride = n_chunks * (2 + DV);
+
+    std::array<float *, 8> pq;
+    std::array<float *, 8> unused = {};
+
+    for (int64_t u = params->ith; u < n_kvh * n_chunks; u += params->nth) {
+        const int64_t kvh = u / n_chunks;
+        const int64_t c   = u % n_chunks;
+        const int64_t c0  = std::min(n_kv, c * chunk);
+        const int64_t c1  = std::min(n_kv, c0 + chunk);
+        const int64_t h0  = kvh * rk2;
+
+        for (int64_t i = 0; i < rk2; ++i) {
+            pq[i] = (float *) ((char *) q->data + (h0 + i) * q->nb[2]);
+        }
+        const ggml_fp16_t * mp = mask ? (const ggml_fp16_t *) mask->data + c0 : nullptr;
+        const char *        kd = (const char *) k->data + kvh * k->nb[2] + c0 * k->nb[1];
+        const char *        vd = (const char *) v->data + kvh * v->nb[2] + c0 * v->nb[1];
+        float *             pr = partials + (h0 * n_chunks + c) * (2 + DV);
+
+#define FA_SPLIT_MROW(QL)                                                                                      \
+    flash_attn_ext_f16_one_chunk_inner_vlen1024_vf16_mrow<QL>(pq.data(), kd, vd, mp, unused.data(), unused.data(), \
+                                                              scale, logit_softcap, 1.0f, c1 - c0, k->nb[1],      \
+                                                              v->nb[1], DV, DK, tcm_buffer, tcm_buffer_size, pr,  \
+                                                              stride)
+        switch (rk2) {
+            case 2: FA_SPLIT_MROW(2); break;
+            case 4: FA_SPLIT_MROW(4); break;
+            default: FA_SPLIT_MROW(8); break;
+        }
+#undef FA_SPLIT_MROW
+    }
+}
+
+void forward_flash_attn_ext_f16_split_kv_reduce_vlen1024_vf16(const ggml_compute_params * params,
+                                                              ggml_tensor *               dst,
+                                                              int                         n_chunks,
+                                                              const float *               partials) {
+    const ggml_tensor * q     = dst->src[0];
+    const ggml_tensor * v     = dst->src[2];
+    const ggml_tensor * sinks = dst->src[4];
+
+    const int64_t DV = v->ne[0];
+    const int64_t nh = q->ne[2];
+
+    float acc[FA_VLEN1024_MAX_D];
+
+    for (int64_t h = params->ith; h < nh; h += params->nth) {
+        const float * pr = partials + h * n_chunks * (2 + DV);
+
+        float M = -INFINITY;
+        for (int c = 0; c < n_chunks; ++c) {
+            M = std::max(M, pr[c * (2 + DV)]);
+        }
+
+        rvv_zero_f32(acc, DV);
+        float S = 0.0f;
+        if (M != -INFINITY) {
+            for (int c = 0; c < n_chunks; ++c) {
+                const float * pc = pr + c * (2 + DV);
+                if (pc[0] == -INFINITY) {
+                    continue;
+                }
+                const float w = expf(pc[0] - M);
+                S += w * pc[1];
+                for (int64_t d0 = 0; d0 < DV;) {
+                    const size_t vl = __riscv_vsetvl_e32m4(DV - d0);
+                    vfloat32m4_t a  = __riscv_vle32_v_f32m4(acc + d0, vl);
+                    a               = __riscv_vfmacc_vf_f32m4(a, w, __riscv_vle32_v_f32m4(pc + 2 + d0, vl), vl);
+                    __riscv_vse32_v_f32m4(acc + d0, a, vl);
+                    d0 += vl;
+                }
+            }
+        }
+
+        float ms = 1.0f;
+        if (sinks) {
+            const float s  = ((const float *) sinks->data)[h];
+            float       vs = 1.0f;
+            if (s > M) {
+                ms = M == -INFINITY ? 0.0f : expf(M - s);
+            } else {
+                vs = expf(s - M);
+            }
+            S = S * ms + vs;
+        }
+        const float f = S == 0.0f ? 0.0f : ms / S;
+
+        float * out = (float *) ((char *) dst->data + h * dst->nb[1]);
+        for (int64_t d0 = 0; d0 < DV;) {
+            const size_t vl = __riscv_vsetvl_e32m4(DV - d0);
+            __riscv_vse32_v_f32m4(out + d0, __riscv_vfmul_vf_f32m4(__riscv_vle32_v_f32m4(acc + d0, vl), f, vl), vl);
+            d0 += vl;
         }
     }
 }

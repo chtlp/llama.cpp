@@ -1571,6 +1571,24 @@ class tensor_traits_common : public tensor_traits_base {
         long   tcm_size = 0;
         void * tcm_buf  = spacemit_spert_shared_buffer(&tcm_size);
 
+        // single-token decode: split KV across threads so each K/V row is read once (GGML_SPACEMIT_FA_SPLITKV=0 disables)
+        static const bool split_kv = [] {
+            const char * e = getenv("GGML_SPACEMIT_FA_SPLITKV");
+            return !(e && e[0] == '0');
+        }();
+        const int n_split = (split_kv && !use_tiled && tcm_buf != nullptr) ?
+                                spacemit_kernels::rvv::flash_attn_ext_f16_split_kv_chunks_vlen1024_vf16(dst, nth) :
+                                0;
+        if (n_split > 0) {
+            float * partials = (float *) params->wdata;
+            spacemit_kernels::rvv::forward_flash_attn_ext_f16_split_kv_partial_vlen1024_vf16(params, dst, n_split,
+                                                                                             partials, tcm_buf, tcm_size);
+            spacemit_spert_grid_sync();
+            spacemit_kernels::rvv::forward_flash_attn_ext_f16_split_kv_reduce_vlen1024_vf16(params, dst, n_split,
+                                                                                            partials);
+            return;
+        }
+
         const int current_chunk = ith;
         if (current_chunk < nchunk) {
             const int64_t ir0 = dr * current_chunk;
