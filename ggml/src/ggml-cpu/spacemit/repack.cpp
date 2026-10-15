@@ -7,6 +7,7 @@
 #include "ggml-cpu.h"
 #include "ggml-impl.h"
 #include "ime_kernels.h"
+#include "rvv_kernels.h"
 
 #include <algorithm>
 #include <cassert>
@@ -1802,10 +1803,23 @@ template <> int repack<block_q4_0, 32, 32>(ggml_tensor * t, const void * data, s
 
 template <> int repack<block_q4_0, 256, 32>(ggml_tensor * t, const void * data, size_t data_size) {
 #if 1
-    return repack_q4_0_to_q4_0_256_32_bl_ref(t, 32, data, data_size);
+    int ret = repack_q4_0_to_q4_0_256_32_bl_ref(t, 32, data, data_size);
 #else
     //return repack_q4_0_to_q4_0_256_32_bl(t, 32, data, data_size);
 #endif
+    if (ret == 0 && spacemit_kernels::hp_aligned_enabled()) {
+        // signed int4 for gemm_kernel_i8i4_hp_al: q - 8 in two's complement is q ^ 8 per nibble
+        block_q4_0x32x256 * dst = (block_q4_0x32x256 *) t->data;
+        const int64_t       n   = ggml_nrows(t) / 32 * (t->ne[0] / 256);
+        for (int64_t i = 0; i < n; i++) {
+            for (auto & blk : dst[i].blocks) {
+                for (auto & q : blk.qs) {
+                    q ^= 0x88;
+                }
+            }
+        }
+    }
+    return ret;
 }
 
 template <> int repack<block_q4_1, 32, 32>(ggml_tensor * t, const void * data, size_t data_size) {

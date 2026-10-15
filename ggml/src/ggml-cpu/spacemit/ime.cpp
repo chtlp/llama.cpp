@@ -269,6 +269,16 @@ class tensor_traits_base : public ggml::cpu::tensor_traits {
 };
 
 template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS> class tensor_traits : public tensor_traits_base {
+    // Q4_0 hp: aligned 4-row A layout + signed int4 B (GGML_SPACEMIT_HP_ALIGNED, default on). The weights are
+    // repacked accordingly at load time, so this must be decided once per process.
+    static bool hp_aligned() {
+        if constexpr (std::is_same_v<BLOC_TYPE, block_q4_0> && INTER_SIZE == 256) {
+            return spacemit_kernels::hp_aligned_enabled();
+        } else {
+            return false;
+        }
+    }
+
     bool work_size(int n_threads, const ggml_tensor * op, size_t & size) override {
         switch (op->op) {
             case GGML_OP_MUL_MAT:
@@ -283,12 +293,17 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS> class tensor_
                                spacemit_kernels::q8_blk_size(QK4_0, true);
                     } else if constexpr (INTER_SIZE == 256) {
                         size = spacemit_kernels::div_round_up(src1_nelements, 256) *
-                               spacemit_kernels::q8_hp_blk_size(256, true, true);
+                               (hp_aligned() ? spacemit_kernels::q8_hp_al_row_blk_size :
+                                               spacemit_kernels::q8_hp_blk_size(256, true, true));
                     } else {
                         GGML_ABORT("unsupported block type");
                     }
 
                     size = GGML_PAD(size, sizeof(int64_t));
+                    if (hp_aligned()) {
+                        // room to align the workspace base and pad the A buffer (B may follow it in TCM)
+                        size = GGML_PAD(size, spacemit_kernels::q8_hp_al_align) + spacemit_kernels::q8_hp_al_align;
+                    }
 
                     return true;
                 }
@@ -322,8 +337,12 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS> class tensor_
                     if constexpr (INTER_SIZE == 256 && !std::is_same_v<BLOC_TYPE, block_q2_K> &&
                                   !std::is_same_v<BLOC_TYPE, block_q3_K>) {
                         const size_t nbw1 = spacemit_kernels::div_round_up(op->src[1]->ne[0], 256) *
-                                            spacemit_kernels::q8_hp_blk_size(256, true, true);
+                                            (hp_aligned() ? spacemit_kernels::q8_hp_al_row_blk_size :
+                                                            spacemit_kernels::q8_hp_blk_size(256, true, true));
                         size += mmid_m4_work_size(n_threads, op, nbw1);
+                        if (hp_aligned()) {
+                            size += spacemit_kernels::q8_hp_al_align;  // 128B alignment of the 4-row groups
+                        }
                     }
 
                     return true;
@@ -430,6 +449,12 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS> class tensor_
                     quantize_a_row_i8  = spacemit_kernels::rvv::quantize_a_row_i8_hp;
                     quantize_a_4row_i8 = spacemit_kernels::rvv::quantize_a_4row_i8_hp;
                     block_stride_a     = spacemit_kernels::q8_hp_blk_size(a_blk_len, true, true);
+                    if (hp_aligned()) {
+                        // 4-row groups take 4 * 304B per K256; single rows keep the 290B layout in a 304B slot
+                        gemm_kernel        = spacemit_kernels::ime2::gemm_kernel_i8i4_hp_al;
+                        quantize_a_4row_i8 = spacemit_kernels::rvv::quantize_a_4row_i8_hp_al;
+                        block_stride_a     = spacemit_kernels::q8_hp_al_row_blk_size;
+                    }
                     set_kernel_impl    = true;
                 } else {
                     gemm_kernel        = spacemit_kernels::ime2::gemm_kernel_i8i4;
@@ -486,13 +511,17 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS> class tensor_
         const int64_t b_k_blks = spacemit_kernels::div_round_up(gemm_k, b_blk_len);
 
         const int64_t row_stride_a        = a_k_blks * block_stride_a;
-        const int64_t gemm_workspace_size = GGML_PAD(gemm_m * row_stride_a, alignof(int64_t));
+        const int64_t ws_align            = hp_aligned() ? spacemit_kernels::q8_hp_al_align : alignof(int64_t);
+        const int64_t gemm_workspace_size = GGML_PAD(gemm_m * row_stride_a, ws_align);
 
-        if (ith == 0 && params->wsize < gemm_workspace_size) {
+        if (ith == 0 && params->wsize < gemm_workspace_size + (hp_aligned() ? ws_align : 0)) {
             GGML_ABORT("wsize less than gemm_workspace_size");
         }
 
         uintptr_t ws_ptr = reinterpret_cast<uintptr_t>(params->wdata);
+        if (hp_aligned()) {
+            ws_ptr = (ws_ptr + ws_align - 1) & ~(uintptr_t) (ws_align - 1);
+        }
 
         long          tcm_buffer_size = 0;
         void *        tcm_buffer      = spacemit_spert_shared_buffer(&tcm_buffer_size);
@@ -513,12 +542,16 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS> class tensor_
         spine_barrier_t * cur_barrier = &global_spine_env_info.init_barrier[barrier_idx];
 
         if (gemm_m == 1) {
+            // the 1-row kernels walk K blocks contiguously, so split at the 1-row block size (block_stride_a is
+            // the padded per-row slot size in the aligned hp layout)
+            const int64_t blk_stride_1row =
+                hp_aligned() ? (int64_t) spacemit_kernels::q8_hp_blk_size(a_blk_len, true, true) : block_stride_a;
             int task_per_thread = spacemit_kernels::div_round_up(a_k_blks, nth);
             int a_blk_start     = ith * task_per_thread;
             int a_blk_end       = std::min(a_blk_start + task_per_thread, (int) a_k_blks);
             if (a_blk_start < a_blk_end) {
                 quantize_a_row_i8(a_blk_len, feature + a_blk_start * a_blk_len, (a_blk_end - a_blk_start) * a_blk_len,
-                                  quant_a_buffer + a_blk_start * block_stride_a);
+                                  quant_a_buffer + a_blk_start * blk_stride_1row);
             }
         } else {
             int task_per_thread = spacemit_kernels::div_round_up(row_blks, nth);
@@ -795,6 +828,12 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS> class tensor_
                     if (mmid_m4_enabled()) {
                         quantize_a_4row_i8 = spacemit_kernels::rvv::quantize_a_4row_i8_hp;
                     }
+                    if (hp_aligned()) {
+                        gemm_kernel = spacemit_kernels::ime2::gemm_kernel_i8i4_hp_al;
+                        if (mmid_m4_enabled()) {
+                            quantize_a_4row_i8 = spacemit_kernels::rvv::quantize_a_4row_i8_hp_al;
+                        }
+                    }
                     set_kernel_impl = true;
                 } else {
                     gemm_kernel        = spacemit_kernels::ime2::gemm_kernel_i8i4;
@@ -885,9 +924,14 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS> class tensor_
         const bool use_m4  = quantize_a_4row_i8 != nullptr && ne01 % 32 == 0;
         const int64_t n_rows_all = (int64_t) n_ids * ids->ne[1];
         auto align64 = [](uintptr_t p) { return (p + 63) & ~(uintptr_t) 63; };
-        uintptr_t m4_ptr           = align64(reinterpret_cast<uintptr_t>(matrix_rows + n_as * ne12));
+        // per-row stride of the 4-row groups: 4 * nbw1_m4 bytes per group
+        const size_t nbw1_m4 = hp_aligned() ? a_k_blks * spacemit_kernels::q8_hp_al_row_blk_size : nbw1;
+        uintptr_t m4_ptr     = align64(reinterpret_cast<uintptr_t>(matrix_rows + n_as * ne12));
+        if (hp_aligned()) {
+            m4_ptr = (m4_ptr + spacemit_kernels::q8_hp_al_align - 1) & ~(uintptr_t) (spacemit_kernels::q8_hp_al_align - 1);
+        }
         uint8_t * m4_quant         = reinterpret_cast<uint8_t *>(m4_ptr);
-        m4_ptr                     = align64(m4_ptr + n_rows_all * nbw1);
+        m4_ptr                     = align64(m4_ptr + n_rows_all * nbw1_m4);
         int64_t * m4_expert_offset = reinterpret_cast<int64_t *>(m4_ptr);
         m4_ptr                     = align64(m4_ptr + n_as * sizeof(int64_t));
         int64_t * m4_n_groups      = reinterpret_cast<int64_t *>(m4_ptr);
@@ -991,7 +1035,7 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS> class tensor_
                     const float * src = (const float *) ((const char *) src1->data + (rm.i1 % ne11) * nb11 + rm.i2 * nb12);
                     memcpy(m4_a_f32 + r * ne10, src, ne10 * sizeof(float));
                 }
-                quantize_a_4row_i8(a_blk_len, m4_a_f32, ne10, m4_quant + (m4_expert_offset[cur_a] + r0) * nbw1);
+                quantize_a_4row_i8(a_blk_len, m4_a_f32, ne10, m4_quant + (m4_expert_offset[cur_a] + r0) * nbw1_m4);
             }
             spacemit_spert_grid_sync();
             st_lap(op_stats ? st->t_quant4 : st_t);
@@ -1139,8 +1183,8 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS> class tensor_
 
                 const int64_t n_cols = src0_cur_end - src0_cur_start;
                 if (use_m4 && n_cols % 32 == 0 && cne1 >= 4) {
-                    const uint8_t * a_grp = m4_quant + m4_expert_offset[cur_a] * nbw1;
-                    for (; ir1 + 4 <= src1_cur_end; ir1 += 4, a_grp += 4 * nbw1) {
+                    const uint8_t * a_grp = m4_quant + m4_expert_offset[cur_a] * nbw1_m4;
+                    for (; ir1 + 4 <= src1_cur_end; ir1 += 4, a_grp += 4 * nbw1_m4) {
                         gemm_kernel(b_blk_len, a_grp, src0_cur, b_col_zp, m4_c_tmp, 4, n_cols, b_k_blks, n_cols);
                         for (int r = 0; r < 4; ++r) {
                             const mmid_row_mapping rm = MMID_MATRIX_ROW(cur_a, ir1 + r);

@@ -136,6 +136,38 @@ size_t gemm_kernel_i8i4_hp(size_t          blk_len,
                            size_t          k_blks,
                            size_t          ldc);
 
+// Q4_0 hp with aligned 4-row A (rvv::quantize_a_4row_i8_hp_al) and signed-int4 B (GGML_SPACEMIT_HP_ALIGNED).
+// count_m >= 4 uses the 4-row kernel on one aligned 4-row group; otherwise one row in the 1-row hp layout.
+size_t gemm_kernel_i8i4_hp_al(size_t          blk_len,
+                              const uint8_t * quant_a_ptr,
+                              const uint8_t * quant_b_data,
+                              const uint8_t * quant_b_zp,
+                              float *         c_ptr,
+                              size_t          count_m,
+                              size_t          count_n,
+                              size_t          k_blks,
+                              size_t          ldc);
+
+void gemm_kernel_i8i4_hp_m4_al(size_t          blk_len,
+                               const uint8_t * quant_a_ptr,
+                               const uint8_t * quant_b_data,
+                               const uint8_t * quant_b_zp,
+                               float *         c_ptr,
+                               size_t          count_m,
+                               size_t          count_n,
+                               size_t          k_blks,
+                               size_t          ldc);
+
+void gemm_kernel_i8i4_hp_m1_s(size_t          blk_len,
+                              const uint8_t * quant_a_ptr,
+                              const uint8_t * quant_b_data,
+                              const uint8_t * quant_b_zp,
+                              float *         c_ptr,
+                              size_t          count_m,
+                              size_t          count_n,
+                              size_t          k_blks,
+                              size_t          ldc);
+
 size_t moe_m2_gemm_kernel_i8i4(size_t           blk_len,
                                const uint8_t ** quant_a_ptr,
                                const uint8_t *  quant_b_data,
