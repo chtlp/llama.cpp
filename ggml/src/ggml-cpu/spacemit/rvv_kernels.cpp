@@ -3999,6 +3999,9 @@ bool forward_ssm_conv_concat_f32(const ggml_compute_params * params, ggml_tensor
 //   S1  = Gam_C S0 + (E_C. o K)^T U
 // which equals the token recurrence S_t = e^{g_t} S_{t-1} + k_t beta_t (v_t - e^{g_t} S_{t-1}^T k_t)^T,
 // o_t = scale S_t^T q_t, up to float rounding. All products are 4-row blocked RVV matmuls.
+// Default chunk 16: everything runs at the A100's fp32 vector rate, so smaller chunks (less C^2 work) are
+// faster (Qwen3.6 pp512 GDN ms/token: chunk 8 1.23, 16 1.29, 32 1.53, 64 1.98, 128 2.74; recurrence 2.56).
+// KLD vs the recurrence is 0.004-0.005 for all chunk sizes (rounding-level for this MoE model).
 static bool gdn_chunk_enabled() {
     static const bool enabled = [] {
         const char * e = getenv("GGML_SPACEMIT_GDN_CHUNK");
@@ -4010,7 +4013,7 @@ static bool gdn_chunk_enabled() {
 static int64_t gdn_chunk_size() {
     static const int64_t cs = [] {
         const char * e = getenv("GGML_SPACEMIT_GDN_CHUNK_SIZE");
-        const int    v = e ? atoi(e) : 64;
+        const int    v = e ? atoi(e) : 16;
         return (int64_t) std::min(128, std::max(8, v));
     }();
     return cs;
