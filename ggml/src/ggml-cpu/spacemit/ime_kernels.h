@@ -148,6 +148,17 @@ size_t gemm_kernel_i8i4_hp_al(size_t          blk_len,
                               size_t          k_blks,
                               size_t          ldc);
 
+// Q4_0 hp, 8 rows (rvv::quantize_a_8row_i8_hp_m8 layout) x signed-int4 B; writes 8 rows of C (stride ldc).
+void gemm_kernel_i8i4_hp_m8(size_t          blk_len,
+                            const uint8_t * quant_a_ptr,
+                            const uint8_t * quant_b_data,
+                            const uint8_t * quant_b_zp,
+                            float *         c_ptr,
+                            size_t          count_m,
+                            size_t          count_n,
+                            size_t          k_blks,
+                            size_t          ldc);
+
 void gemm_kernel_i8i4_hp_m4_al(size_t          blk_len,
                                const uint8_t * quant_a_ptr,
                                const uint8_t * quant_b_data,
