@@ -221,6 +221,21 @@ static bool moe_store1_enabled() {
     return v;
 }
 
+// MoE: rows left after the full 8-row groups of an expert (1..7, including experts with fewer than 8 rows) run as
+// one zero-padded m8 group instead of a 4-row group plus single rows (GGML_SPACEMIT_MOE_PAD8=0 disables)
+static bool moe_pad8_enabled() {
+    static const bool v = fuse_env_enabled("GGML_SPACEMIT_MOE_PAD8");
+    return v;
+}
+
+// MoE: the up and gate MUL_MAT_ID of a layer are adjacent and read the same activations with the same expert ids;
+// the second one reuses the routing tables and 8-row groups the first one left in the work buffer
+// (GGML_SPACEMIT_MOE_REUSEQ=0 disables)
+static bool moe_reuseq_enabled() {
+    static const bool v = fuse_env_enabled("GGML_SPACEMIT_MOE_REUSEQ");
+    return v;
+}
+
 static bool fuse_conv_enabled() {
     static const bool enabled = fuse_env_enabled("GGML_SPACEMIT_FUSE_CONV");
     return enabled;
@@ -235,6 +250,7 @@ static bool fuse_moe_w_enabled() {
 constexpr int FUSE_P_PTR     = 8;   // MUL_MAT_ID: weights tensor pointer (2 slots)
 constexpr int FUSE_P_USES    = 11;  // scratch during graph prepare
 constexpr int FUSE_P_APPLIED = 12;  // MUL_MAT_ID: set to 1 by the kernel once it applied the weights
+constexpr int FUSE_P_REUSEQ  = 13;  // MUL_MAT_ID: 1 = reuse routing + 8-row quantization of the previous node
 constexpr int FUSE_P_AUX     = 14;  // scratch during graph prepare
 constexpr int FUSE_P_STATE   = 15;  // CONCAT: first column to write + 1 (0 = not fused); MUL_MAT_ID: 1 = fused
 
@@ -295,6 +311,25 @@ static void graph_prepare_fusions(ggml_cgraph * gf) {
             ggml_set_op_params_i32(t, FUSE_P_STATE, 0);
             ggml_set_op_params_i32(t, FUSE_P_APPLIED, 0);
             ggml_set_op_params_i32(t, FUSE_P_USES, 0);
+            ggml_set_op_params_i32(t, FUSE_P_REUSEQ, 0);
+        }
+    }
+
+    // adjacent MUL_MAT_IDs with the same activations, expert ids and expert matrix shape/type (ffn_up -> ffn_gate):
+    // nothing runs between them, so the work buffer still holds the first one's routing and quantized groups
+    if (moe_reuseq_enabled()) {
+        for (int i = 0; i + 1 < n; ++i) {
+            const ggml_tensor * a = ggml_graph_node(gf, i);
+            ggml_tensor *       b = ggml_graph_node(gf, i + 1);
+            if (a->op != GGML_OP_MUL_MAT_ID || b->op != GGML_OP_MUL_MAT_ID || a->src[1] != b->src[1] ||
+                a->src[2] != b->src[2] || a->src[0]->type != GGML_TYPE_Q4_0 || b->src[0]->type != GGML_TYPE_Q4_0 ||
+                !ggml_are_same_shape(a->src[0], b->src[0]) || !a->src[0]->buffer || !b->src[0]->buffer ||
+                a->src[0]->buffer->buft != ggml_backend_cpu_riscv64_spacemit_buffer_type() ||
+                b->src[0]->buffer->buft != ggml_backend_cpu_riscv64_spacemit_buffer_type() ||
+                (b->flags & GGML_TENSOR_FLAG_COMPUTE) == 0 || (a->flags & GGML_TENSOR_FLAG_COMPUTE) == 0) {
+                continue;
+            }
+            ggml_set_op_params_i32(b, FUSE_P_REUSEQ, 1);
         }
     }
 
@@ -450,9 +485,10 @@ static size_t mmid_m4_work_size(int n_threads, const ggml_tensor * op, size_t nb
     const int64_t n_rows = op->src[2]->ne[0] * op->src[2]->ne[1];  // n_expert_used * n_tokens
     const int64_t n_as   = op->src[0]->ne[2];
     size_t        size   = 64;
-    size += GGML_PAD(n_rows * nbw1, 64) + n_as * spacemit_kernels::q8_hp_al_align;  // per-expert alignment
+    // per-expert alignment and up to 8 padding rows per expert (zero-padded m8 groups)
+    size += GGML_PAD(n_rows * nbw1, 64) + n_as * (spacemit_kernels::q8_hp_al_align + 8 * nbw1);
     size += GGML_PAD(n_as * sizeof(int64_t), 64);
-    size += GGML_PAD((n_rows / 4 + 1) * 3 * sizeof(int32_t) + sizeof(int64_t), 64);
+    size += GGML_PAD((n_rows / 4 + 1 + n_as) * 3 * sizeof(int32_t) + sizeof(int64_t), 64);
     size += (size_t) n_threads * GGML_PAD((8 * op->src[1]->ne[0] + 8 * op->src[0]->ne[1]) * sizeof(float), 64);
     return size;
 }
@@ -1320,7 +1356,19 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS> class tensor_
         const uintptr_t ws_ptr         = reinterpret_cast<uintptr_t>(params->wdata);
         auto *          quant_a_buffer = reinterpret_cast<uint8_t *>(ws_ptr);
 
-        if (ne11 == 1) {
+        // every row goes through the 8-row groups (zero-padded tail): the 1-row quantized copy is not needed
+        bool pad8_all = false;
+        if constexpr (std::is_same_v<BLOC_TYPE, block_q4_0> && INTER_SIZE == 256) {
+            pad8_all = ids->ne[1] > 1 && quantize_a_4row_i8 != nullptr && ne01 % 32 == 0 && hp_aligned() &&
+                       spacemit_kernels::hp_m8_enabled() && moe_pad8_enabled();
+        }
+
+        // routing and 8-row groups already in the work buffer (previous node, same inputs); needs pad8_all on both
+        const bool reuse_q = pad8_all && ggml_get_op_params_i32(op, FUSE_P_REUSEQ) == 1;
+
+        if (pad8_all) {
+            // nothing: rows are quantized per 8-row group below
+        } else if (ne11 == 1) {
             for (int64_t ii = ith; ii < ne12 * a_k_blks; ii += nth) {
                 int64_t i12       = ii / a_k_blks;
                 int64_t ak_blk_id = ii % a_k_blks;
@@ -1363,12 +1411,12 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS> class tensor_
             m4_ptr = (m4_ptr + spacemit_kernels::q8_hp_al_align - 1) & ~(uintptr_t) (spacemit_kernels::q8_hp_al_align - 1);
         }
         uint8_t * m4_quant         = reinterpret_cast<uint8_t *>(m4_ptr);
-        m4_ptr                     = align64(m4_ptr + n_rows_all * nbw1_m4 + n_as * spacemit_kernels::q8_hp_al_align);
+        m4_ptr = align64(m4_ptr + n_rows_all * nbw1_m4 + n_as * (spacemit_kernels::q8_hp_al_align + 8 * nbw1_m4));
         int64_t * m4_expert_offset = reinterpret_cast<int64_t *>(m4_ptr);  // byte offset of each expert's groups
         m4_ptr                     = align64(m4_ptr + n_as * sizeof(int64_t));
         int64_t * m4_n_groups      = reinterpret_cast<int64_t *>(m4_ptr);
         int32_t * m4_groups        = reinterpret_cast<int32_t *>(m4_n_groups + 1);  // (expert, first row, rows)
-        m4_ptr                     = align64(m4_ptr + sizeof(int64_t) + (n_rows_all / 4 + 1) * 3 * sizeof(int32_t));
+        m4_ptr = align64(m4_ptr + sizeof(int64_t) + (n_rows_all / 4 + 1 + n_as) * 3 * sizeof(int32_t));
         const size_t m4_scratch_sz = GGML_PAD((8 * ne10 + 8 * ne01) * sizeof(float), 64);
         float *      m4_a_f32      = reinterpret_cast<float *>(m4_ptr + ith * m4_scratch_sz);
         float *      m4_c_tmp      = m4_a_f32 + 8 * ne10;
@@ -1377,6 +1425,25 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS> class tensor_
         }
 
         if (ith == 0) {
+            static FILE * ids_dump = [] {
+                const char * e = getenv("GGML_SPACEMIT_DUMP_IDS");
+                return e && e[0] ? fopen(e, "wb") : (FILE *) nullptr;
+            }();
+            if (ids_dump && ids->ne[1] > 1 && strstr(op->name, "ffn_moe_up") != nullptr && ids->type == GGML_TYPE_I32) {
+                // record: name[64], ne0, ne1, then ne0 x ne1 int32 (rows contiguous in ne0)
+                char name[64] = { 0 };
+                snprintf(name, sizeof(name), "%s", op->name);
+                const int32_t dims[2] = { (int32_t) ids->ne[0], (int32_t) ids->ne[1] };
+                fwrite(name, 1, sizeof(name), ids_dump);
+                fwrite(dims, sizeof(int32_t), 2, ids_dump);
+                for (int64_t i1 = 0; i1 < ids->ne[1]; i1++) {
+                    fwrite((const char *) ids->data + i1 * ids->nb[1], sizeof(int32_t), ids->ne[0], ids_dump);
+                }
+                fflush(ids_dump);
+            }
+        }
+
+        if (ith == 0 && !reuse_q) {
             // initialize matrix_row_counts
             memset(matrix_row_counts, 0, n_as * sizeof(int64_t));
 
@@ -1421,6 +1488,14 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS> class tensor_
                         m4_groups[3 * n_groups + 2] = 8;
                         n_groups++;
                         offset += m8_grp_bytes;
+                    }
+                    if (pad8_all && r < cne1) {
+                        m4_groups[3 * n_groups + 0] = cur_a;
+                        m4_groups[3 * n_groups + 1] = (int32_t) r;
+                        m4_groups[3 * n_groups + 2] = (int32_t) (cne1 - r);  // 1..7 real rows of an 8-row group
+                        n_groups++;
+                        offset += m8_grp_bytes;
+                        r = cne1;
                     }
                     for (; r + 4 <= cne1; r += 4) {
                         m4_groups[3 * n_groups + 0] = cur_a;
@@ -1467,7 +1542,7 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS> class tensor_
 
         st_lap(op_stats ? st->t_sync : st_t);
 
-        if (use_m4 && m4_n_groups[0] > 0) {
+        if (use_m4 && m4_n_groups[0] > 0 && !reuse_q) {
             const int64_t n_groups = m4_n_groups[0];
             for (int64_t gi = ith; gi < n_groups; gi += nth) {
                 const int     cur_a = m4_groups[3 * gi + 0];
@@ -1481,7 +1556,10 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS> class tensor_
                 // groups of an expert are laid out in row order: n8 x m8 group, then at most one m4 group
                 const int64_t n8  = use_m8 ? std::min<int64_t>(r0, (matrix_row_counts[cur_a] / 8) * 8) / 8 : 0;
                 uint8_t *     out = m4_quant + m4_expert_offset[cur_a] + n8 * m8_grp_bytes + (r0 - n8 * 8) * nbw1_m4;
-                if (nr == 8) {
+                if (nr < 8 && pad8_all) {
+                    memset(m4_a_f32 + nr * ne10, 0, (8 - nr) * ne10 * sizeof(float));
+                    spacemit_kernels::rvv::quantize_a_8row_i8_hp_m8(a_blk_len, m4_a_f32, ne10, out);
+                } else if (nr == 8) {
                     spacemit_kernels::rvv::quantize_a_8row_i8_hp_m8(a_blk_len, m4_a_f32, ne10, out);
                 } else {
                     quantize_a_4row_i8(a_blk_len, m4_a_f32, ne10, out);
@@ -1511,7 +1589,7 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS> class tensor_
         int ith_es = ith % nth_es;
         int ith_n  = (ith / nth_es) % nth_n;
 
-        if (valid_ep_count_t % nth == 0 && tcm_buffer != nullptr && valid_ep_count_t == n_as &&
+        if (!pad8_all && valid_ep_count_t % nth == 0 && tcm_buffer != nullptr && valid_ep_count_t == n_as &&
             valid_act_count_t == n_as && per_nb_cols_wsize <= tcm_buffer_size) {
             const bool has_pair = ((ith & 1) != 0) || (ith + 1 < nth);
 
@@ -1634,7 +1712,10 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS> class tensor_
                 int ir1 = src1_cur_start;
 
                 const int64_t n_cols = src0_cur_end - src0_cur_start;
-                if (use_m4 && n_cols % 32 == 0 && cne1 >= 4) {
+                if (pad8_all) {
+                    GGML_ASSERT(use_m8 && n_cols % 32 == 0);
+                }
+                if (use_m4 && n_cols % 32 == 0 && (cne1 >= 4 || pad8_all)) {
                     const uint8_t * a_grp = m4_quant + m4_expert_offset[cur_a];
                     st_lap(op_stats ? st->t_kernel : st_t);
                     for (; use_m8 && ir1 + 8 <= src1_cur_end; ir1 += 8, a_grp += m8_grp_bytes) {
@@ -1657,6 +1738,24 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS> class tensor_
                         } else {
                             st_lap(op_stats ? st->t_scatter : st_t);
                         }
+                    }
+                    if (pad8_all && ir1 < src1_cur_end) {
+                        // zero-padded tail group: compute 8 rows, keep the real ones
+                        const int nr = (int) (src1_cur_end - ir1);
+                        spacemit_kernels::ime2::gemm_kernel_i8i4_hp_m8(b_blk_len, a_grp, src0_cur, nullptr, m4_c_tmp, 8,
+                                                                       n_cols, b_k_blks, n_cols);
+                        if (op_stats) {
+                            st_lap(st->t_k8);
+                            st->rows_m8 += nr;
+                            st->flops_m8 += 2.0 * 8 * ne00 * n_cols;
+                        }
+                        for (int r = 0; r < nr; ++r) {
+                            const mmid_row_mapping rm = MMID_MATRIX_ROW(cur_a, ir1 + r);
+                            float * dst_row = (float *) ((char *) dst->data + (rm.i1 * nb1 + rm.i2 * nb2)) + src0_cur_start;
+                            mmid_store_row(dst_row, m4_c_tmp + r * n_cols, n_cols, fw, rm.i1, rm.i2);
+                        }
+                        st_lap(op_stats ? st->t_scatter : st_t);
+                        ir1 = src1_cur_end;
                     }
                     for (; ir1 + 4 <= src1_cur_end; ir1 += 4, a_grp += 4 * nbw1_m4) {
                         gemm_kernel(b_blk_len, a_grp, src0_cur, b_col_zp, m4_c_tmp, 4, n_cols, b_k_blks, n_cols);
