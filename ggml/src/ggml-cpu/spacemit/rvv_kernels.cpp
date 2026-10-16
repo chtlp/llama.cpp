@@ -4365,57 +4365,240 @@ static void gdn_ime_row(float * C, int n_ct, const _Float16 * A, const _Float16 
     }
 }
 
+// 2 row tiles x 4 col tiles, whole-register loads, next k tile loaded before the current one is computed (kt even).
+// C0 / C1: the 4 contiguous output tiles of row tile 0 / 1. ~7.4 vs ~20 cycles per vfwmadot for the plain loop
+// (L1-resident operands; bench-results/k3/20261016-k3-dev006-hp-m8-probe/gdn_bench.cpp).
+static void gdn_ime_24(float * C0, float * C1, const _Float16 * A0, const _Float16 * A1, const _Float16 * b0,
+                       const _Float16 * b1, const _Float16 * b2, const _Float16 * b3, int kt, bool init, float s) {
+    asm volatile(
+        "vsetvli        t0, x0, e32, m2           \n\t"
+        "vmv.v.i        v16, 0                    \n\t"
+        "vmv.v.i        v18, 0                    \n\t"
+        "vmv.v.i        v20, 0                    \n\t"
+        "vmv.v.i        v22, 0                    \n\t"
+        "vmv.v.i        v24, 0                    \n\t"
+        "vmv.v.i        v26, 0                    \n\t"
+        "vmv.v.i        v28, 0                    \n\t"
+        "vmv.v.i        v30, 0                    \n\t"
+        "beqz           %[INIT], 1f               \n\t"
+        "addi           t1, %[C0], 0            \n\t"
+        "vle32.v        v16, (t1)                 \n\t"
+        "vfmul.vf       v16, v16, %[S]            \n\t"
+        "addi           t1, %[C0], 256            \n\t"
+        "vle32.v        v18, (t1)                 \n\t"
+        "vfmul.vf       v18, v18, %[S]            \n\t"
+        "addi           t1, %[C0], 512            \n\t"
+        "vle32.v        v20, (t1)                 \n\t"
+        "vfmul.vf       v20, v20, %[S]            \n\t"
+        "addi           t1, %[C0], 768            \n\t"
+        "vle32.v        v22, (t1)                 \n\t"
+        "vfmul.vf       v22, v22, %[S]            \n\t"
+        "addi           t1, %[C1], 0            \n\t"
+        "vle32.v        v24, (t1)                 \n\t"
+        "vfmul.vf       v24, v24, %[S]            \n\t"
+        "addi           t1, %[C1], 256            \n\t"
+        "vle32.v        v26, (t1)                 \n\t"
+        "vfmul.vf       v26, v26, %[S]            \n\t"
+        "addi           t1, %[C1], 512            \n\t"
+        "vle32.v        v28, (t1)                 \n\t"
+        "vfmul.vf       v28, v28, %[S]            \n\t"
+        "addi           t1, %[C1], 768            \n\t"
+        "vle32.v        v30, (t1)                 \n\t"
+        "vfmul.vf       v30, v30, %[S]            \n\t"
+        "1:                                       \n\t"
+        "vsetvli        t0, x0, e16, m1           \n\t"
+        "mv             t3, %[A0]                 \n\t"
+        "mv             s2, %[A1]                 \n\t"
+        "mv             t4, %[B0]                 \n\t"
+        "mv             t5, %[B1]                 \n\t"
+        "mv             t6, %[B2]                 \n\t"
+        "mv             a7, %[B3]                 \n\t"
+        "srli           t2, %[KT], 1              \n\t"
+        "addi           t2, t2, -1                \n\t"
+        "vl1r.v         v0, (t3)                  \n\t"
+        "vl1r.v         v1, (s2)                  \n\t"
+        "vl1r.v         v2, (t4)                  \n\t"
+        "vl1r.v         v3, (t5)                  \n\t"
+        "vl1r.v         v4, (t6)                  \n\t"
+        "vl1r.v         v5, (a7)                  \n\t"
+        "beqz           t2, 3f                    \n\t"
+        "2:                                       \n\t"
+        "addi           t1, t3, 128            \n\t"
+        "vl1r.v         v6, (t1)                  \n\t"
+        "addi           t1, s2, 128            \n\t"
+        "vl1r.v         v7, (t1)                  \n\t"
+        "addi           t1, t4, 128            \n\t"
+        "vl1r.v         v8, (t1)                  \n\t"
+        "addi           t1, t5, 128            \n\t"
+        "vl1r.v         v9, (t1)                  \n\t"
+        "addi           t1, t6, 128            \n\t"
+        "vl1r.v         v10, (t1)                  \n\t"
+        "addi           t1, a7, 128            \n\t"
+        "vl1r.v         v11, (t1)                  \n\t"
+        "vfwmadot       v16, v0, v2             \n\t"
+        "vfwmadot       v18, v0, v3             \n\t"
+        "vfwmadot       v20, v0, v4             \n\t"
+        "vfwmadot       v22, v0, v5             \n\t"
+        "vfwmadot       v24, v1, v2             \n\t"
+        "vfwmadot       v26, v1, v3             \n\t"
+        "vfwmadot       v28, v1, v4             \n\t"
+        "vfwmadot       v30, v1, v5             \n\t"
+        "addi           t3, t3, 256               \n\t"
+        "addi           s2, s2, 256               \n\t"
+        "addi           t4, t4, 256               \n\t"
+        "addi           t5, t5, 256               \n\t"
+        "addi           t6, t6, 256               \n\t"
+        "addi           a7, a7, 256               \n\t"
+        "vl1r.v         v0, (t3)                  \n\t"
+        "vl1r.v         v1, (s2)                  \n\t"
+        "vl1r.v         v2, (t4)                  \n\t"
+        "vl1r.v         v3, (t5)                  \n\t"
+        "vl1r.v         v4, (t6)                  \n\t"
+        "vl1r.v         v5, (a7)                  \n\t"
+        "vfwmadot       v16, v6, v8             \n\t"
+        "vfwmadot       v18, v6, v9             \n\t"
+        "vfwmadot       v20, v6, v10             \n\t"
+        "vfwmadot       v22, v6, v11             \n\t"
+        "vfwmadot       v24, v7, v8             \n\t"
+        "vfwmadot       v26, v7, v9             \n\t"
+        "vfwmadot       v28, v7, v10             \n\t"
+        "vfwmadot       v30, v7, v11             \n\t"
+        "addi           t2, t2, -1                \n\t"
+        "bgtz           t2, 2b                    \n\t"
+        "3:                                       \n\t"
+        "addi           t1, t3, 128            \n\t"
+        "vl1r.v         v6, (t1)                  \n\t"
+        "addi           t1, s2, 128            \n\t"
+        "vl1r.v         v7, (t1)                  \n\t"
+        "addi           t1, t4, 128            \n\t"
+        "vl1r.v         v8, (t1)                  \n\t"
+        "addi           t1, t5, 128            \n\t"
+        "vl1r.v         v9, (t1)                  \n\t"
+        "addi           t1, t6, 128            \n\t"
+        "vl1r.v         v10, (t1)                  \n\t"
+        "addi           t1, a7, 128            \n\t"
+        "vl1r.v         v11, (t1)                  \n\t"
+        "vfwmadot       v16, v0, v2             \n\t"
+        "vfwmadot       v18, v0, v3             \n\t"
+        "vfwmadot       v20, v0, v4             \n\t"
+        "vfwmadot       v22, v0, v5             \n\t"
+        "vfwmadot       v24, v1, v2             \n\t"
+        "vfwmadot       v26, v1, v3             \n\t"
+        "vfwmadot       v28, v1, v4             \n\t"
+        "vfwmadot       v30, v1, v5             \n\t"
+        "vfwmadot       v16, v6, v8             \n\t"
+        "vfwmadot       v18, v6, v9             \n\t"
+        "vfwmadot       v20, v6, v10             \n\t"
+        "vfwmadot       v22, v6, v11             \n\t"
+        "vfwmadot       v24, v7, v8             \n\t"
+        "vfwmadot       v26, v7, v9             \n\t"
+        "vfwmadot       v28, v7, v10             \n\t"
+        "vfwmadot       v30, v7, v11             \n\t"
+        "vsetvli        t0, x0, e32, m2           \n\t"
+        "addi           t1, %[C0], 0            \n\t"
+        "vse32.v        v16, (t1)                 \n\t"
+        "addi           t1, %[C0], 256            \n\t"
+        "vse32.v        v18, (t1)                 \n\t"
+        "addi           t1, %[C0], 512            \n\t"
+        "vse32.v        v20, (t1)                 \n\t"
+        "addi           t1, %[C0], 768            \n\t"
+        "vse32.v        v22, (t1)                 \n\t"
+        "addi           t1, %[C1], 0            \n\t"
+        "vse32.v        v24, (t1)                 \n\t"
+        "addi           t1, %[C1], 256            \n\t"
+        "vse32.v        v26, (t1)                 \n\t"
+        "addi           t1, %[C1], 512            \n\t"
+        "vse32.v        v28, (t1)                 \n\t"
+        "addi           t1, %[C1], 768            \n\t"
+        "vse32.v        v30, (t1)                 \n\t"
+        :
+        : [C0] "r"(C0), [C1] "r"(C1), [A0] "r"(A0), [A1] "r"(A1), [B0] "r"(b0), [B1] "r"(b1), [B2] "r"(b2), [B3] "r"(b3),
+          [KT] "r"((long) kt), [INIT] "r"((long) init), [S] "f"(s)
+        : "t0", "t1", "t2", "t3", "t4", "t5", "t6", "a7", "s2", "v0", "v1", "v2", "v3", "v4", "v5", "v6", "v7", "v8", "v9",
+          "v10", "v11", "v16", "v17", "v18", "v19", "v20", "v21", "v22", "v23", "v24", "v25", "v26", "v27", "v28", "v29",
+          "v30", "v31", "memory");
+}
+
 // C = A x B^T: A panel n_rt x kt tiles, B panel n_ct x kt tiles, C tiles [n_rt][n_ct][64]
 static void gdn_ime_gemm(float * C, int n_rt, int n_ct, int kt, const _Float16 * A, const _Float16 * B, bool init,
                          float init_scale) {
-    for (int r = 0; r < n_rt; ++r) {
-        gdn_ime_row(C + (size_t) r * n_ct * 64, n_ct, A + (size_t) r * kt * 64, B, (size_t) kt * 64, kt, init,
-                    init_scale);
-    }
-}
-
-// fp32 row-major X (rows x cols, ld) -> fp16 panel [rows/8][cols/8][8][8] (rows, cols multiples of 8)
-static void gdn_pack(const float * X, int64_t ld, int rows, int cols, _Float16 * P) {
-    const int kt = cols / 8;
-    for (int r = 0; r < rows; ++r) {
-        _Float16 * dst = P + (size_t) (r / 8) * kt * 64 + (r % 8) * 8;
-        for (int c0 = 0; c0 < cols;) {
-            const size_t vl = __riscv_vsetvl_e32m4(cols - c0);
-            // 8-element pieces of the row go to consecutive tiles (stride 64 fp16): store as 64-bit x2 segments
-            vfloat16m2_t h  = __riscv_vfncvt_f_f_w_f16m2(__riscv_vle32_v_f32m4(X + r * ld + c0, vl), vl);
-            alignas(64) _Float16 tmp[128];
-            __riscv_vse16_v_f16m2(tmp, h, vl);
-            for (size_t c = 0; c < vl; c += 8) {
-                memcpy(dst + ((c0 + c) / 8) * 64, tmp + c, 16);
+    const size_t bs = (size_t) kt * 64;
+    int          r  = 0;
+    if (kt % 2 == 0) {
+        for (; r + 2 <= n_rt; r += 2) {
+            float *          c0 = C + (size_t) r * n_ct * 64;
+            float *          c1 = c0 + (size_t) n_ct * 64;
+            const _Float16 * a0 = A + (size_t) r * bs;
+            const _Float16 * a1 = a0 + bs;
+            int              c  = 0;
+            for (; c + 4 <= n_ct; c += 4) {
+                gdn_ime_24(c0 + c * 64, c1 + c * 64, a0, a1, B + c * bs, B + (c + 1) * bs, B + (c + 2) * bs,
+                           B + (c + 3) * bs, kt, init, init_scale);
             }
-            c0 += vl;
+            if (c < n_ct) {
+                gdn_ime_row(c0 + c * 64, n_ct - c, a0, B + c * bs, bs, kt, init, init_scale);
+                gdn_ime_row(c1 + c * 64, n_ct - c, a1, B + c * bs, bs, kt, init, init_scale);
+            }
+        }
+    }
+    for (; r < n_rt; ++r) {
+        gdn_ime_row(C + (size_t) r * n_ct * 64, n_ct, A + (size_t) r * bs, B, bs, kt, init, init_scale);
+    }
+}
+
+// fp32 row-major X (rows x cols, ld; row r scaled by rw[r] if given) -> fp16 panel [rows/8][cols/8][8][8]
+// (rows, cols multiples of 8, cols <= 128). Rows are converted into a row-major fp16 scratch, then every tile is
+// one strided segment load (8 rows x 16B) and one segment store; strided element loads are ~50x slower on A100.
+static void gdn_pack(const float * X, int64_t ld, int rows, int cols, _Float16 * P, const float * rw = nullptr) {
+    static thread_local std::vector<_Float16> h;
+    if (h.size() < (size_t) rows * cols) {
+        h.resize((size_t) rows * cols);
+    }
+    for (int r = 0; r < rows; ++r) {
+        const size_t vl = __riscv_vsetvl_e32m4(cols);
+        vfloat32m4_t v  = __riscv_vle32_v_f32m4(X + r * ld, vl);
+        if (rw) {
+            v = __riscv_vfmul_vf_f32m4(v, rw[r], vl);
+        }
+        __riscv_vse16_v_f16m2(h.data() + (size_t) r * cols, __riscv_vfncvt_f_f_w_f16m2(v, vl), vl);
+    }
+    const int    kt = cols / 8;
+    const size_t vl = __riscv_vsetvl_e64m1(8);
+    for (int rb = 0; rb < rows / 8; ++rb) {
+        for (int k = 0; k < kt; ++k) {
+            vuint64m1x2_t t = __riscv_vlsseg2e64_v_u64m1x2(
+                (const uint64_t *) (h.data() + (size_t) rb * 8 * cols + k * 8), (ptrdiff_t) cols * 2, vl);
+            __riscv_vsseg2e64_v_u64m1x2((uint64_t *) (P + ((size_t) rb * kt + k) * 64), t, vl);
         }
     }
 }
 
-// fp32 row-major X (rows x cols, ld), column c scaled by w[c] (or 1) -> fp16 panel of X^T: [cols/8][rows/8][8][8]
-static void gdn_pack_t(const float * X, int64_t ld, int rows, int cols, const float * w, _Float16 * P) {
-    const int kt = rows / 8;
-    for (int c = 0; c < cols; ++c) {
-        _Float16 * dst = P + (size_t) (c / 8) * kt * 64 + (c % 8) * 8;
-        const size_t vl = __riscv_vsetvl_e32m4(rows);
-        vfloat32m4_t col = __riscv_vlse32_v_f32m4(X + c, ld * sizeof(float), vl);
-        if (w) {
-            col = __riscv_vfmul_vv_f32m4(col, __riscv_vle32_v_f32m4(w, vl), vl);
+// transposed panel: tile (k, r) of PT = transpose of tile (r, k) of P (n_rt x n_kt tiles), one vrgather per tile
+static void gdn_transpose_panel(const _Float16 * P, int n_rt, int n_kt, _Float16 * PT) {
+    static const std::vector<uint16_t> idx = [] {
+        std::vector<uint16_t> v(64);
+        for (int p = 0; p < 64; ++p) {
+            v[p] = (uint16_t) ((p % 8) * 8 + p / 8);
         }
-        alignas(64) _Float16 tmp[128];
-        __riscv_vse16_v_f16m2(tmp, __riscv_vfncvt_f_f_w_f16m2(col, vl), vl);
-        for (int r = 0; r < rows; r += 8) {
-            memcpy(dst + (r / 8) * 64, tmp + r, 16);
+        return v;
+    }();
+    const size_t vl = __riscv_vsetvl_e16m1(64);
+    vuint16m1_t  vi = __riscv_vle16_v_u16m1(idx.data(), vl);
+    for (int r = 0; r < n_rt; ++r) {
+        for (int k = 0; k < n_kt; ++k) {
+            vuint16m1_t t = __riscv_vle16_v_u16m1((const uint16_t *) (P + ((size_t) r * n_kt + k) * 64), vl);
+            __riscv_vse16_v_u16m1((uint16_t *) (PT + ((size_t) k * n_rt + r) * 64), __riscv_vrgather_vv_u16m1(t, vi, vl), vl);
         }
     }
 }
 
-// tiles [n_rt][n_ct][64] fp32 -> row-major (ld)
+// tiles [n_rt][n_ct][64] fp32 -> row-major (ld): per tile one segment load (8 rows x 32B) + one strided segment store
 static void gdn_untile(const float * T, int n_rt, int n_ct, float * X, int64_t ld) {
-    for (int r = 0; r < n_rt * 8; ++r) {
+    const size_t vl = __riscv_vsetvl_e64m1(8);
+    for (int r = 0; r < n_rt; ++r) {
         for (int c = 0; c < n_ct; ++c) {
-            memcpy(X + r * ld + c * 8, T + ((size_t) (r / 8) * n_ct + c) * 64 + (r % 8) * 8, 32);
+            vuint64m1x4_t t = __riscv_vlseg4e64_v_u64m1x4((const uint64_t *) (T + ((size_t) r * n_ct + c) * 64), vl);
+            __riscv_vssseg4e64_v_u64m1x4((uint64_t *) (X + (size_t) r * 8 * ld + c * 8), (ptrdiff_t) ld * 4, t, vl);
         }
     }
 }
@@ -4430,7 +4613,7 @@ static void gdn_chunked_head_ime(const gdn_chunk_args & a, int64_t iq1, int64_t 
     static thread_local std::vector<float>    fb;
     static thread_local std::vector<_Float16> hb;
     const size_t need_f = D * D + 6 * CS * D + 3 * CS * CS + 4 * CS + 64;
-    const size_t need_h = D * D + 4 * CS * D + 2 * CS * CS + 64;
+    const size_t need_h = D * D + 5 * CS * D + 2 * CS * CS + 64;
     if (fb.size() < need_f) fb.resize(need_f);
     if (hb.size() < need_h) hb.resize(need_h);
     float * Mt  = fb.data();          // state M = S^T (M[j][i]) as tiles [j/8][i/8][8][8]
@@ -4453,6 +4636,7 @@ static void gdn_chunked_head_ime(const gdn_chunk_args & a, int64_t iq1, int64_t 
     _Float16 * Utp = Qp + CS * D;     // U^T: rows j, k = s
     _Float16 * Ktp = Utp + CS * D;    // (w o K)^T: rows i, k = s
     _Float16 * Ap  = Ktp + CS * D;    // E o QK (lower incl): rows r, k = s
+    _Float16 * Xp  = Ap + CS * CS;    // scratch panel (rows s, k = j / i) before transposing
 
     // state in: M[j][i] = s_in[j * D + i] -> tiles
     for (int64_t j = 0; j < D; ++j) {
@@ -4537,7 +4721,8 @@ static void gdn_chunked_head_ime(const gdn_chunk_args & a, int64_t iq1, int64_t 
                 }
             }
             gdn_pack(QK, CS, (int) Cp, (int) Cp, Ap);
-            gdn_pack_t(U, D, (int) Cp, (int) D, nullptr, Utp);  // U^T: rows j, k = s
+            gdn_pack(U, D, (int) Cp, (int) D, Xp);
+            gdn_transpose_panel(Xp, CnT, DT, Utp);  // U^T: rows j, k = s
             // O = scale (Gam Q S0 + A U)
             gdn_ime_gemm(TB, CnT, DT, CnT, Ap, Utp, false, 0.0f);
             gdn_untile(TB, CnT, DT, P, D);
@@ -4548,7 +4733,8 @@ static void gdn_chunked_head_ime(const gdn_chunk_args & a, int64_t iq1, int64_t 
             }
 
             // M = Gam_C M + U^T (w o K)   (M[j][i] += sum_s U[s][j] w_s K[s][i])
-            gdn_pack_t(Kc, D, (int) Cp, (int) D, wst, Ktp);  // rows i, k = s
+            gdn_pack(Kc, D, (int) Cp, (int) D, Xp, wst);
+            gdn_transpose_panel(Xp, CnT, DT, Ktp);  // (w o K)^T: rows i, k = s
             gdn_ime_gemm(Mt, DT, DT, CnT, Utp, Ktp, true, Gam[Cn - 1]);
         }
     }
