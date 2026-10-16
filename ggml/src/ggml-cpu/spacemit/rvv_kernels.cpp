@@ -4257,10 +4257,12 @@ static void gdn_chunked_head(const gdn_chunk_args & a, int64_t iq1, int64_t ik1,
 // Same algorithm as gdn_chunked_head; the state stays fp32 in an 8x8 tile layout and is rounded to fp16 only as a
 // matmul operand. "Panels" are fp16 matrices stored as [row tile][k tile][8][8], so every vfwmadot operand is one
 // contiguous 128B load. The forward substitution for U stays in fp32 vector code.
+// Off by default: single-thread it is ~28% faster than the RVV fp32 chunked kernel, but at 8 threads (two harts per
+// Tensor Core, shared L2) Qwen3.6 pp512 GDN is 1.43 vs 1.29 ms/token. GGML_SPACEMIT_GDN_IME=1 enables it.
 static bool gdn_ime_enabled() {
     static const bool enabled = [] {
         const char * e = getenv("GGML_SPACEMIT_GDN_IME");
-        return !(e && e[0] == '0');
+        return e && e[0] == '1';
     }();
     return enabled;
 }
