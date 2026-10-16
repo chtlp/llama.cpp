@@ -3925,6 +3925,149 @@ void gemm_kernel_i8i4_hp_m4_al(size_t          blk_len,
 #undef HP_AL_LOAD_Y
 #undef HP_AL_MM8
 
+// m8: 8 rows of pre-split A (rvv::quantize_a_8row_i8_hp_m8) x signed-int4 B (same B tiles as the m4 kernel).
+// One vmadot.hp computes 8 rows x 8 cols x K32, so all 8 rows of every IME op are useful (m4 uses 4) and the
+// A operands are loaded as two aligned registers per subblock with no nibble unpacking. Subblocks run in pairs
+// with the next subblock's A (2 regs) and B (4 regs) loaded before the current one is computed; the last pair
+// of each K256 block never prefetches past it. Registers: scales v0-v3, B X v4-v7 / Y v28-v31, A X v24-v25 /
+// Y v26-v27, fp32 accumulators v8-v15 (4 x m2 in N8-group layout), fp16 accumulators hi v16-v19, lo v20-v23.
+// Microbenchmark (k3-dev-006, bench-results/k3/20261016-k3-dev006-hp-m8-probe): ~75 vs ~120 cycles per 8 rows x
+// N32 x K32 single-thread (1.55-1.65x over two m4 calls).
+#define M8_SCALE(OFF_T2, OFF_S5)                              \
+    "flh            fa0, " OFF_T2 "(t2)       \n\t"           \
+    "fmul.h         fa2, fa0, %[HP16]         \n\t"           \
+    "addi           t3, s5, " OFF_S5 "        \n\t"           \
+    "vsetvli        t0, x0, e16, mf2          \n\t"           \
+    "vle16.v        v1, (t3)                  \n\t"           \
+    "vfmul.vf       v2, v1, fa0               \n\t"           \
+    "vfmul.vf       v3, v1, fa2               \n\t"           \
+    "vsetvli        t0, x0, e8, m1            \n\t"           \
+    "vpack.vv       v0, v3, v2, 3             \n\t"           \
+    "vsetvli        t0, x0, e32, m1           \n\t"
+#define M8_MM(AL, AH, B0, B1, B2, B3)                         \
+    "vmadot.hp      v16, " AH ", " B0 ", v0, 0, i4 \n\t"      \
+    "vmadot.hp      v17, " AH ", " B1 ", v0, 1, i4 \n\t"      \
+    "vmadot.hp      v18, " AH ", " B2 ", v0, 2, i4 \n\t"      \
+    "vmadot.hp      v19, " AH ", " B3 ", v0, 3, i4 \n\t"      \
+    "vmadotus.hp    v20, " AL ", " B0 ", v0, 4, i4 \n\t"      \
+    "vmadotus.hp    v21, " AL ", " B1 ", v0, 5, i4 \n\t"      \
+    "vmadotus.hp    v22, " AL ", " B2 ", v0, 6, i4 \n\t"      \
+    "vmadotus.hp    v23, " AL ", " B3 ", v0, 7, i4 \n\t"
+#define M8_LOAD(OA, OA2, OB, AL, AH, B0)                      \
+    "addi           t3, t6, " OA "            \n\t"           \
+    "vl1r.v         " AL ", (t3)              \n\t"           \
+    "addi           t3, t6, " OA2 "           \n\t"           \
+    "vl1r.v         " AH ", (t3)              \n\t"           \
+    "addi           t3, s5, " OB "            \n\t"           \
+    "vl4r.v         " B0 ", (t3)              \n\t"
+
+void gemm_kernel_i8i4_hp_m8(size_t          blk_len,
+                            const uint8_t * quant_a_ptr,
+                            const uint8_t * quant_b_data,
+                            const uint8_t * quant_b_zp,
+                            float *         c_ptr,
+                            size_t          count_m,
+                            size_t          count_n,
+                            size_t          k_blks,
+                            size_t          ldc) {
+    constexpr size_t NB_COLS           = 32;
+    constexpr size_t b_superblk_stride = (NB_COLS * sizeof(_Float16) + 16 * NB_COLS) * 8;
+    static_assert(b_superblk_stride == 4608, "B superblock layout");
+    static_assert(q8_hp_m8_blk_size == 2176, "A superblock layout");
+
+    GGML_ASSERT(blk_len == 256);
+    GGML_ASSERT(count_m == 8);
+    GGML_ASSERT(quant_b_zp == nullptr);
+
+    const size_t   b_tile_stride = k_blks * b_superblk_stride;
+    const _Float16 hp_scale_16   = (_Float16) 16.0f;
+    alignas(128) float acc[4][64];  // [N8 group][row * 8 + col]
+
+    for (size_t ni = 0; ni + NB_COLS <= count_n; ni += NB_COLS) {
+        const uint8_t * b_tile = quant_b_data + (ni / NB_COLS) * b_tile_stride;
+
+        asm volatile(
+            "mv             t5, %[BK]                 \n\t"
+            "mv             t6, %[A]                  \n\t"
+            "mv             s5, %[B]                  \n\t"
+            "vsetvli        t0, x0, e32, m2           \n\t"
+            "vmv.v.i        v8, 0                     \n\t"
+            "vmv.v.i        v10, 0                    \n\t"
+            "vmv.v.i        v12, 0                    \n\t"
+            "vmv.v.i        v14, 0                    \n\t"
+            ".align 4                                 \n\t"
+            "_HPM8_BLK%=:                             \n\t"
+            "addi           t2, t6, 2047              \n\t"
+            "addi           t2, t2, 1                 \n\t"  // fp16 scales at block offset 2048
+            "flh            fa1, 16(t2)               \n\t"  // scale_avg
+            "vsetvli        t0, x0, e16, m1           \n\t"
+            "vmv.v.i        v16, 0                    \n\t"
+            "vmv.v.i        v17, 0                    \n\t"
+            "vmv.v.i        v18, 0                    \n\t"
+            "vmv.v.i        v19, 0                    \n\t"
+            "vmv.v.i        v20, 0                    \n\t"
+            "vmv.v.i        v21, 0                    \n\t"
+            "vmv.v.i        v22, 0                    \n\t"
+            "vmv.v.i        v23, 0                    \n\t"
+            "li             t4, 3                     \n\t"
+            M8_LOAD("0", "128", "64", "v24", "v25", "v4")
+            "_HPM8_SUB%=:                             \n\t"
+            M8_LOAD("256", "384", "640", "v26", "v27", "v28")
+            M8_SCALE("0", "0")
+            M8_MM("v24", "v25", "v4", "v5", "v6", "v7")
+            M8_LOAD("512", "640", "1216", "v24", "v25", "v4")
+            M8_SCALE("2", "576")
+            M8_MM("v26", "v27", "v28", "v29", "v30", "v31")
+            "addi           t6, t6, 512               \n\t"
+            "addi           t2, t2, 4                 \n\t"
+            "addi           s5, s5, 1152              \n\t"
+            "addi           t4, t4, -1                \n\t"
+            "bgtz           t4, _HPM8_SUB%=           \n\t"
+            M8_LOAD("256", "384", "640", "v26", "v27", "v28")
+            M8_SCALE("0", "0")
+            M8_MM("v24", "v25", "v4", "v5", "v6", "v7")
+            M8_SCALE("2", "576")
+            M8_MM("v26", "v27", "v28", "v29", "v30", "v31")
+            "addi           t6, t6, 640               \n\t"  // 1536 + 640 = 2176: next A block
+            "addi           s5, s5, 1152              \n\t"
+            "vsetvli        t0, x0, e16, m1           \n\t"
+            "vfadd.vv       v16, v16, v20             \n\t"
+            "vfadd.vv       v17, v17, v21             \n\t"
+            "vfadd.vv       v18, v18, v22             \n\t"
+            "vfadd.vv       v19, v19, v23             \n\t"
+            "vfwmacc.vf     v8, fa1, v16              \n\t"
+            "vfwmacc.vf     v10, fa1, v17             \n\t"
+            "vfwmacc.vf     v12, fa1, v18             \n\t"
+            "vfwmacc.vf     v14, fa1, v19             \n\t"
+            "addi           t5, t5, -1                \n\t"
+            "bgtz           t5, _HPM8_BLK%=           \n\t"
+            "vsetvli        t0, x0, e32, m2           \n\t"
+            "vse32.v        v8, (%[ACC])              \n\t"
+            "addi           t3, %[ACC], 256           \n\t"
+            "vse32.v        v10, (t3)                 \n\t"
+            "addi           t3, %[ACC], 512           \n\t"
+            "vse32.v        v12, (t3)                 \n\t"
+            "addi           t3, %[ACC], 768           \n\t"
+            "vse32.v        v14, (t3)                 \n\t"
+            :
+            : [A] "r"(quant_a_ptr), [B] "r"(b_tile), [BK] "r"(k_blks), [HP16] "f"(hp_scale_16), [ACC] "r"(&acc[0][0])
+            : "t0", "t2", "t3", "t4", "t5", "t6", "s5", "fa0", "fa1", "fa2", "v0", "v1", "v2", "v3", "v4", "v5",
+              "v6", "v7", "v8", "v9", "v10", "v11", "v12", "v13", "v14", "v15", "v16", "v17", "v18", "v19", "v20",
+              "v21", "v22", "v23", "v24", "v25", "v26", "v27", "v28", "v29", "v30", "v31", "memory");
+
+        for (size_t r = 0; r < 8; ++r) {
+            float * c_row = c_ptr + r * ldc + ni;
+            for (size_t g = 0; g < 4; ++g) {
+                memcpy(c_row + g * 8, &acc[g][r * 8], 8 * sizeof(float));
+            }
+        }
+    }
+}
+
+#undef M8_LOAD
+#undef M8_MM
+#undef M8_SCALE
+
 // gemm_kernel_i8i4_hp_m1 for signed-int4 B: no a_sum compensation, vmadot.hp / vmadotus.hp.
 void gemm_kernel_i8i4_hp_m1_s(size_t          blk_len,
                               const uint8_t * quant_a_ptr,

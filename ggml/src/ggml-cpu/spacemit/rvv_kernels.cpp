@@ -2802,6 +2802,79 @@ void quantize_a_4row_i8_hp_al(size_t blk_len, const float * a_ptr, size_t count_
     }
 }
 
+}  // namespace spacemit_kernels::rvv
+
+namespace spacemit_kernels {
+bool hp_m8_enabled() {
+    static const bool enabled = [] {
+        const char * e = getenv("GGML_SPACEMIT_HP_M8");
+        return hp_aligned_enabled() && !(e && e[0] == '0');
+    }();
+    return enabled;
+}
+}  // namespace spacemit_kernels
+
+namespace spacemit_kernels::rvv {
+
+// Same scales as quantize_a_4row_i8_hp_al with 8 rows per group; the int8 values are split into lo (u4) and
+// hi (s4) nibble planes at quantization time so the m8 kernel needs no per-subblock unpacking.
+void quantize_a_8row_i8_hp_m8(size_t blk_len, const float * a_ptr, size_t count_k, uint8_t * quant_a_ptr) {
+    constexpr size_t k_subblk_len = 32;
+    constexpr size_t subblk_count = 256 / k_subblk_len;
+    GGML_ASSERT(blk_len == 256);
+
+    const float stable_factor = 0.1f;
+    float       scale_temp[subblk_count];
+    alignas(64) int8_t q[k_subblk_len];
+
+    for (size_t k = 0; k < count_k; k += blk_len, quant_a_ptr += q8_hp_m8_blk_size) {
+        _Float16 * scale_ptr = reinterpret_cast<_Float16 *>(quant_a_ptr + 2048);
+        float      scale_avg = 0.0f;
+
+        for (size_t kk = 0; kk < subblk_count; ++kk) {
+            const size_t vl        = __riscv_vsetvl_e32m1(k_subblk_len);
+            vfloat32m1_t v_max_abs = __riscv_vfabs_v_f32m1(__riscv_vle32_v_f32m1(a_ptr + k + kk * k_subblk_len, vl), vl);
+            for (size_t r = 1; r < 8; ++r) {
+                vfloat32m1_t v = __riscv_vle32_v_f32m1(a_ptr + r * count_k + k + kk * k_subblk_len, vl);
+                v_max_abs      = __riscv_vfmax_vv_f32m1(v_max_abs, __riscv_vfabs_v_f32m1(v, vl), vl);
+            }
+            vfloat32m1_t v_a_max = __riscv_vfredmax_vs_f32m1_f32m1(v_max_abs, __riscv_vfmv_v_f_f32m1(0.0f, vl), vl);
+            scale_temp[kk]       = __riscv_vfmv_f_s_f32m1_f32(v_a_max) / ((1 << 7) - 1);
+            scale_avg += scale_temp[kk];
+        }
+
+        scale_avg /= subblk_count;
+        const float scale_factor = scale_avg ? stable_factor / scale_avg : 0.0f;
+        scale_ptr[8]             = static_cast<_Float16>(scale_avg / stable_factor);
+
+        for (size_t kk = 0; kk < subblk_count; ++kk) {
+            const float rep_scale_a = scale_temp[kk] ? 1.0f / scale_temp[kk] : 0.0f;
+            scale_ptr[kk]           = static_cast<_Float16>(scale_temp[kk] * scale_factor);
+            uint8_t * lo            = quant_a_ptr + kk * 256;
+            uint8_t * hi            = lo + 128;
+
+            for (size_t r = 0; r < 8; ++r) {
+                size_t       vl  = __riscv_vsetvl_e32m1(k_subblk_len);
+                vfloat32m1_t v_a = __riscv_vfmul_vf_f32m1(
+                    __riscv_vle32_v_f32m1(a_ptr + r * count_k + k + kk * k_subblk_len, vl), rep_scale_a, vl);
+                vint16mf2_t v16 = __riscv_vfncvt_x_f_w_i16mf2(v_a, vl);
+                __riscv_vse8_v_i8mf4(q, __riscv_vncvt_x_x_w_i8mf4(v16, vl), vl);
+
+                // pair even/odd k into bytes: low nibble = even k
+                vl              = __riscv_vsetvl_e8mf4(k_subblk_len / 2);
+                vint8mf4_t ev   = __riscv_vlse8_v_i8mf4(q, 2, vl);
+                vint8mf4_t od   = __riscv_vlse8_v_i8mf4(q + 1, 2, vl);
+                vint8mf4_t l    = __riscv_vor_vv_i8mf4(__riscv_vand_vx_i8mf4(ev, 15, vl),
+                                                       __riscv_vsll_vx_i8mf4(__riscv_vand_vx_i8mf4(od, 15, vl), 4, vl), vl);
+                vint8mf4_t h    = __riscv_vor_vv_i8mf4(__riscv_vand_vx_i8mf4(__riscv_vsra_vx_i8mf4(ev, 4, vl), 15, vl),
+                                                       __riscv_vsll_vx_i8mf4(__riscv_vsra_vx_i8mf4(od, 4, vl), 4, vl), vl);
+                __riscv_vse8_v_i8mf4((int8_t *) lo + r * 16, l, vl);
+                __riscv_vse8_v_i8mf4((int8_t *) hi + r * 16, h, vl);
+            }
+        }
+    }
+}
+
 void quantize_a_row_i8k(size_t blk_len, const float * a_ptr, size_t count_k, uint8_t * quant_a_ptr) {
     GGML_ASSERT(blk_len == 256);
     constexpr int64_t a_blk_stride = q8k_blk_size(256);

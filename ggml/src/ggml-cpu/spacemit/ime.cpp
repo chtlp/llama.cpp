@@ -382,10 +382,10 @@ static size_t mmid_m4_work_size(int n_threads, const ggml_tensor * op, size_t nb
     const int64_t n_rows = op->src[2]->ne[0] * op->src[2]->ne[1];  // n_expert_used * n_tokens
     const int64_t n_as   = op->src[0]->ne[2];
     size_t        size   = 64;
-    size += GGML_PAD(n_rows * nbw1, 64);
+    size += GGML_PAD(n_rows * nbw1, 64) + n_as * spacemit_kernels::q8_hp_al_align;  // per-expert alignment
     size += GGML_PAD(n_as * sizeof(int64_t), 64);
-    size += GGML_PAD((n_rows / 4 + 1) * 2 * sizeof(int32_t) + sizeof(int64_t), 64);
-    size += (size_t) n_threads * GGML_PAD((4 * op->src[1]->ne[0] + 4 * op->src[0]->ne[1]) * sizeof(float), 64);
+    size += GGML_PAD((n_rows / 4 + 1) * 3 * sizeof(int32_t) + sizeof(int64_t), 64);
+    size += (size_t) n_threads * GGML_PAD((8 * op->src[1]->ne[0] + 8 * op->src[0]->ne[1]) * sizeof(float), 64);
     return size;
 }
 
@@ -1129,6 +1129,12 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS> class tensor_
 
         // 4-row path workspace (sized by mmid_m4_work_size)
         const bool use_m4  = quantize_a_4row_i8 != nullptr && ne01 % 32 == 0;
+        // 8-row groups first, then at most one 4-row group per expert (signed-int4 Q4_0 only)
+        bool use_m8 = false;
+        if constexpr (std::is_same_v<BLOC_TYPE, block_q4_0> && INTER_SIZE == 256) {
+            use_m8 = use_m4 && hp_aligned() && spacemit_kernels::hp_m8_enabled();
+        }
+        const size_t m8_grp_bytes = a_k_blks * spacemit_kernels::q8_hp_m8_blk_size;
         const int64_t n_rows_all = (int64_t) n_ids * ids->ne[1];
         auto align64 = [](uintptr_t p) { return (p + 63) & ~(uintptr_t) 63; };
         // per-row stride of the 4-row groups: 4 * nbw1_m4 bytes per group
@@ -1138,15 +1144,15 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS> class tensor_
             m4_ptr = (m4_ptr + spacemit_kernels::q8_hp_al_align - 1) & ~(uintptr_t) (spacemit_kernels::q8_hp_al_align - 1);
         }
         uint8_t * m4_quant         = reinterpret_cast<uint8_t *>(m4_ptr);
-        m4_ptr                     = align64(m4_ptr + n_rows_all * nbw1_m4);
-        int64_t * m4_expert_offset = reinterpret_cast<int64_t *>(m4_ptr);
+        m4_ptr                     = align64(m4_ptr + n_rows_all * nbw1_m4 + n_as * spacemit_kernels::q8_hp_al_align);
+        int64_t * m4_expert_offset = reinterpret_cast<int64_t *>(m4_ptr);  // byte offset of each expert's groups
         m4_ptr                     = align64(m4_ptr + n_as * sizeof(int64_t));
         int64_t * m4_n_groups      = reinterpret_cast<int64_t *>(m4_ptr);
-        int32_t * m4_groups        = reinterpret_cast<int32_t *>(m4_n_groups + 1);  // (expert, first row) pairs
-        m4_ptr                     = align64(m4_ptr + sizeof(int64_t) + (n_rows_all / 4 + 1) * 2 * sizeof(int32_t));
-        const size_t m4_scratch_sz = GGML_PAD((4 * ne10 + 4 * ne01) * sizeof(float), 64);
+        int32_t * m4_groups        = reinterpret_cast<int32_t *>(m4_n_groups + 1);  // (expert, first row, rows)
+        m4_ptr                     = align64(m4_ptr + sizeof(int64_t) + (n_rows_all / 4 + 1) * 3 * sizeof(int32_t));
+        const size_t m4_scratch_sz = GGML_PAD((8 * ne10 + 8 * ne01) * sizeof(float), 64);
         float *      m4_a_f32      = reinterpret_cast<float *>(m4_ptr + ith * m4_scratch_sz);
-        float *      m4_c_tmp      = m4_a_f32 + 4 * ne10;
+        float *      m4_c_tmp      = m4_a_f32 + 8 * ne10;
         if (use_m4 && ith == 0) {
             GGML_ASSERT(m4_ptr + nth * m4_scratch_sz <= reinterpret_cast<uintptr_t>(params->wdata) + params->wsize);
         }
@@ -1187,13 +1193,23 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS> class tensor_
                 int64_t offset   = 0;
                 for (int cur_a = 0; cur_a < n_as; ++cur_a) {
                     const int64_t cne1 = matrix_row_counts[cur_a];
+                    offset = (offset + spacemit_kernels::q8_hp_al_align - 1) & ~(int64_t) (spacemit_kernels::q8_hp_al_align - 1);
                     m4_expert_offset[cur_a] = offset;
-                    for (int64_t r = 0; r + 4 <= cne1; r += 4) {
-                        m4_groups[2 * n_groups + 0] = cur_a;
-                        m4_groups[2 * n_groups + 1] = (int32_t) r;
+                    int64_t r = 0;
+                    for (; use_m8 && r + 8 <= cne1; r += 8) {
+                        m4_groups[3 * n_groups + 0] = cur_a;
+                        m4_groups[3 * n_groups + 1] = (int32_t) r;
+                        m4_groups[3 * n_groups + 2] = 8;
                         n_groups++;
+                        offset += m8_grp_bytes;
                     }
-                    offset += (cne1 / 4) * 4;
+                    for (; r + 4 <= cne1; r += 4) {
+                        m4_groups[3 * n_groups + 0] = cur_a;
+                        m4_groups[3 * n_groups + 1] = (int32_t) r;
+                        m4_groups[3 * n_groups + 2] = 4;
+                        n_groups++;
+                        offset += 4 * nbw1_m4;
+                    }
                 }
                 m4_n_groups[0] = n_groups;
             }
@@ -1235,14 +1251,22 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS> class tensor_
         if (use_m4 && m4_n_groups[0] > 0) {
             const int64_t n_groups = m4_n_groups[0];
             for (int64_t gi = ith; gi < n_groups; gi += nth) {
-                const int     cur_a = m4_groups[2 * gi + 0];
-                const int64_t r0    = m4_groups[2 * gi + 1];
-                for (int r = 0; r < 4; ++r) {
+                const int     cur_a = m4_groups[3 * gi + 0];
+                const int64_t r0    = m4_groups[3 * gi + 1];
+                const int     nr    = m4_groups[3 * gi + 2];
+                for (int r = 0; r < nr; ++r) {
                     const mmid_row_mapping rm = MMID_MATRIX_ROW(cur_a, r0 + r);
                     const float * src = (const float *) ((const char *) src1->data + (rm.i1 % ne11) * nb11 + rm.i2 * nb12);
                     memcpy(m4_a_f32 + r * ne10, src, ne10 * sizeof(float));
                 }
-                quantize_a_4row_i8(a_blk_len, m4_a_f32, ne10, m4_quant + (m4_expert_offset[cur_a] + r0) * nbw1_m4);
+                // groups of an expert are laid out in row order: n8 x m8 group, then at most one m4 group
+                const int64_t n8  = use_m8 ? std::min<int64_t>(r0, (matrix_row_counts[cur_a] / 8) * 8) / 8 : 0;
+                uint8_t *     out = m4_quant + m4_expert_offset[cur_a] + n8 * m8_grp_bytes + (r0 - n8 * 8) * nbw1_m4;
+                if (nr == 8) {
+                    spacemit_kernels::rvv::quantize_a_8row_i8_hp_m8(a_blk_len, m4_a_f32, ne10, out);
+                } else {
+                    quantize_a_4row_i8(a_blk_len, m4_a_f32, ne10, out);
+                }
             }
             spacemit_spert_grid_sync();
             st_lap(op_stats ? st->t_quant4 : st_t);
@@ -1391,7 +1415,17 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS> class tensor_
 
                 const int64_t n_cols = src0_cur_end - src0_cur_start;
                 if (use_m4 && n_cols % 32 == 0 && cne1 >= 4) {
-                    const uint8_t * a_grp = m4_quant + m4_expert_offset[cur_a] * nbw1_m4;
+                    const uint8_t * a_grp = m4_quant + m4_expert_offset[cur_a];
+                    for (; use_m8 && ir1 + 8 <= src1_cur_end; ir1 += 8, a_grp += m8_grp_bytes) {
+                        spacemit_kernels::ime2::gemm_kernel_i8i4_hp_m8(b_blk_len, a_grp, src0_cur, nullptr, m4_c_tmp, 8,
+                                                                       n_cols, b_k_blks, n_cols);
+                        for (int r = 0; r < 8; ++r) {
+                            const mmid_row_mapping rm = MMID_MATRIX_ROW(cur_a, ir1 + r);
+                            float * dst_row = (float *) ((char *) dst->data + (rm.i1 * nb1 + rm.i2 * nb2)) + src0_cur_start;
+                            memcpy(dst_row, m4_c_tmp + r * n_cols, n_cols * sizeof(float));
+                            mmid_scale_row(dst_row, n_cols, fw, rm.i1, rm.i2);
+                        }
+                    }
                     for (; ir1 + 4 <= src1_cur_end; ir1 += 4, a_grp += 4 * nbw1_m4) {
                         gemm_kernel(b_blk_len, a_grp, src0_cur, b_col_zp, m4_c_tmp, 4, n_cols, b_k_blks, n_cols);
                         for (int r = 0; r < 4; ++r) {

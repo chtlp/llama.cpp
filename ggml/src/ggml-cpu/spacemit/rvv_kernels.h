@@ -41,6 +41,15 @@ constexpr size_t q8_hp_m4al_blk_size = 1216;
 constexpr size_t q8_hp_al_row_blk_size = q8_hp_m4al_blk_size / 4;
 constexpr size_t q8_hp_al_align        = 128;
 
+// 8-row pre-split Q8 HP layout for the m8 kernel (GGML_SPACEMIT_HP_M8). One fp16 scale per K32 subblock shared
+// by the 8 rows; each int8 value v = 16 * hi + lo is stored as two int4 register images that vmadot.hp reads
+// directly (row r = bytes 16r..16r+15, k in low-then-high nibble order). Per K256 block of 8 rows:
+//   [8 x (128B lo u4 | 128B hi s4)][8 x fp16 scale][fp16 scale_avg][110B pad]                         = 2176B
+constexpr size_t q8_hp_m8_blk_size = 2176;
+
+// GGML_SPACEMIT_HP_M8=0 disables the 8-row kernel (default on; needs the aligned hp path).
+bool hp_m8_enabled();
+
 // GGML_SPACEMIT_HP_ALIGNED=0 disables the aligned-A / signed-B Q4_0 hp path (default on). Read once, so the
 // weight repack and the kernels always agree.
 bool hp_aligned_enabled();
@@ -128,6 +137,8 @@ void quantize_a_4row_i8_hp(size_t blk_len, const float * a_ptr, size_t count_k, 
 
 // aligned 4-row layout (q8_hp_m4al_blk_size per K256 block)
 void quantize_a_4row_i8_hp_al(size_t blk_len, const float * a_ptr, size_t count_k, uint8_t * quant_a_ptr);
+// 8 rows (row stride count_k) in the m8 layout (q8_hp_m8_blk_size per K256 block); quant_a_ptr 128B aligned
+void quantize_a_8row_i8_hp_m8(size_t blk_len, const float * a_ptr, size_t count_k, uint8_t * quant_a_ptr);
 
 void quantize_a_row_i8k(size_t blk_len, const float * a_ptr, size_t count_k, uint8_t * quant_a_ptr);
 
