@@ -4253,6 +4253,314 @@ static void gdn_chunked_head(const gdn_chunk_args & a, int64_t iq1, int64_t ik1,
     gdn_transpose(D, D, S, D, s_out, D);
 }
 
+// ---- chunkwise GDN with the matmuls on the IME (fp16 x fp16 -> fp32 vfwmadot, C[8x8] += A[8x8] B[8x8]^T) ----
+// Same algorithm as gdn_chunked_head; the state stays fp32 in an 8x8 tile layout and is rounded to fp16 only as a
+// matmul operand. "Panels" are fp16 matrices stored as [row tile][k tile][8][8], so every vfwmadot operand is one
+// contiguous 128B load. The forward substitution for U stays in fp32 vector code.
+static bool gdn_ime_enabled() {
+    static const bool enabled = [] {
+        const char * e = getenv("GGML_SPACEMIT_GDN_IME");
+        return !(e && e[0] == '0');
+    }();
+    return enabled;
+}
+
+// C tiles (n_ct tiles of 64 fp32, contiguous) = (init ? init_scale * C : 0) + A_panel_row x B_panel_rows^T over kt
+// k tiles: A is one row tile (kt tiles contiguous), B row tile c starts at B + c * b_rt_stride (in fp16 elements).
+static void gdn_ime_row(float * C, int n_ct, const _Float16 * A, const _Float16 * B, size_t b_rt_stride, int kt,
+                        bool init, float init_scale) {
+    int c = 0;
+    for (; c + 4 <= n_ct; c += 4) {
+        const _Float16 * b0 = B + (c + 0) * b_rt_stride;
+        const _Float16 * b1 = B + (c + 1) * b_rt_stride;
+        const _Float16 * b2 = B + (c + 2) * b_rt_stride;
+        const _Float16 * b3 = B + (c + 3) * b_rt_stride;
+        float *          cc = C + c * 64;
+        asm volatile(
+            "vsetvli        t0, x0, e32, m2           \n\t"
+            "beqz           %[INIT], 1f               \n\t"
+            "vle32.v        v16, (%[C0])              \n\t"
+            "vfmul.vf       v16, v16, %[S]            \n\t"
+            "addi           t1, %[C0], 256            \n\t"
+            "vle32.v        v18, (t1)                 \n\t"
+            "vfmul.vf       v18, v18, %[S]            \n\t"
+            "addi           t1, %[C0], 512            \n\t"
+            "vle32.v        v20, (t1)                 \n\t"
+            "vfmul.vf       v20, v20, %[S]            \n\t"
+            "addi           t1, %[C0], 768            \n\t"
+            "vle32.v        v22, (t1)                 \n\t"
+            "vfmul.vf       v22, v22, %[S]            \n\t"
+            "j              2f                        \n\t"
+            "1:                                       \n\t"
+            "vmv.v.i        v16, 0                    \n\t"
+            "vmv.v.i        v18, 0                    \n\t"
+            "vmv.v.i        v20, 0                    \n\t"
+            "vmv.v.i        v22, 0                    \n\t"
+            "2:                                       \n\t"
+            "vsetvli        t0, x0, e16, m1           \n\t"
+            "mv             t2, %[KT]                 \n\t"
+            "mv             t3, %[A]                  \n\t"
+            "mv             t4, %[B0]                 \n\t"
+            "mv             t5, %[B1]                 \n\t"
+            "mv             t6, %[B2]                 \n\t"
+            "mv             a7, %[B3]                 \n\t"
+            "3:                                       \n\t"
+            "vle16.v        v0, (t3)                  \n\t"
+            "vle16.v        v1, (t4)                  \n\t"
+            "vle16.v        v2, (t5)                  \n\t"
+            "vle16.v        v3, (t6)                  \n\t"
+            "vle16.v        v4, (a7)                  \n\t"
+            "vfwmadot       v16, v0, v1               \n\t"
+            "vfwmadot       v18, v0, v2               \n\t"
+            "vfwmadot       v20, v0, v3               \n\t"
+            "vfwmadot       v22, v0, v4               \n\t"
+            "addi           t3, t3, 128               \n\t"
+            "addi           t4, t4, 128               \n\t"
+            "addi           t5, t5, 128               \n\t"
+            "addi           t6, t6, 128               \n\t"
+            "addi           a7, a7, 128               \n\t"
+            "addi           t2, t2, -1                \n\t"
+            "bgtz           t2, 3b                    \n\t"
+            "vsetvli        t0, x0, e32, m2           \n\t"
+            "vse32.v        v16, (%[C0])              \n\t"
+            "addi           t1, %[C0], 256            \n\t"
+            "vse32.v        v18, (t1)                 \n\t"
+            "addi           t1, %[C0], 512            \n\t"
+            "vse32.v        v20, (t1)                 \n\t"
+            "addi           t1, %[C0], 768            \n\t"
+            "vse32.v        v22, (t1)                 \n\t"
+            :
+            : [C0] "r"(cc), [A] "r"(A), [B0] "r"(b0), [B1] "r"(b1), [B2] "r"(b2), [B3] "r"(b3), [KT] "r"((long) kt),
+              [INIT] "r"((long) init), [S] "f"(init_scale)
+            : "t0", "t1", "t2", "t3", "t4", "t5", "t6", "a7", "v0", "v1", "v2", "v3", "v4", "v16", "v17", "v18", "v19",
+              "v20", "v21", "v22", "v23", "memory");
+    }
+    for (; c < n_ct; ++c) {
+        const _Float16 * b0 = B + c * b_rt_stride;
+        float *          cc = C + c * 64;
+        asm volatile(
+            "vsetvli        t0, x0, e32, m2           \n\t"
+            "vmv.v.i        v16, 0                    \n\t"
+            "beqz           %[INIT], 1f               \n\t"
+            "vle32.v        v16, (%[C0])              \n\t"
+            "vfmul.vf       v16, v16, %[S]            \n\t"
+            "1:                                       \n\t"
+            "vsetvli        t0, x0, e16, m1           \n\t"
+            "mv             t2, %[KT]                 \n\t"
+            "mv             t3, %[A]                  \n\t"
+            "mv             t4, %[B0]                 \n\t"
+            "3:                                       \n\t"
+            "vle16.v        v0, (t3)                  \n\t"
+            "vle16.v        v1, (t4)                  \n\t"
+            "vfwmadot       v16, v0, v1               \n\t"
+            "addi           t3, t3, 128               \n\t"
+            "addi           t4, t4, 128               \n\t"
+            "addi           t2, t2, -1                \n\t"
+            "bgtz           t2, 3b                    \n\t"
+            "vsetvli        t0, x0, e32, m2           \n\t"
+            "vse32.v        v16, (%[C0])              \n\t"
+            :
+            : [C0] "r"(cc), [A] "r"(A), [B0] "r"(b0), [KT] "r"((long) kt), [INIT] "r"((long) init), [S] "f"(init_scale)
+            : "t0", "t2", "t3", "t4", "v0", "v1", "v16", "v17", "memory");
+    }
+}
+
+// C = A x B^T: A panel n_rt x kt tiles, B panel n_ct x kt tiles, C tiles [n_rt][n_ct][64]
+static void gdn_ime_gemm(float * C, int n_rt, int n_ct, int kt, const _Float16 * A, const _Float16 * B, bool init,
+                         float init_scale) {
+    for (int r = 0; r < n_rt; ++r) {
+        gdn_ime_row(C + (size_t) r * n_ct * 64, n_ct, A + (size_t) r * kt * 64, B, (size_t) kt * 64, kt, init,
+                    init_scale);
+    }
+}
+
+// fp32 row-major X (rows x cols, ld) -> fp16 panel [rows/8][cols/8][8][8] (rows, cols multiples of 8)
+static void gdn_pack(const float * X, int64_t ld, int rows, int cols, _Float16 * P) {
+    const int kt = cols / 8;
+    for (int r = 0; r < rows; ++r) {
+        _Float16 * dst = P + (size_t) (r / 8) * kt * 64 + (r % 8) * 8;
+        for (int c0 = 0; c0 < cols;) {
+            const size_t vl = __riscv_vsetvl_e32m4(cols - c0);
+            // 8-element pieces of the row go to consecutive tiles (stride 64 fp16): store as 64-bit x2 segments
+            vfloat16m2_t h  = __riscv_vfncvt_f_f_w_f16m2(__riscv_vle32_v_f32m4(X + r * ld + c0, vl), vl);
+            alignas(64) _Float16 tmp[128];
+            __riscv_vse16_v_f16m2(tmp, h, vl);
+            for (size_t c = 0; c < vl; c += 8) {
+                memcpy(dst + ((c0 + c) / 8) * 64, tmp + c, 16);
+            }
+            c0 += vl;
+        }
+    }
+}
+
+// fp32 row-major X (rows x cols, ld), column c scaled by w[c] (or 1) -> fp16 panel of X^T: [cols/8][rows/8][8][8]
+static void gdn_pack_t(const float * X, int64_t ld, int rows, int cols, const float * w, _Float16 * P) {
+    const int kt = rows / 8;
+    for (int c = 0; c < cols; ++c) {
+        _Float16 * dst = P + (size_t) (c / 8) * kt * 64 + (c % 8) * 8;
+        const size_t vl = __riscv_vsetvl_e32m4(rows);
+        vfloat32m4_t col = __riscv_vlse32_v_f32m4(X + c, ld * sizeof(float), vl);
+        if (w) {
+            col = __riscv_vfmul_vv_f32m4(col, __riscv_vle32_v_f32m4(w, vl), vl);
+        }
+        alignas(64) _Float16 tmp[128];
+        __riscv_vse16_v_f16m2(tmp, __riscv_vfncvt_f_f_w_f16m2(col, vl), vl);
+        for (int r = 0; r < rows; r += 8) {
+            memcpy(dst + (r / 8) * 64, tmp + r, 16);
+        }
+    }
+}
+
+// tiles [n_rt][n_ct][64] fp32 -> row-major (ld)
+static void gdn_untile(const float * T, int n_rt, int n_ct, float * X, int64_t ld) {
+    for (int r = 0; r < n_rt * 8; ++r) {
+        for (int c = 0; c < n_ct; ++c) {
+            memcpy(X + r * ld + c * 8, T + ((size_t) (r / 8) * n_ct + c) * 64 + (r % 8) * 8, 32);
+        }
+    }
+}
+
+static void gdn_chunked_head_ime(const gdn_chunk_args & a, int64_t iq1, int64_t ik1, int64_t iv1, int64_t iq3,
+                                 int64_t ik3, int64_t iv3, const float * s_in, float * s_out, float * attn_data) {
+    const int64_t D  = a.S_v;
+    const int64_t CS = (gdn_chunk_size() + 7) / 8 * 8;
+    const int     DT = (int) (D / 8);
+    const int     CT = (int) (CS / 8);
+
+    static thread_local std::vector<float>    fb;
+    static thread_local std::vector<_Float16> hb;
+    const size_t need_f = D * D + 6 * CS * D + 3 * CS * CS + 4 * CS + 64;
+    const size_t need_h = D * D + 4 * CS * D + 2 * CS * CS + 64;
+    if (fb.size() < need_f) fb.resize(need_f);
+    if (hb.size() < need_h) hb.resize(need_h);
+    float * Mt  = fb.data();          // state M = S^T (M[j][i]) as tiles [j/8][i/8][8][8]
+    float * Qc  = Mt + D * D;         // CS x D
+    float * Kc  = Qc + CS * D;
+    float * U   = Kc + CS * D;        // v rows, then U
+    float * P   = U + CS * D;         // K S0 (row-major), then (E o QK) U
+    float * QS  = P + CS * D;
+    float * KK  = QS + CS * D;        // CS x CS
+    float * QK  = KK + CS * CS;
+    float * E   = QK + CS * CS;
+    float * TB  = E + CS * CS;        // matmul output tiles (up to CS x D)
+    float * gam = TB + CS * D;
+    float * Gam = gam + CS;
+    float * bet = Gam + CS;
+    float * wst = bet + CS;
+    _Float16 * Mh  = hb.data();       // fp16 panel of M: rows j, k = i
+    _Float16 * Kp  = Mh + D * D;      // rows r, k = i
+    _Float16 * Qp  = Kp + CS * D;
+    _Float16 * Utp = Qp + CS * D;     // U^T: rows j, k = s
+    _Float16 * Ktp = Utp + CS * D;    // (w o K)^T: rows i, k = s
+    _Float16 * Ap  = Ktp + CS * D;    // E o QK (lower incl): rows r, k = s
+
+    // state in: M[j][i] = s_in[j * D + i] -> tiles
+    for (int64_t j = 0; j < D; ++j) {
+        for (int ib = 0; ib < DT; ++ib) {
+            memcpy(Mt + ((size_t) (j / 8) * DT + ib) * 64 + (j % 8) * 8, s_in + j * D + ib * 8, 32);
+        }
+    }
+
+    GGML_TENSOR_LOCALS(size_t, nbq, a.src_q, nb);
+    GGML_TENSOR_LOCALS(size_t, nbk, a.src_k, nb);
+    GGML_TENSOR_LOCALS(size_t, nbv, a.src_v, nb);
+    GGML_TENSOR_LOCALS(size_t, nbg, a.src_g, nb);
+    GGML_TENSOR_LOCALS(size_t, nbb, a.src_beta, nb);
+
+    const size_t vl = __riscv_vsetvl_e32m4(D);
+
+    for (int64_t t0 = 0; t0 < a.n_tokens; t0 += CS) {
+        const int64_t Cn = std::min(CS, a.n_tokens - t0);
+        const int     CnT = (int) ((Cn + 7) / 8);
+        const int64_t Cp  = CnT * 8;  // padded rows: zero q/k/v, beta 0, g 0
+
+        float acc_g = 0.0f;
+        for (int64_t r = 0; r < Cp; ++r) {
+            if (r < Cn) {
+                const int64_t t = t0 + r;
+                memcpy(Qc + r * D, (const char *) a.src_q->data + iq3 * nbq3 + t * nbq2 + iq1 * nbq1, D * sizeof(float));
+                memcpy(Kc + r * D, (const char *) a.src_k->data + ik3 * nbk3 + t * nbk2 + ik1 * nbk1, D * sizeof(float));
+                memcpy(U + r * D, (const char *) a.src_v->data + iv3 * nbv3 + t * nbv2 + iv1 * nbv1, D * sizeof(float));
+                acc_g += *(const float *) ((const char *) a.src_g->data + iv3 * nbg3 + t * nbg2 + iv1 * nbg1);
+                bet[r] = *(const float *) ((const char *) a.src_beta->data + iv3 * nbb3 + t * nbb2 + iv1 * nbb1);
+            } else {
+                memset(Qc + r * D, 0, D * sizeof(float));
+                memset(Kc + r * D, 0, D * sizeof(float));
+                memset(U + r * D, 0, D * sizeof(float));
+                bet[r] = 0.0f;
+            }
+            gam[r] = acc_g;
+            Gam[r] = expf(acc_g);
+        }
+        for (int64_t r = 0; r < Cp; ++r) {
+            for (int64_t c = 0; c <= r; ++c) {
+                E[r * CS + c] = expf(gam[r] - gam[c]);
+            }
+            wst[r] = r < Cn ? expf(gam[Cn - 1] - gam[r]) : 0.0f;
+        }
+
+        gdn_pack(Kc, D, (int) Cp, (int) D, Kp);
+        gdn_pack(Qc, D, (int) Cp, (int) D, Qp);
+        for (int t = 0; t < DT * DT; ++t) {  // fp16 copy of the state tiles = panel of M (rows j, k = i)
+            const size_t v64 = __riscv_vsetvl_e32m4(64);
+            __riscv_vse16_v_f16m2(Mh + t * 64, __riscv_vfncvt_f_f_w_f16m2(__riscv_vle32_v_f32m4(Mt + t * 64, v64), v64), v64);
+        }
+
+        // P = K M^T, QS = Q M^T  (tiles -> row-major)
+        {
+            gdn_ime_gemm(TB, CnT, DT, DT, Kp, Mh, false, 0.0f);
+            gdn_untile(TB, CnT, DT, P, D);
+            gdn_ime_gemm(TB, CnT, DT, DT, Qp, Mh, false, 0.0f);
+            gdn_untile(TB, CnT, DT, QS, D);
+            // KK = K K^T, QK = Q K^T
+            gdn_ime_gemm(TB, CnT, CnT, DT, Kp, Kp, false, 0.0f);
+            gdn_untile(TB, CnT, CnT, KK, CS);
+            gdn_ime_gemm(TB, CnT, CnT, DT, Qp, Kp, false, 0.0f);
+            gdn_untile(TB, CnT, CnT, QK, CS);
+
+            // U_r = beta_r (v_r - Gam_r P_r) - sum_{s<r} beta_r E_rs KK_rs U_s   (fp32 vector)
+            for (int64_t r = 0; r < Cp; ++r) {
+                vfloat32m4_t u = __riscv_vle32_v_f32m4(U + r * D, vl);
+                u              = __riscv_vfnmsac_vf_f32m4(u, Gam[r], __riscv_vle32_v_f32m4(P + r * D, vl), vl);
+                u              = __riscv_vfmul_vf_f32m4(u, bet[r], vl);
+                for (int64_t c = 0; c < r; ++c) {
+                    const float l = bet[r] * E[r * CS + c] * KK[r * CS + c];
+                    u             = __riscv_vfnmsac_vf_f32m4(u, l, __riscv_vle32_v_f32m4(U + c * D, vl), vl);
+                }
+                __riscv_vse32_v_f32m4(U + r * D, u, vl);
+            }
+
+            // A = E o QK, lower incl
+            for (int64_t r = 0; r < Cp; ++r) {
+                for (int64_t c = 0; c < Cp; ++c) {
+                    QK[r * CS + c] = c <= r ? QK[r * CS + c] * E[r * CS + c] : 0.0f;
+                }
+            }
+            gdn_pack(QK, CS, (int) Cp, (int) Cp, Ap);
+            gdn_pack_t(U, D, (int) Cp, (int) D, nullptr, Utp);  // U^T: rows j, k = s
+            // O = scale (Gam Q S0 + A U)
+            gdn_ime_gemm(TB, CnT, DT, CnT, Ap, Utp, false, 0.0f);
+            gdn_untile(TB, CnT, DT, P, D);
+            for (int64_t r = 0; r < Cn; ++r) {
+                vfloat32m4_t o = __riscv_vfmacc_vf_f32m4(__riscv_vle32_v_f32m4(P + r * D, vl), Gam[r],
+                                                         __riscv_vle32_v_f32m4(QS + r * D, vl), vl);
+                __riscv_vse32_v_f32m4(attn_data + (t0 + r) * D * a.H, __riscv_vfmul_vf_f32m4(o, a.scale, vl), vl);
+            }
+
+            // M = Gam_C M + U^T (w o K)   (M[j][i] += sum_s U[s][j] w_s K[s][i])
+            gdn_pack_t(Kc, D, (int) Cp, (int) D, wst, Ktp);  // rows i, k = s
+            gdn_ime_gemm(Mt, DT, DT, CnT, Utp, Ktp, true, Gam[Cn - 1]);
+        }
+    }
+
+    // tiles -> s_out[j * D + i]
+    for (int64_t j = 0; j < D; ++j) {
+        for (int ib = 0; ib < DT; ++ib) {
+            memcpy(s_out + j * D + ib * 8, Mt + ((size_t) (j / 8) * DT + ib) * 64 + (j % 8) * 8, 32);
+        }
+    }
+}
+
 // Gated delta net. Same math and output layout as ggml_compute_forward_gated_delta_net_one_chunk, but
 // every step touches only row j of the transposed state, so each row is loaded once, updated in registers
 // (decay, k-dot, rank-1 update, q-dot) and stored once, instead of a memcpy plus four passes over the state.
@@ -4316,7 +4624,8 @@ bool forward_gated_delta_net_f32(const ggml_compute_params * params, ggml_tensor
         for (int64_t ir = ir0; ir < ir1; ++ir) {
             const int64_t iv1 = ir % H;
             const int64_t iv3 = ir / H;
-            gdn_chunked_head(args, iv1 % neq1, iv1 % nek1, iv1, iv3 / rq3, iv3 / rk3, iv3,
+            (gdn_ime_enabled() && S_v % 8 == 0 ? gdn_chunked_head_ime : gdn_chunked_head)(
+                             args, iv1 % neq1, iv1 % nek1, iv1, iv3 / rq3, iv3 / rk3, iv3,
                              state_in_base + iv3 * state_seq_stride + iv1 * S_v * S_v,
                              state_out_base + (iv3 * H + iv1) * S_v * S_v,
                              attn_out_base + (iv3 * n_tokens * H + iv1) * S_v);
