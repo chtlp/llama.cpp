@@ -28,6 +28,8 @@ typedef struct {
     int64_t busy_ns;
     int64_t nthr;
     double  flops;
+    double  bytes;  // dst + all srcs, nbytes (MUL_MAT_ID counts every expert of src0)
+    char    shape[160];
 } op_stats_entry;
 
 typedef struct {
@@ -166,7 +168,34 @@ static void node_key(const struct ggml_tensor * t, char * buf, size_t n) {
         snprintf(buf, n, "%s:%s[%s]", op, name[0] ? name : "?", ggml_type_name(t->src[0]->type));
         return;
     }
+    if (getenv("GGML_OP_STATS_SHAPES")) {
+        // split by output shape, e.g. RMS_NORM:norm{128x32x512}
+        snprintf(buf, n, "%s:%s{%lldx%lldx%lld}", op, name[0] ? name : "?", (long long) t->ne[0], (long long) t->ne[1],
+                 (long long) t->ne[2]);
+        return;
+    }
     snprintf(buf, n, "%s:%s", op, name[0] ? name : "?");
+}
+
+static double node_bytes(const struct ggml_tensor * t) {
+    double b = (double) ggml_nbytes(t);
+    for (int i = 0; i < GGML_MAX_SRC; i++) {
+        if (t->src[i]) {
+            b += (double) ggml_nbytes(t->src[i]);
+        }
+    }
+    return b;
+}
+
+static void node_shape(const struct ggml_tensor * t, char * buf, size_t n) {
+    int off = snprintf(buf, n, "dst=%lldx%lldx%lld", (long long) t->ne[0], (long long) t->ne[1], (long long) t->ne[2]);
+    for (int i = 0; i < 3 && off < (int) n; i++) {
+        const struct ggml_tensor * s = t->src[i];
+        if (s) {
+            off += snprintf(buf + off, n - off, " s%d=%lldx%lldx%lld%s", i, (long long) s->ne[0], (long long) s->ne[1],
+                            (long long) s->ne[2], ggml_is_contiguous(s) ? "" : "(nc)");
+        }
+    }
 }
 
 static double node_flops(const struct ggml_tensor * t) {
@@ -234,6 +263,10 @@ void ggml_op_stats_graph_done(const struct ggml_cgraph * cgraph, int nth) {
             e->busy_ns += busy;
             e->nthr += cnt;
             e->flops += node_flops(cgraph->nodes[i]);
+            e->bytes += node_bytes(cgraph->nodes[i]);
+            if (!e->shape[0]) {
+                node_shape(cgraph->nodes[i], e->shape, sizeof(e->shape));
+            }
         }
     }
 
@@ -287,7 +320,7 @@ static void op_stats_dump(void) {
     if (path && path[0]) {
         tsv = fopen(path, "w");
         if (tsv) {
-            fprintf(tsv, "kind\tntok\tkey\tcalls\twall_ms\tbusy_ms\tnthr\tgflop\n");
+            fprintf(tsv, "kind\tntok\tkey\tcalls\twall_ms\tbusy_ms\tnthr\tgflop\tgbyte\tshape\n");
         }
     }
 
@@ -301,7 +334,7 @@ static void op_stats_dump(void) {
                 (long long) g->graphs, graph_ms, g->launch_ns / 1e6);
         fprintf(stderr, "%-44s %8s %11s %6s %7s %9s\n", "op:tensor", "calls", "wall_ms", "%", "util%", "GFLOP/s");
         if (tsv) {
-            fprintf(tsv, "graph\t%d\t-\t%lld\t%.3f\t%.3f\t0\t0\n", g->ntok, (long long) g->graphs, graph_ms,
+            fprintf(tsv, "graph\t%d\t-\t%lld\t%.3f\t%.3f\t0\t0\t0\t-\n", g->ntok, (long long) g->graphs, graph_ms,
                     g->launch_ns / 1e6);
         }
         for (int i = 0; i < n_rows; i++) {
@@ -319,8 +352,8 @@ static void op_stats_dump(void) {
                         100.0 * wall_ms / graph_ms, util, gflops);
             }
             if (tsv) {
-                fprintf(tsv, "op\t%d\t%s\t%lld\t%.3f\t%.3f\t%.2f\t%.3f\n", e->ntok, e->key, (long long) e->calls,
-                        wall_ms, e->busy_ns / 1e6, nthr_avg, e->flops / 1e9);
+                fprintf(tsv, "op\t%d\t%s\t%lld\t%.3f\t%.3f\t%.2f\t%.3f\t%.4f\t%s\n", e->ntok, e->key, (long long) e->calls,
+                        wall_ms, e->busy_ns / 1e6, nthr_avg, e->flops / 1e9, e->bytes / 1e9, e->shape[0] ? e->shape : "-");
             }
         }
     }

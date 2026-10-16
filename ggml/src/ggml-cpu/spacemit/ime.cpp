@@ -25,6 +25,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <functional>
 #include <cassert>
 #include <cerrno>
 #include <cmath>
@@ -141,6 +142,30 @@ struct alignas(64) mmid_phase_stats {
     int64_t w_tcm_miss;
     int64_t fast_path;
     double  kernel_flops;
+    // m8/m4 group path, split out of t_kernel / t_quant4
+    int64_t t_k8;
+    int64_t t_k4;
+    int64_t t_scatter;
+    int64_t t_q4wait;
+    int64_t t_scatter_wide;  // part of t_scatter for outputs wider than 1024 (ffn_down)
+    int64_t rows_m8;
+    double  flops_m8;
+    double  flops_m4;
+};
+
+// Dense MUL_MAT (multi-row) sub-phase stats, GGML_OP_STATS=1. Index: 0 q4_0, 1 q8_0, 2 other.
+struct alignas(64) dense_phase_stats {
+    int64_t calls;
+    int64_t t_total;
+    int64_t t_quant;
+    int64_t t_sync;
+    int64_t t_acopy;
+    int64_t t_bcopy;
+    int64_t t_barrier;
+    int64_t t_gemm;
+    int64_t branch[3];
+    double  flops;
+    double  b_bytes;  // weight bytes the kernels read (per pass over B)
 };
 
 struct mmid_route_stats {
@@ -393,6 +418,60 @@ static constexpr int     mmid_stats_max_threads = 64;
 static mmid_phase_stats  g_mmid_stats[2][mmid_stats_max_threads];
 static mmid_route_stats  g_mmid_route[2];
 static std::once_flag    g_mmid_stats_once;
+static dense_phase_stats g_dense_stats[3][mmid_stats_max_threads];
+static std::once_flag    g_dense_stats_once;
+
+static void dense_stats_dump() {
+    const char * kinds[3] = { "q4_0", "q8_0", "other" };
+    for (int k = 0; k < 3; k++) {
+        dense_phase_stats sum = {};
+        int               nth = 0;
+        for (int i = 0; i < mmid_stats_max_threads; i++) {
+            const dense_phase_stats & t = g_dense_stats[k][i];
+            if (t.calls == 0) {
+                continue;
+            }
+            nth++;
+            sum.calls += t.calls;
+            sum.t_total += t.t_total;
+            sum.t_quant += t.t_quant;
+            sum.t_sync += t.t_sync;
+            sum.t_acopy += t.t_acopy;
+            sum.t_bcopy += t.t_bcopy;
+            sum.t_barrier += t.t_barrier;
+            sum.t_gemm += t.t_gemm;
+            for (int b = 0; b < 3; b++) {
+                sum.branch[b] += t.branch[b];
+            }
+            sum.flops += t.flops;
+            sum.b_bytes += t.b_bytes;
+        }
+        if (nth == 0 || sum.t_total == 0) {
+            continue;
+        }
+        auto phase = [&](const char * name, int64_t ns) {
+            fprintf(stderr, "  %-34s %10.1f ms/thread %6.2f%%\n", name, ns / 1e6 / nth, 100.0 * ns / sum.t_total);
+        };
+        fprintf(stderr, "\n== spacemit dense MUL_MAT sub-phases (%s, multi-row): calls=%lld threads=%d ==\n", kinds[k],
+                (long long) (sum.calls / nth), nth);
+        fprintf(stderr, "  %-34s %10.1f ms/thread\n", "total", sum.t_total / 1e6 / nth);
+        phase("quantize A", sum.t_quant);
+        phase("grid sync after quantize", sum.t_sync);
+        phase("A copy to TCM", sum.t_acopy);
+        phase("B copy to TCM", sum.t_bcopy);
+        phase("pair barrier", sum.t_barrier);
+        phase("gemm kernels", sum.t_gemm);
+        phase("other", sum.t_total - sum.t_quant - sum.t_sync - sum.t_acopy - sum.t_bcopy - sum.t_barrier - sum.t_gemm);
+        const double gemm_s = sum.t_gemm / 1e9 / nth;
+        const double tot_s  = sum.t_total / 1e9 / nth;
+        fprintf(stderr, "  gemm throughput: %.1f GOP/s over %d threads (whole op %.1f GOP/s)\n",
+                gemm_s > 0 ? sum.flops / 1e9 / gemm_s : 0.0, nth, tot_s > 0 ? sum.flops / 1e9 / tot_s : 0.0);
+        fprintf(stderr, "  weight bytes read by kernels: %.1f GB/s during gemm (%.2f GB total)\n",
+                gemm_s > 0 ? sum.b_bytes / 1e9 / gemm_s : 0.0, sum.b_bytes / 1e9);
+        fprintf(stderr, "  branch calls (per thread): A-in-TCM %lld, B-in-TCM %lld, generic %lld\n",
+                (long long) (sum.branch[0] / nth), (long long) (sum.branch[1] / nth), (long long) (sum.branch[2] / nth));
+    }
+}
 
 static void mmid_stats_dump() {
     const char * kinds[2] = { "1 token", "multi-token" };
@@ -424,6 +503,14 @@ static void mmid_stats_dump() {
             sum.w_tcm_miss += t.w_tcm_miss;
             sum.fast_path += t.fast_path;
             sum.kernel_flops += t.kernel_flops;
+            sum.t_k8 += t.t_k8;
+            sum.t_k4 += t.t_k4;
+            sum.t_scatter += t.t_scatter;
+            sum.t_q4wait += t.t_q4wait;
+            sum.t_scatter_wide += t.t_scatter_wide;
+            sum.rows_m8 += t.rows_m8;
+            sum.flops_m8 += t.flops_m8;
+            sum.flops_m4 += t.flops_m4;
         }
         if (nth == 0) {
             continue;
@@ -438,17 +525,30 @@ static void mmid_stats_dump() {
         phase("quantize activations", sum.t_quant);
         phase("routing (thread 0 only)", sum.t_route);
         phase("grid sync after routing", sum.t_sync);
-        phase("4-row quantize + sync", sum.t_quant4);
+        phase("8/4-row quantize", sum.t_quant4);
+        phase("grid sync after 8/4-row quantize", sum.t_q4wait);
         phase("weight copy to TCM", sum.t_wcopy);
         phase("activation gather to TCM", sum.t_agather);
-        phase("gemm kernels", sum.t_kernel);
-        phase("other", sum.t_total - sum.t_quant - sum.t_route - sum.t_sync - sum.t_quant4 - sum.t_wcopy -
-                           sum.t_agather - sum.t_kernel);
-        const double kernel_s = sum.t_kernel / 1e9 / nth;
+        phase("gemm m8", sum.t_k8);
+        phase("gemm m4", sum.t_k4);
+        phase("m8/m4 output scatter + scale", sum.t_scatter);
+        phase("  of which ne01 > 1024 (down)", sum.t_scatter_wide);
+        phase("gemm m2/m1 + bookkeeping", sum.t_kernel);
+        phase("other", sum.t_total - sum.t_quant - sum.t_route - sum.t_sync - sum.t_quant4 - sum.t_q4wait -
+                           sum.t_wcopy - sum.t_agather - sum.t_kernel - sum.t_k8 - sum.t_k4 - sum.t_scatter);
+        auto tput = [&](const char * name, double flops, int64_t ns) {
+            const double s = ns / 1e9 / nth;
+            fprintf(stderr, "  %-34s %10.1f GOP/s over %d threads\n", name, s > 0 ? flops / 1e9 / s : 0.0, nth);
+        };
+        tput("m8 kernel throughput", sum.flops_m8, sum.t_k8);
+        tput("m4 kernel throughput", sum.flops_m4, sum.t_k4);
+        tput("m2/m1 kernel throughput", sum.kernel_flops - sum.flops_m8 - sum.flops_m4, sum.t_kernel);
+        fprintf(stderr, "  rows via m8 kernel: %lld\n", (long long) sum.rows_m8);
+        const double kernel_s = (sum.t_kernel + sum.t_k8 + sum.t_k4 + sum.t_scatter) / 1e9 / nth;
         fprintf(stderr, "  kernel throughput: %.1f GOP/s over %d threads (%.2f GOP/s/thread)\n",
                 kernel_s > 0 ? sum.kernel_flops / 1e9 / kernel_s : 0.0, nth,
                 kernel_s > 0 ? sum.kernel_flops / 1e9 / kernel_s / nth : 0.0);
-        fprintf(stderr, "  rows via m4 kernel: %lld, m2 kernel: %lld, m1 kernel: %lld (summed over threads)\n",
+        fprintf(stderr, "  rows via m4 kernel (incl. m8): %lld, m2 kernel: %lld, m1 kernel: %lld (summed over threads)\n",
                 (long long) sum.rows_m4, (long long) sum.rows_m2, (long long) sum.rows_m1);
         fprintf(stderr, "  expert weight slice in TCM: %lld, not in TCM: %lld, fast-path calls: %lld\n",
                 (long long) sum.w_tcm_hit, (long long) sum.w_tcm_miss, (long long) sum.fast_path);
@@ -737,6 +837,11 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS> class tensor_
         auto * quant_a_buffer = reinterpret_cast<uint8_t *>(ws_ptr);
 
         const int64_t row_align = use_m8 ? 8 : 4;
+        // experiment: GGML_SPACEMIT_DENSE_MBLK=R gives each thread R consecutive row groups per pass over B
+        static const int64_t dense_mblk = [] {
+            const char * e = getenv("GGML_SPACEMIT_DENSE_MBLK");
+            return e ? std::max<int64_t>(1, atoll(e)) : (int64_t) 1;
+        }();
         const int64_t     row_blks  = spacemit_kernels::div_round_up(gemm_m, row_align);
 
         const int64_t row_stride_b      = b_k_blks * get_repacked_block_type_size<BLOC_TYPE, INTER_SIZE, NB_COLS>();
@@ -744,6 +849,35 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS> class tensor_
         const int64_t per_nb_cols_wsize = NB_COLS * row_stride_b;
 
         const int64_t barrier_idx = static_cast<int64_t>(ith / 2);
+
+        const bool          dstats = gemm_m > 1 && ggml_op_stats_enabled() && ith < mmid_stats_max_threads;
+        dense_phase_stats * ds     = dstats ? &g_dense_stats[std::is_same_v<BLOC_TYPE, block_q4_0>   ? 0 :
+                                                             std::is_same_v<BLOC_TYPE, block_q8_0> ? 1 :
+                                                                                                     2][ith] :
+                                              nullptr;
+        const int64_t       ds_t0  = dstats ? ggml_op_stats_now_ns() : 0;
+        int64_t             ds_t   = ds_t0;
+        int64_t             ds_dummy = 0;
+        auto                ds_lap = [&](int64_t & acc) {
+            if (dstats) {
+                const int64_t now = ggml_op_stats_now_ns();
+                acc += now - ds_t;
+                ds_t = now;
+            }
+        };
+        struct ds_finish_t {
+            std::function<void()> f;
+            ~ds_finish_t() { f(); }
+        } ds_finish{ [&] {
+            if (dstats) {
+                ds_lap(ds->t_gemm);
+                ds->t_total += ds_t - ds_t0;
+                ds->calls++;
+            }
+        } };
+        if (dstats) {
+            std::call_once(g_dense_stats_once, [] { atexit(dense_stats_dump); });
+        }
 
         GGML_ASSERT(global_spine_env_info.init_barrier != nullptr);
         GGML_ASSERT(barrier_idx < static_cast<int64_t>(spine_init_barrier_count));
@@ -795,7 +929,9 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS> class tensor_
             }
         }
 
+        ds_lap(dstats ? ds->t_quant : ds_dummy);
         spacemit_spert_grid_sync();
+        ds_lap(dstats ? ds->t_sync : ds_dummy);
 
         const int64_t gemm_m_stride     = gemm_n / gemm_m > 64 ? gemm_m : 16;
         const int64_t gemm_m_blocked    = spacemit_kernels::div_round_up(gemm_m, gemm_m_stride);
@@ -808,14 +944,33 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS> class tensor_
         }
 
         if (gemm_n_stride == gemm_n && tcm_buffer != nullptr && per_mb_rows_wsize <= tcm_buffer_size) {
-            for (int64_t m_start = ith * row_align; m_start < gemm_m; m_start += row_align * nth) {
+            if (dstats) {
+                ds->branch[0]++;
+            }
+            int64_t m_blk = row_align;
+            if (dense_mblk > 1 && gemm_m > row_align) {
+                // largest R' <= R that still gives every thread a block and fits TCM
+                for (int64_t r = dense_mblk; r >= 1; r--) {
+                    if (r * row_align * row_stride_a <= tcm_buffer_size &&
+                        spacemit_kernels::div_round_up(gemm_m, r * row_align) >= nth) {
+                        m_blk = r * row_align;
+                        break;
+                    }
+                }
+            }
+            for (int64_t m_start = ith * m_blk; m_start < gemm_m; m_start += m_blk * nth) {
                 uint8_t * b_col    = reinterpret_cast<uint8_t *>(w_data);
                 uint8_t * b_col_zp = block_type_has_zp<BLOC_TYPE>() ? b_col : nullptr;
 
-                int64_t m_row_real = std::min(gemm_m - m_start, row_align);
+                int64_t m_row_real = std::min(gemm_m - m_start, m_blk);
 
                 spacemit_kernels::rvv::memcpy1d(tcm_buffer, quant_a_buffer + m_start * row_stride_a,
                                                 m_row_real * row_stride_a);
+                if (dstats) {
+                    ds_lap(ds->t_acopy);
+                    ds->flops += 2.0 * m_row_real * gemm_n * gemm_k;
+                    ds->b_bytes += (double) gemm_n * row_stride_b;
+                }
 
                 int64_t n_blk_real = 0;
                 for (int64_t ni = 0; ni < gemm_n; ni += n_blk_real, b_col += n_blk_real * row_stride_b) {
@@ -836,8 +991,12 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS> class tensor_
                         rows_remaining -= rows_handled;
                     }
                 }
+                ds_lap(dstats ? ds->t_gemm : ds_dummy);
             }
         } else if (tcm_buffer != nullptr && per_nb_cols_wsize <= tcm_buffer_size) {
+            if (dstats) {
+                ds->branch[1]++;
+            }
             uint8_t * a_row = quant_a_buffer;
             uint8_t * b_col = reinterpret_cast<uint8_t *>(tcm_buffer);
             if ((gemm_workspace_size + per_nb_cols_wsize) <= tcm_buffer_size) {
@@ -933,6 +1092,9 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS> class tensor_
                 }
             }
         } else {
+            if (dstats) {
+                ds->branch[2]++;
+            }
             const int64_t task_count_m = spacemit_kernels::div_round_up(gemm_m, gemm_m_stride);
             const int64_t task_count_n = spacemit_kernels::div_round_up(gemm_n, gemm_n_stride);
 
@@ -1281,8 +1443,9 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS> class tensor_
                     quantize_a_4row_i8(a_blk_len, m4_a_f32, ne10, out);
                 }
             }
-            spacemit_spert_grid_sync();
             st_lap(op_stats ? st->t_quant4 : st_t);
+            spacemit_spert_grid_sync();
+            st_lap(op_stats ? st->t_q4wait : st_t);
         }
 
         const size_t row_stride_b      = b_k_blks * get_repacked_block_type_size<BLOC_TYPE, INTER_SIZE, NB_COLS>();
@@ -1429,23 +1592,47 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS> class tensor_
                 const int64_t n_cols = src0_cur_end - src0_cur_start;
                 if (use_m4 && n_cols % 32 == 0 && cne1 >= 4) {
                     const uint8_t * a_grp = m4_quant + m4_expert_offset[cur_a];
+                    st_lap(op_stats ? st->t_kernel : st_t);
                     for (; use_m8 && ir1 + 8 <= src1_cur_end; ir1 += 8, a_grp += m8_grp_bytes) {
                         spacemit_kernels::ime2::gemm_kernel_i8i4_hp_m8(b_blk_len, a_grp, src0_cur, nullptr, m4_c_tmp, 8,
                                                                        n_cols, b_k_blks, n_cols);
+                        if (op_stats) {
+                            st_lap(st->t_k8);
+                            st->rows_m8 += 8;
+                            st->flops_m8 += 2.0 * 8 * ne00 * n_cols;
+                        }
                         for (int r = 0; r < 8; ++r) {
                             const mmid_row_mapping rm = MMID_MATRIX_ROW(cur_a, ir1 + r);
                             float * dst_row = (float *) ((char *) dst->data + (rm.i1 * nb1 + rm.i2 * nb2)) + src0_cur_start;
                             memcpy(dst_row, m4_c_tmp + r * n_cols, n_cols * sizeof(float));
                             mmid_scale_row(dst_row, n_cols, fw, rm.i1, rm.i2);
                         }
+                        if (op_stats && ne01 > 1024) {
+                            const int64_t t_before = st->t_scatter;
+                            st_lap(st->t_scatter);
+                            st->t_scatter_wide += st->t_scatter - t_before;
+                        } else {
+                            st_lap(op_stats ? st->t_scatter : st_t);
+                        }
                     }
                     for (; ir1 + 4 <= src1_cur_end; ir1 += 4, a_grp += 4 * nbw1_m4) {
                         gemm_kernel(b_blk_len, a_grp, src0_cur, b_col_zp, m4_c_tmp, 4, n_cols, b_k_blks, n_cols);
+                        if (op_stats) {
+                            st_lap(st->t_k4);
+                            st->flops_m4 += 2.0 * 4 * ne00 * n_cols;
+                        }
                         for (int r = 0; r < 4; ++r) {
                             const mmid_row_mapping rm = MMID_MATRIX_ROW(cur_a, ir1 + r);
                             float * dst_row = (float *) ((char *) dst->data + (rm.i1 * nb1 + rm.i2 * nb2)) + src0_cur_start;
                             memcpy(dst_row, m4_c_tmp + r * n_cols, n_cols * sizeof(float));
                             mmid_scale_row(dst_row, n_cols, fw, rm.i1, rm.i2);
+                        }
+                        if (op_stats && ne01 > 1024) {
+                            const int64_t t_before = st->t_scatter;
+                            st_lap(st->t_scatter);
+                            st->t_scatter_wide += st->t_scatter - t_before;
+                        } else {
+                            st_lap(op_stats ? st->t_scatter : st_t);
                         }
                     }
                     if (op_stats) {
