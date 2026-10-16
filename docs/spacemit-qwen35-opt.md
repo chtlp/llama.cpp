@@ -283,7 +283,7 @@ INT8 口径 MAC 利用率约 4.0%（11 TOPS 实测峰值）。8 核扩展、各�
 - [ ] 对齐 kernel 后重测长输入 prefill（4K/8K/16K）和 16K decode。
 - [ ] 重复次数补到 2 次以上，KLD 用 4×512 token。
 - [ ] `quantize_a_4row_i8_hp_al` 的 vlenb≠128 分支在其他 VLEN 上测试。
-- [ ] 向 SpacemiT 报告：Q5_0 IME kernel 结果错误；原 hp kernel 的 A 布局导致非对齐加载；独立 `ggml-spacemit` 后端不支持 F32 权重矩阵乘（Qwen3.5/3.6 无法运行）；`gemm_kernel_i8i8_m4` 把只读输入 `k_blks` 当计数器递减，`count_n > 32` 时第二个 tile 起只算 1 个 K 块（现有调用方每次只传 32 列，所以没出错）。
+- [ ] 向 SpacemiT 报告：Q5_0 IME kernel 结果错误；原 hp kernel 的 A 布局导致非对齐加载；独立 `ggml-spacemit` 后端 `tensor_traits::compute_forward` 的 MUL_MAT / MUL_MAT_ID 漏了 Q5_0（repack 和 `supports_op` 都接受它），Qwen3.6 因此报 `failed to dispatch op MUL_MAT (f32)`，补上后能跑（6df9f7504 上 pp512 34.3、pp2048 23.5、tg32 7.4 t/s），此前误读为不支持 F32 权重；`gemm_kernel_i8i8_m4` 把只读输入 `k_blks` 当计数器递减，`count_n > 32` 时第二个 tile 起只算 1 个 K 块（现有调用方每次只传 32 列，所以没出错）。
 - [ ] 路由 Q8_0 的 top-1 一致率（92.0%）用更长文本复核；必要时改 fp16 路由。
 - [ ] 第二到第四批只在 Qwen3.6 上测过 prefill；decode、长输入、Qwen3-30B 未重测。
 
