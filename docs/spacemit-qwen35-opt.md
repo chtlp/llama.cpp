@@ -11,8 +11,8 @@
 | 指标（Qwen3.6-35B-A3B，原始 Q4_0 GGUF） | 基线 | 本分支 | 变化 |
 |---|---:|---:|---:|
 | 正确性 | **输出乱码**（`3333…`） | 正确 | — |
-| pp512（t/s） | 16.9¹ | **83.2** | 4.9× |
-| pp2048（t/s） | 16.1¹ | **77.7** | 4.8× |
+| pp512（t/s） | 16.9¹ | **90.4** | 5.3× |
+| pp2048（t/s） | 16.1¹ | **83.9** | 5.2× |
 | tg（短上下文，t/s） | 6.2¹ | **8.3** | 1.34× |
 | decode 4K（t/s） | — | **7.5** | |
 | decode 4K / 8K，MTP 投机解码（t/s） | — | **9.6 / 8.9**² | |
@@ -45,6 +45,9 @@ Qwen3-30B-A3B（只覆盖 Qwen3 阶段的改动）：pp512 54.0 → **76.9**（+
 | `cd4b405c2` | 图级融合：concat→ssm_conv、MoE 路由权重并入 MUL_MAT_ID；prefill GDN 分块（chunkwise）实现 | PP |
 | `939d0eb6d` | `build_ssm_conv`：把 concat 输入挂为 ssm_conv 的额外 src，保证融合时不被提前回收（qwen35/qwen35moe/qwen3next） | 正确性 |
 | `c6a63fc5c` | 分块 GDN 默认分块 16 | PP |
+| `4c3b707f7`、`de8dbe2f2` | m8 kernel：A 按 8 行一组量化并预拆 nibble，用满 `vmadot.hp` 的 8 行；MoE 先跑 8 行组 | PP |
+| `dc353a5d8` | dense Q4_0 hp 矩阵乘也用 m8 | PP |
+| `2d71832db`、`b089d9baa`、`3e6186a6b` | 分块 GDN 的矩阵乘上 IME FP16（`vfwmadot`），默认关闭 | 实验 |
 
 ### 1.2 改动说明
 
@@ -66,6 +69,9 @@ Qwen3-30B-A3B（只覆盖 Qwen3 阶段的改动）：pp512 54.0 → **76.9**（+
   - 两者浮点运算和顺序不变，输出逐位相同。
 - **分块 GDN**（`cd4b405c2`、`c6a63fc5c`）：prefill（K=1、标量 gate、≥16 token）改为分块 WY 形式：块内 `U = (I+L)^-1 β(V − Γ K S0)`（前向代入），`O = scale(Γ Q S0 + (E∘QKᵀ) U)`，`S ← Γ_C S + K̃ᵀU`，所有乘积用 4 行分块 RVV fp32 矩阵乘。decode 和 MTP（K>1）仍走递推 kernel。A100 的 FP32 向量峰值只有约 4.2 MAC/周期/核，分块越小 C² 部分越少、越快，默认 16。
 
+- **m8 kernel**（`4c3b707f7`、`de8dbe2f2`、`dc353a5d8`）：一条 `vmadot.hp` 算 8 行 × 8 列 × K32，原 m4 只用其中 4 行。实测 A 寄存器第 r 行为字节 16r～16r+15（k 低 nibble 在前）。A 按 8 行一组量化（每个 K32 子块 8 行共用一个 scale），量化时就拆成 lo（u4）/ hi（s4）两个寄存器镜像（每 K256 2176B），kernel 每子块只做两次对齐加载、无需拆 nibble，成对软件流水。微基准比两次 m4 快 1.55～1.65 倍。MoE 每个专家先跑 8 行组、再最多一个 4 行组；dense 按 8 行一组、尾部 4 行 / 1 行。
+- **GDN 上 IME FP16**（`2d71832db`、`b089d9baa`，默认关）：分块 GDN 的 6 个矩阵乘改成 `vfwmadot`（fp16 输入、fp32 累加），状态在 head 内以 fp32 8×8 tile 保存。单线程比 RVV fp32 快 28%，但 8 线程下两个 hart 共享 Tensor Core，GDN 反而 1.43 对 1.29 ms/token，故默认关闭（`GGML_SPACEMIT_GDN_IME=1` 打开）。
+
 **Decode / MTP**
 
 - **FA head_dim 256**（`3ca97beb9`）：10 层全注意力原来走通用 FA。decode 上下文斜率 19.3 → 7.2 µs/token。
@@ -86,6 +92,8 @@ Qwen3-30B-A3B（只覆盖 Qwen3 阶段的改动）：pp512 54.0 → **76.9**（+
 | `GGML_SPACEMIT_FUSE_CONV` | 开 | concat→ssm_conv 融合 |
 | `GGML_SPACEMIT_FUSE_MOE_W` | 开 | MoE 路由权重并入 MUL_MAT_ID |
 | `GGML_SPACEMIT_GDN_CHUNK`、`GGML_SPACEMIT_GDN_CHUNK_SIZE` | 开、16 | prefill 分块 GDN 及分块大小（8～128） |
+| `GGML_SPACEMIT_HP_M8` | 开 | Q4_0 hp 的 8 行 kernel（MoE 与 dense） |
+| `GGML_SPACEMIT_GDN_IME` | **关** | 分块 GDN 的矩阵乘走 IME FP16 |
 | `GGML_SPACEMIT_Q5_0_IME` | 关 | 打开有问题的 Q5_0 IME kernel（仅调试） |
 | `GGML_SPACEMIT_RVV_OFF=op,...` / `ALL` | — | 指定 op 走通用实现 |
 | `GGML_SPACEMIT_REPACK_OFF=type,...` | — | 指定量化类型不走 IME（如 `q4_0`，可用作精度参考） |
@@ -107,7 +115,8 @@ Qwen3-30B-A3B（只覆盖 Qwen3 阶段的改动）：pp512 54.0 → **76.9**（+
 | + hp m4 对齐 kernel（`4d99b2c1d`） | `-shexpq8` | 69.7 | 65.4 |
 | + Q5_0 加载时转 Q8_0（`7e4078126`） | 原始 | 69.7 | 65.8 |
 | + concat→ssm_conv、MoE 权重融合（`939d0eb6d`） | 原始 | 75.7 | 71.1 |
-| + 分块 GDN，分块 16（`c6a63fc5c`） | **原始** | **83.2** | **77.7** |
+| + 分块 GDN，分块 16（`c6a63fc5c`） | 原始 | 83.2 | 77.7 |
+| + m8 kernel（MoE + dense，`dc353a5d8`） | **原始** | **90.4** | **83.9** |
 
 MoE m4 和 fastmask 在以上各阶段都开着。最后一行与上一行速度相同，说明加载时转换等价于离线转换。
 
@@ -168,6 +177,8 @@ hp 对齐 kernel 和 split-KV 在 Qwen3-30B 上没有做端到端 A/B（模型�
 | Q5_0 加载时转 Q8_0 | 离线 `-shexpq8` | 0.0035 | 93.7% | 1.003 ± 0.004 |
 | conv / MoE 权重融合 | 未融合 | ≈ 0（max 4.8e-5） | 100% | 1.000 |
 | 分块 GDN（分块 16） | 递推 | 0.0046 | 92.9% | 1.004 ± 0.005 |
+| m8（MoE + dense） | m4 | 0.0054 | 95.3% | 0.995 ± 0.004 |
+| GDN IME FP16（默认关） | RVV fp32 分块 | 0.0055 | 94.9% | 0.999 ± 0.005 |
 
 ³ `GGML_SPACEMIT_REPACK_OFF=q4_0`：Q4_0 不 repack，走通用 Q4_0×Q8_0 点积，fp32 累加。
 
@@ -178,24 +189,24 @@ hp 对齐 kernel 和 split-KV 在 Qwen3-30B 上没有做端到端 A/B（模型�
 
 ## 3. 当前瓶颈与 TODO
 
-### 3.1 Prefill（pp512 12.0 ms/token = 83.2 t/s）
+### 3.1 Prefill（pp512 11.1 ms/token = 90.4 t/s）
 
 | 类别 | ms/token | 占比 |
 |---|---:|---:|
-| 矩阵乘（MoE 3.24 含 Q4_1，其余 `MUL_MAT` 4.44：dense Q4_0 约 2.1、Q8_0 约 1.1、F32 router 约 0.73、其他） | 7.68 | 64% |
+| 矩阵乘（MoE 3.07 含 Q4_1；dense Q4_0 1.36；其余 `MUL_MAT` 2.34：Q8_0 约 1.1、F32 router 约 0.73、其他） | 6.77 | 61% |
 | `GATED_DELTA_NET`（分块） | 1.29 | 11% |
 | norm、逐元素、SSM_CONV、非线性等 | 约 2.7 | 22% |
 | attention（FA） | 0.32 | 3% |
 
-INT8 口径 MAC 利用率约 3.7%（11 TOPS 实测峰值）。8 核扩展、各算子扩展性与对 K5 的分析见 edge-ai-exp 仓库 `docs/k3_qwen36_prefill_bottleneck_and_k5_implications_20261015.md`。TODO 按预计收益排序（均未实测）：
+INT8 口径 MAC 利用率约 4.0%（11 TOPS 实测峰值）。8 核扩展、各算子扩展性与对 K5 的分析见 edge-ai-exp 仓库 `docs/k3_qwen36_prefill_bottleneck_and_k5_implications_20261015.md`。TODO 按预计收益排序（均未实测）：
 
 | # | 方向 | 预计省 ms/token | 状态 |
 |---|---|---:|---|
 | — | concat→ssm_conv、MoE 权重融合 | 1.1 | **已完成**（实测 −1.1） |
 | — | GDN 分块 | 1.5～2.5 | **已完成，RVV fp32 版**（实测 −1.27）；受 A100 FP32 向量峰值限制 |
-| 1 | GDN 块内矩阵乘改用 IME FP16（`vfwmadot`，fp32 累加） | 约 1 | |
+| 1 | GDN 块内矩阵乘改用 IME FP16（`vfwmadot`，fp32 累加） | 约 1 | **已实现，默认关**：单线程 −28%，8 线程反而 +0.14 ms（Tensor Core / L2 共享）；剩余开销在 expf、读入、打包 |
 | 2 | MoE kernel 叠加 B 复用和批量 scale；去掉 gate/up 对同一 token 的重复 4 行量化（0.46） | 约 1 | |
-| 3 | m8 kernel（用满 IME 8 行），先做微基准：8 行 nibble 布局、8 行共用激活 scale 的精度、寄存器压力 | 待定 | |
+| 3 | m8 kernel（用满 IME 8 行） | 待定 | **已完成**：dense Q4_0 2.16 → 1.36 ms，MoE −0.08 ms；pp512 +8.3% |
 | 4 | router 改 fp16 / IME（扩展只有 3.65×，cluster 内带宽受限；decode 也受益） | 约 0.6 | |
 | 5 | Q8_0 kernel 做同样的对齐 + 流水 | 约 0.5 | |
 | 6 | RMS_NORM / ADD 等融合（逐元素算子不随线程扩展） | 0.5～1 | |
