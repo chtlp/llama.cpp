@@ -6084,6 +6084,23 @@ size_t gemm_kernel_i8i4_hp_al(size_t          blk_len,
     return 1;
 }
 
+// Dense rows quantized in 8-row groups (rvv::quantize_a_8row_i8_hp_m8) with a 4-row / 1-row tail.
+size_t gemm_kernel_i8i4_hp_m8_al(size_t          blk_len,
+                                 const uint8_t * quant_a_ptr,
+                                 const uint8_t * quant_b_data,
+                                 const uint8_t * quant_b_zp,
+                                 float *         c_ptr,
+                                 size_t          count_m,
+                                 size_t          count_n,
+                                 size_t          k_blks,
+                                 size_t          ldc) {
+    if (count_m >= 8) {
+        gemm_kernel_i8i4_hp_m8(blk_len, quant_a_ptr, quant_b_data, quant_b_zp, c_ptr, 8, count_n, k_blks, ldc);
+        return 8;
+    }
+    return gemm_kernel_i8i4_hp_al(blk_len, quant_a_ptr, quant_b_data, quant_b_zp, c_ptr, count_m, count_n, k_blks, ldc);
+}
+
 size_t moe_m2_gemm_kernel_i8i4(size_t           blk_len,
                                const uint8_t ** quant_a_ptr,
                                const uint8_t *  quant_b_data,

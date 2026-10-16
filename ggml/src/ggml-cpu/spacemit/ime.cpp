@@ -641,6 +641,7 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS> class tensor_
         spacemit_kernels::quantize_a_row_def       quantize_a_4row_i8;
         spacemit_kernels::gemm_kernel_quantize_def gemm_kernel;
         bool                                       set_kernel_impl = false;
+        bool                                       use_m8          = false;  // 8-row A groups (Q4_0 hp)
 
         int64_t block_stride_a = spacemit_kernels::q8_blk_size(a_blk_len);
 
@@ -665,6 +666,13 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS> class tensor_
                         gemm_kernel        = spacemit_kernels::ime2::gemm_kernel_i8i4_hp_al;
                         quantize_a_4row_i8 = spacemit_kernels::rvv::quantize_a_4row_i8_hp_al;
                         block_stride_a     = spacemit_kernels::q8_hp_al_row_blk_size;
+                        if constexpr (std::is_same_v<BLOC_TYPE, block_q4_0>) {
+                            // 8-row groups (2176B per K256) fit in 8 row slots (8 * 304B), 128B aligned
+                            if (spacemit_kernels::hp_m8_enabled()) {
+                                gemm_kernel = spacemit_kernels::ime2::gemm_kernel_i8i4_hp_m8_al;
+                                use_m8      = true;
+                            }
+                        }
                     }
                     set_kernel_impl    = true;
                 } else {
@@ -736,7 +744,7 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS> class tensor_
 
         auto * quant_a_buffer = reinterpret_cast<uint8_t *>(ws_ptr);
 
-        constexpr int64_t row_align = 4;
+        const int64_t row_align = use_m8 ? 8 : 4;
         const int64_t     row_blks  = spacemit_kernels::div_round_up(gemm_m, row_align);
 
         const int64_t row_stride_b      = b_k_blks * get_repacked_block_type_size<BLOC_TYPE, INTER_SIZE, NB_COLS>();
@@ -769,11 +777,21 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS> class tensor_
                 int m_idx             = m_row_blk * row_align;
                 int rows_tobe_handled = (gemm_m - m_idx) > row_align ? row_align : (gemm_m - m_idx);
 
-                if (rows_tobe_handled == row_align && quantize_a_4row_i8 != nullptr) {
+                if (use_m8 && rows_tobe_handled == 8) {
+                    spacemit_kernels::rvv::quantize_a_8row_i8_hp_m8(a_blk_len, feature + m_idx * gemm_k, gemm_k,
+                                                                    quant_a_buffer + m_idx * row_stride_a);
+                } else if (rows_tobe_handled == row_align && quantize_a_4row_i8 != nullptr) {
                     const float * a_row_ptr       = feature + m_idx * gemm_k;
                     auto *        quant_a_row_ptr = quant_a_buffer + m_idx * row_stride_a;
                     quantize_a_4row_i8(a_blk_len, a_row_ptr, gemm_k, quant_a_row_ptr);
                 } else {
+                    // tail: one 4-row group if possible (gemm_kernel_i8i4_hp_m8_al falls back the same way)
+                    if (use_m8 && rows_tobe_handled >= 4) {
+                        quantize_a_4row_i8(a_blk_len, feature + m_idx * gemm_k, gemm_k,
+                                           quant_a_buffer + m_idx * row_stride_a);
+                        rows_tobe_handled -= 4;
+                        m_idx += 4;
+                    }
                     while (rows_tobe_handled) {
                         const float * a_row_ptr       = feature + m_idx * gemm_k;
                         auto *        quant_a_row_ptr = quant_a_buffer + m_idx * row_stride_a;
