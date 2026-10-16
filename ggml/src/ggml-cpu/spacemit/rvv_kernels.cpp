@@ -2118,6 +2118,142 @@ void forward_rms_norm_f32(ggml_compute_params * params, ggml_tensor * op) {
     }
 }
 
+// y = rms_norm(x) * w, fused (the RMS_NORM + MUL pair that ggml_cpu_try_fuse_ops would otherwise run as a
+// scalar loop). One pass for the sum of squares, one for y = x * s * w. Rows of at most vlmax(e32m4) elements are
+// done four at a time so the four reductions overlap. Each output row is written after its input row is read,
+// the same aliasing contract as the generic fused kernel.
+void forward_rms_norm_mul_f32(ggml_compute_params * params, const ggml_tensor * rms, ggml_tensor * mul) {
+    const ggml_tensor * src0 = rms->src[0];
+    const ggml_tensor * w    = mul->src[0] == rms ? mul->src[1] : mul->src[0];
+    ggml_tensor *       dst  = mul;
+
+    const int ith = params->ith;
+    const int nth = params->nth;
+
+    const int64_t n   = src0->ne[0];
+    const int64_t ne1 = src0->ne[1], ne2 = src0->ne[2], ne3 = src0->ne[3];
+    float         eps;
+    memcpy(&eps, rms->op_params, sizeof(float));
+
+    const int64_t rows = ne1 * ne2 * ne3;
+    const int64_t per  = (rows + nth - 1) / nth;
+    const int64_t r0   = std::min(rows, per * ith);
+    const int64_t r1   = std::min(rows, r0 + per);
+
+    auto x_row = [&](int64_t r, int64_t & i1, int64_t & i2, int64_t & i3) {
+        i3 = r / (ne2 * ne1);
+        i2 = (r - i3 * ne2 * ne1) / ne1;
+        i1 = r - i3 * ne2 * ne1 - i2 * ne1;
+        return (const float *) ((const char *) src0->data + i1 * src0->nb[1] + i2 * src0->nb[2] + i3 * src0->nb[3]);
+    };
+    auto y_row = [&](int64_t i1, int64_t i2, int64_t i3) {
+        return (float *) ((char *) dst->data + i1 * dst->nb[1] + i2 * dst->nb[2] + i3 * dst->nb[3]);
+    };
+    auto w_row = [&](int64_t i1, int64_t i2, int64_t i3) {
+        return (const float *) ((const char *) w->data + (i1 % w->ne[1]) * w->nb[1] + (i2 % w->ne[2]) * w->nb[2] +
+                                (i3 % w->ne[3]) * w->nb[3]);
+    };
+
+    const vfloat32m1_t zero = __riscv_vfmv_v_f_f32m1(0.0f, 1);
+    int64_t            r    = r0;
+    if (n <= (int64_t) __riscv_vsetvlmax_e32m4() && w->ne[1] == 1 && w->ne[2] == 1 && w->ne[3] == 1) {
+        const size_t       vl = __riscv_vsetvl_e32m4(n);
+        const vfloat32m4_t wv = __riscv_vle32_v_f32m4((const float *) w->data, vl);
+        for (; r + 4 <= r1; r += 4) {
+            int64_t       a1, a2, a3, b1, b2, b3, c1, c2, c3, d1, d2, d3;
+            const float * xa = x_row(r + 0, a1, a2, a3);
+            const float * xb = x_row(r + 1, b1, b2, b3);
+            const float * xc = x_row(r + 2, c1, c2, c3);
+            const float * xd = x_row(r + 3, d1, d2, d3);
+            vfloat32m4_t  va = __riscv_vle32_v_f32m4(xa, vl), vb = __riscv_vle32_v_f32m4(xb, vl);
+            vfloat32m4_t  vc = __riscv_vle32_v_f32m4(xc, vl), vd = __riscv_vle32_v_f32m4(xd, vl);
+            vfloat32m1_t  sa = __riscv_vfredusum_vs_f32m4_f32m1(__riscv_vfmul_vv_f32m4(va, va, vl), zero, vl);
+            vfloat32m1_t  sb = __riscv_vfredusum_vs_f32m4_f32m1(__riscv_vfmul_vv_f32m4(vb, vb, vl), zero, vl);
+            vfloat32m1_t  sc = __riscv_vfredusum_vs_f32m4_f32m1(__riscv_vfmul_vv_f32m4(vc, vc, vl), zero, vl);
+            vfloat32m1_t  sd = __riscv_vfredusum_vs_f32m4_f32m1(__riscv_vfmul_vv_f32m4(vd, vd, vl), zero, vl);
+            const float   fa = 1.0f / sqrtf(__riscv_vfmv_f_s_f32m1_f32(sa) / n + eps);
+            const float   fb = 1.0f / sqrtf(__riscv_vfmv_f_s_f32m1_f32(sb) / n + eps);
+            const float   fc = 1.0f / sqrtf(__riscv_vfmv_f_s_f32m1_f32(sc) / n + eps);
+            const float   fd = 1.0f / sqrtf(__riscv_vfmv_f_s_f32m1_f32(sd) / n + eps);
+            __riscv_vse32_v_f32m4(y_row(a1, a2, a3), __riscv_vfmul_vv_f32m4(__riscv_vfmul_vf_f32m4(va, fa, vl), wv, vl), vl);
+            __riscv_vse32_v_f32m4(y_row(b1, b2, b3), __riscv_vfmul_vv_f32m4(__riscv_vfmul_vf_f32m4(vb, fb, vl), wv, vl), vl);
+            __riscv_vse32_v_f32m4(y_row(c1, c2, c3), __riscv_vfmul_vv_f32m4(__riscv_vfmul_vf_f32m4(vc, fc, vl), wv, vl), vl);
+            __riscv_vse32_v_f32m4(y_row(d1, d2, d3), __riscv_vfmul_vv_f32m4(__riscv_vfmul_vf_f32m4(vd, fd, vl), wv, vl), vl);
+        }
+    }
+    for (; r < r1; r++) {
+        int64_t       i1, i2, i3;
+        const float * x  = x_row(r, i1, i2, i3);
+        float *       y  = y_row(i1, i2, i3);
+        const float * wr = w_row(i1, i2, i3);
+        size_t        vl = __riscv_vsetvlmax_e32m8();
+        vfloat32m8_t  acc = __riscv_vfmv_v_f_f32m8(0.0f, vl);
+        for (int64_t i = 0; i < n; i += vl) {
+            vl                = __riscv_vsetvl_e32m8(n - i);
+            vfloat32m8_t v    = __riscv_vle32_v_f32m8(x + i, vl);
+            acc               = __riscv_vfmacc_vv_f32m8_tu(acc, v, v, vl);
+        }
+        const float s =
+            1.0f / sqrtf(__riscv_vfmv_f_s_f32m1_f32(__riscv_vfredusum_vs_f32m8_f32m1(acc, zero, __riscv_vsetvlmax_e32m8())) / n + eps);
+        for (int64_t i = 0; i < n; i += vl) {
+            vl = __riscv_vsetvl_e32m8(n - i);
+            __riscv_vse32_v_f32m8(
+                y + i, __riscv_vfmul_vv_f32m8(__riscv_vfmul_vf_f32m8(__riscv_vle32_v_f32m8(x + i, vl), s, vl),
+                                              __riscv_vle32_v_f32m8(wr + i, vl), vl), vl);
+        }
+    }
+}
+
+// y = 1 / (1 + exp(-x)), contiguous f32 (replaces the libm expf loop of ggml_vec_sigmoid_f32)
+void forward_unary_sigmoid_f32(ggml_compute_params * params, ggml_tensor * op) {
+    const ggml_tensor * src0 = op->src[0];
+    const int64_t       n    = ggml_nelements(op);
+    const int64_t       per  = ((n + params->nth - 1) / params->nth + 63) & ~(int64_t) 63;
+    const int64_t       i0   = std::min(n, per * params->ith);
+    const int64_t       i1   = std::min(n, i0 + per);
+    const float *       x    = (const float *) src0->data;
+    float *             y    = (float *) op->data;
+    for (int64_t i = i0; i < i1;) {
+        const size_t       vl = __riscv_vsetvl_e32m2(i1 - i);
+        const vfloat32m2_t e  = rvv_expf_approx_f32m2(__riscv_vfneg_v_f32m2(__riscv_vle32_v_f32m2(x + i, vl), vl), vl);
+        __riscv_vse32_v_f32m2(y + i, __riscv_vfrdiv_vf_f32m2(__riscv_vfadd_vf_f32m2(e, 1.0f, vl), 1.0f, vl), vl);
+        i += vl;
+    }
+}
+
+// L2 norm over ne0, rows taken with the source strides (the q / k inputs are views of the conv output)
+void forward_l2_norm_f32(ggml_compute_params * params, ggml_tensor * op) {
+    const ggml_tensor * src0 = op->src[0];
+    float               eps;
+    memcpy(&eps, op->op_params, sizeof(float));
+    const int64_t n = src0->ne[0], ne1 = src0->ne[1], ne2 = src0->ne[2], ne3 = src0->ne[3];
+    const int64_t rows = ne1 * ne2 * ne3;
+    const int64_t per  = (rows + params->nth - 1) / params->nth;
+    const int64_t r0   = std::min(rows, per * params->ith);
+    const int64_t r1   = std::min(rows, r0 + per);
+    const vfloat32m1_t zero = __riscv_vfmv_v_f_f32m1(0.0f, 1);
+    for (int64_t r = r0; r < r1; r++) {
+        const int64_t i3 = r / (ne2 * ne1);
+        const int64_t i2 = (r - i3 * ne2 * ne1) / ne1;
+        const int64_t i1 = r - i3 * ne2 * ne1 - i2 * ne1;
+        const float * x  = (const float *) ((const char *) src0->data + i1 * src0->nb[1] + i2 * src0->nb[2] + i3 * src0->nb[3]);
+        float *       y  = (float *) ((char *) op->data + i1 * op->nb[1] + i2 * op->nb[2] + i3 * op->nb[3]);
+        size_t        vl = __riscv_vsetvlmax_e32m8();
+        vfloat32m8_t  acc = __riscv_vfmv_v_f_f32m8(0.0f, vl);
+        for (int64_t i = 0; i < n; i += vl) {
+            vl             = __riscv_vsetvl_e32m8(n - i);
+            vfloat32m8_t v = __riscv_vle32_v_f32m8(x + i, vl);
+            acc            = __riscv_vfmacc_vv_f32m8_tu(acc, v, v, vl);
+        }
+        const float sum = __riscv_vfmv_f_s_f32m1_f32(__riscv_vfredusum_vs_f32m8_f32m1(acc, zero, __riscv_vsetvlmax_e32m8()));
+        const float s   = 1.0f / fmaxf(sqrtf(sum), eps);
+        for (int64_t i = 0; i < n; i += vl) {
+            vl = __riscv_vsetvl_e32m8(n - i);
+            __riscv_vse32_v_f32m8(y + i, __riscv_vfmul_vf_f32m8(__riscv_vle32_v_f32m8(x + i, vl), s, vl), vl);
+        }
+    }
+}
+
 template <size_t MB_ROWS>
 void quantize_a_nrow_i8_ref(size_t blk_len, const float * a_ptr, size_t count_k, uint8_t * quant_a_ptr) {
     int64_t a_blk_stride        = q8_blk_size(blk_len, true);

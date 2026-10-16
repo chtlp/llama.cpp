@@ -197,6 +197,30 @@ static bool fuse_env_enabled(const char * name) {
     return !(e && e[0] == '0');
 }
 
+// RVV replacements for ops that otherwise run as scalar generic code (GGML_SPACEMIT_RVV_RMS_MUL / _SIGMOID / _L2=0
+// turn them off): the fused RMS_NORM + MUL, SIGMOID and L2_NORM
+static bool rvv_rms_mul_enabled() {
+    static const bool v = fuse_env_enabled("GGML_SPACEMIT_RVV_RMS_MUL");
+    return v;
+}
+
+static bool rvv_sigmoid_enabled() {
+    static const bool v = fuse_env_enabled("GGML_SPACEMIT_RVV_SIGMOID");
+    return v;
+}
+
+static bool rvv_l2_enabled() {
+    static const bool v = fuse_env_enabled("GGML_SPACEMIT_RVV_L2");
+    return v;
+}
+
+// MoE m8/m4 row write-out: scale by the routing weight while copying (GGML_SPACEMIT_MOE_STORE1=0: copy, then scale
+// in place as before)
+static bool moe_store1_enabled() {
+    static const bool v = fuse_env_enabled("GGML_SPACEMIT_MOE_STORE1");
+    return v;
+}
+
 static bool fuse_conv_enabled() {
     static const bool enabled = fuse_env_enabled("GGML_SPACEMIT_FUSE_CONV");
     return enabled;
@@ -373,6 +397,25 @@ static inline void mmid_scale_row(float * y, int64_t n, const ggml_tensor * w, i
     for (int64_t i = 0; i < n;) {
         const size_t vl = __riscv_vsetvl_e32m8(n - i);
         __riscv_vse32_v_f32m8(y + i, __riscv_vfmul_vf_f32m8(__riscv_vle32_v_f32m8(y + i, vl), s, vl), vl);
+        i += vl;
+    }
+}
+
+// y = src * routing weight (or a plain copy without fused weights), one pass
+static inline void mmid_store_row(float * y, const float * src, int64_t n, const ggml_tensor * w, int64_t i1, int64_t i2) {
+    if (w == nullptr) {
+        memcpy(y, src, n * sizeof(float));
+        return;
+    }
+    if (!moe_store1_enabled()) {
+        memcpy(y, src, n * sizeof(float));
+        mmid_scale_row(y, n, w, i1, i2);
+        return;
+    }
+    const float s = *(const float *) ((const char *) w->data + i1 * w->nb[1] + i2 * w->nb[2]);
+    for (int64_t i = 0; i < n;) {
+        const size_t vl = __riscv_vsetvl_e32m8(n - i);
+        __riscv_vse32_v_f32m8(y + i, __riscv_vfmul_vf_f32m8(__riscv_vle32_v_f32m8(src + i, vl), s, vl), vl);
         i += vl;
     }
 }
@@ -837,10 +880,11 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS> class tensor_
         auto * quant_a_buffer = reinterpret_cast<uint8_t *>(ws_ptr);
 
         const int64_t row_align = use_m8 ? 8 : 4;
-        // experiment: GGML_SPACEMIT_DENSE_MBLK=R gives each thread R consecutive row groups per pass over B
+        // GGML_SPACEMIT_DENSE_MBLK=R (default 8, 1 = old behaviour): each thread runs R consecutive row groups
+        // per pass over B, so a B tile is read once per R groups instead of once per group
         static const int64_t dense_mblk = [] {
             const char * e = getenv("GGML_SPACEMIT_DENSE_MBLK");
-            return e ? std::max<int64_t>(1, atoll(e)) : (int64_t) 1;
+            return e ? std::max<int64_t>(1, atoll(e)) : (int64_t) 8;
         }();
         const int64_t     row_blks  = spacemit_kernels::div_round_up(gemm_m, row_align);
 
@@ -1604,8 +1648,7 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS> class tensor_
                         for (int r = 0; r < 8; ++r) {
                             const mmid_row_mapping rm = MMID_MATRIX_ROW(cur_a, ir1 + r);
                             float * dst_row = (float *) ((char *) dst->data + (rm.i1 * nb1 + rm.i2 * nb2)) + src0_cur_start;
-                            memcpy(dst_row, m4_c_tmp + r * n_cols, n_cols * sizeof(float));
-                            mmid_scale_row(dst_row, n_cols, fw, rm.i1, rm.i2);
+                            mmid_store_row(dst_row, m4_c_tmp + r * n_cols, n_cols, fw, rm.i1, rm.i2);
                         }
                         if (op_stats && ne01 > 1024) {
                             const int64_t t_before = st->t_scatter;
@@ -1624,8 +1667,7 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS> class tensor_
                         for (int r = 0; r < 4; ++r) {
                             const mmid_row_mapping rm = MMID_MATRIX_ROW(cur_a, ir1 + r);
                             float * dst_row = (float *) ((char *) dst->data + (rm.i1 * nb1 + rm.i2 * nb2)) + src0_cur_start;
-                            memcpy(dst_row, m4_c_tmp + r * n_cols, n_cols * sizeof(float));
-                            mmid_scale_row(dst_row, n_cols, fw, rm.i1, rm.i2);
+                            mmid_store_row(dst_row, m4_c_tmp + r * n_cols, n_cols, fw, rm.i1, rm.i2);
                         }
                         if (op_stats && ne01 > 1024) {
                             const int64_t t_before = st->t_scatter;
@@ -1906,9 +1948,15 @@ class tensor_traits_common : public tensor_traits_base {
                     case GGML_UNARY_OP_GELU:
                         spacemit_kernels::rvv::forward_unary_gelu_f32(params, op);
                         return true;
+                    case GGML_UNARY_OP_SIGMOID:
+                        spacemit_kernels::rvv::forward_unary_sigmoid_f32(params, op);
+                        return true;
                     default:
                         return false;
                 }
+            case GGML_OP_L2_NORM:
+                spacemit_kernels::rvv::forward_l2_norm_f32(params, op);
+                return true;
             case GGML_OP_GLU:
                 if (ggml_get_glu_op(op) == GGML_GLU_OP_GEGLU && op->src[0]->type == GGML_TYPE_F32) {
                     spacemit_kernels::rvv::forward_glu_geglu_f32(params, op);
@@ -2631,6 +2679,17 @@ class extra_buffer_type : ggml::cpu::extra_buffer_type {
                     ggml_is_contiguous(op->src[0])) {
                     return (ggml::cpu::tensor_traits *) (&ggml::cpu::riscv64_spacemit::rvv_impl);
                 }
+                if (ggml_get_unary_op(op) == GGML_UNARY_OP_SIGMOID && rvv_sigmoid_enabled() &&
+                    op->src[0]->type == GGML_TYPE_F32 && op->type == GGML_TYPE_F32 && ggml_is_contiguous(op->src[0]) &&
+                    ggml_is_contiguous(op)) {
+                    return (ggml::cpu::tensor_traits *) (&ggml::cpu::riscv64_spacemit::rvv_impl);
+                }
+                break;
+            case GGML_OP_L2_NORM:
+                if (rvv_l2_enabled() && op->src[0]->type == GGML_TYPE_F32 && op->type == GGML_TYPE_F32 &&
+                    op->src[0]->nb[0] == sizeof(float) && op->nb[0] == sizeof(float)) {
+                    return (ggml::cpu::tensor_traits *) (&ggml::cpu::riscv64_spacemit::rvv_impl);
+                }
                 break;
             case GGML_OP_GLU:
                 if (ggml_get_glu_op(op) == GGML_GLU_OP_GEGLU && op->src[0]->type == GGML_TYPE_F32) {
@@ -2714,6 +2773,21 @@ static int bind_ai_thread() {
 
 int ggml_backend_cpu_riscv64_spacemit_num_prefer_cores(void) {
     return ggml::cpu::riscv64_spacemit::global_spine_env_info.num_perfer_cores;
+}
+
+bool ggml_backend_cpu_riscv64_spacemit_rms_norm_mul(const struct ggml_compute_params * params, struct ggml_tensor * rms,
+                                                    struct ggml_tensor * mul) {
+    if (!ggml::cpu::riscv64_spacemit::rvv_rms_mul_enabled() || ggml::cpu::riscv64_spacemit::rvv_op_disabled(rms)) {
+        return false;
+    }
+    const ggml_tensor * w = mul->src[0] == rms ? mul->src[1] : mul->src[0];
+    if (rms->src[0]->type != GGML_TYPE_F32 || rms->src[0]->nb[0] != sizeof(float) || mul->type != GGML_TYPE_F32 ||
+        mul->nb[0] != sizeof(float) || w->type != GGML_TYPE_F32 || w->nb[0] != sizeof(float) ||
+        w->ne[0] != rms->ne[0] || !ggml_are_same_shape(rms->src[0], mul)) {
+        return false;
+    }
+    spacemit_kernels::rvv::forward_rms_norm_mul_f32(const_cast<ggml_compute_params *>(params), rms, mul);
+    return true;
 }
 
 void ggml_backend_cpu_riscv64_spacemit_graph_prepare(struct ggml_cgraph * cgraph) {

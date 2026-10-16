@@ -97,6 +97,13 @@ void forward_flash_attn_ext_f16_tiled_vlen1024_vf16(const ggml_compute_params * 
 
 void forward_rms_norm_f32(ggml_compute_params * params, ggml_tensor * op);
 
+// RMS_NORM followed by MUL with a weight row, written to the MUL's dst
+void forward_rms_norm_mul_f32(ggml_compute_params * params, const ggml_tensor * rms, ggml_tensor * mul);
+
+void forward_unary_sigmoid_f32(ggml_compute_params * params, ggml_tensor * op);
+
+void forward_l2_norm_f32(ggml_compute_params * params, ggml_tensor * op);
+
 void forward_norm_f32(ggml_compute_params * params, ggml_tensor * op);
 
 void forward_cont_with_permute(ggml_compute_params * params, ggml_tensor * op);

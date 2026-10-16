@@ -3111,6 +3111,11 @@ static int ggml_cpu_try_fuse_ops(
                 mul_w->ne[0]        == node->ne[0]   &&
                 mul_w->nb[0]        == sizeof(float)) {
 
+#ifdef GGML_USE_CPU_RISCV64_SPACEMIT
+                if (ggml_backend_cpu_riscv64_spacemit_rms_norm_mul(params, node, mul_node)) {
+                    return 1;
+                }
+#endif
                 ggml_compute_forward_rms_norm_mul_fused(params, node, mul_node);
                 return 1;
             }
