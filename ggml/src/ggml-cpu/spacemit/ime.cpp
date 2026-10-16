@@ -658,6 +658,19 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS> class tensor_
         }
     }
 
+    // Q8_0 pre-arranged path (GGML_SPACEMIT_Q8_PRE, default on): B in the vmadot i8 layout, 4-row A groups in the
+    // aligned 192B layout (48B per row and K32 block; single rows keep 38B blocks, contiguous, in the same slots)
+    static bool q8_pre() {
+        if constexpr (std::is_same_v<BLOC_TYPE, block_q8_0>) {
+            return spacemit_kernels::q8_prearranged_enabled();
+        } else {
+            return false;
+        }
+    }
+
+    // the A workspace base is aligned to q8_hp_al_align
+    static bool a_aligned() { return hp_aligned() || q8_pre(); }
+
     bool work_size(int n_threads, const ggml_tensor * op, size_t & size) override {
         switch (op->op) {
             case GGML_OP_MUL_MAT:
@@ -669,7 +682,8 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS> class tensor_
                             spacemit_kernels::div_round_up(src1_nelements, QK_K) * spacemit_kernels::q8k_blk_size(QK_K);
                     } else if constexpr (INTER_SIZE == QK4_0) {
                         size = spacemit_kernels::div_round_up(src1_nelements, QK4_0) *
-                               spacemit_kernels::q8_blk_size(QK4_0, true);
+                               (q8_pre() ? spacemit_kernels::q8_m4al_row_blk_size :
+                                           spacemit_kernels::q8_blk_size(QK4_0, true));
                     } else if constexpr (INTER_SIZE == 256) {
                         size = spacemit_kernels::div_round_up(src1_nelements, 256) *
                                (hp_aligned() ? spacemit_kernels::q8_hp_al_row_blk_size :
@@ -679,7 +693,7 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS> class tensor_
                     }
 
                     size = GGML_PAD(size, sizeof(int64_t));
-                    if (hp_aligned()) {
+                    if (a_aligned()) {
                         // room to align the workspace base and pad the A buffer (B may follow it in TCM)
                         size = GGML_PAD(size, spacemit_kernels::q8_hp_al_align) + spacemit_kernels::q8_hp_al_align;
                     }
@@ -829,6 +843,14 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS> class tensor_
             if constexpr (std::is_same_v<BLOC_TYPE, block_q6_K> || std::is_same_v<BLOC_TYPE, block_q8_0>) {
                 gemm_kernel     = spacemit_kernels::ime2::gemm_kernel_i8i8;
                 set_kernel_impl = true;
+                if constexpr (std::is_same_v<BLOC_TYPE, block_q8_0>) {
+                    if (spacemit_kernels::q8_prearranged_enabled()) {
+                        // B pre-arranged at repack; 4-row A groups in 192B K32 blocks (data 64B aligned)
+                        gemm_kernel        = spacemit_kernels::ime2::gemm_kernel_i8i8_pre_al;
+                        quantize_a_4row_i8 = spacemit_kernels::rvv::quantize_a_4row_i8_al;
+                        block_stride_a     = spacemit_kernels::q8_m4al_row_blk_size;
+                    }
+                }
             } else if constexpr (std::is_same_v<BLOC_TYPE, block_q4_0> || std::is_same_v<BLOC_TYPE, block_q4_1> ||
                                  std::is_same_v<BLOC_TYPE, block_q4_K>) {
                 if constexpr (INTER_SIZE == 256) {
@@ -905,15 +927,15 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS> class tensor_
         const int64_t b_k_blks = spacemit_kernels::div_round_up(gemm_k, b_blk_len);
 
         const int64_t row_stride_a        = a_k_blks * block_stride_a;
-        const int64_t ws_align            = hp_aligned() ? spacemit_kernels::q8_hp_al_align : alignof(int64_t);
+        const int64_t ws_align            = a_aligned() ? spacemit_kernels::q8_hp_al_align : alignof(int64_t);
         const int64_t gemm_workspace_size = GGML_PAD(gemm_m * row_stride_a, ws_align);
 
-        if (ith == 0 && params->wsize < gemm_workspace_size + (hp_aligned() ? ws_align : 0)) {
+        if (ith == 0 && params->wsize < gemm_workspace_size + (a_aligned() ? ws_align : 0)) {
             GGML_ABORT("wsize less than gemm_workspace_size");
         }
 
         uintptr_t ws_ptr = reinterpret_cast<uintptr_t>(params->wdata);
-        if (hp_aligned()) {
+        if (a_aligned()) {
             ws_ptr = (ws_ptr + ws_align - 1) & ~(uintptr_t) (ws_align - 1);
         }
 
@@ -972,9 +994,11 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS> class tensor_
 
         if (gemm_m == 1) {
             // the 1-row kernels walk K blocks contiguously, so split at the 1-row block size (block_stride_a is
-            // the padded per-row slot size in the aligned hp layout)
+            // the padded per-row slot size in the aligned hp and Q8_0 pre layouts)
             const int64_t blk_stride_1row =
-                hp_aligned() ? (int64_t) spacemit_kernels::q8_hp_blk_size(a_blk_len, true, true) : block_stride_a;
+                hp_aligned() ? (int64_t) spacemit_kernels::q8_hp_blk_size(a_blk_len, true, true) :
+                q8_pre()     ? (int64_t) spacemit_kernels::q8_blk_size(a_blk_len, true) :
+                               block_stride_a;
             int task_per_thread = spacemit_kernels::div_round_up(a_k_blks, nth);
             int a_blk_start     = ith * task_per_thread;
             int a_blk_end       = std::min(a_blk_start + task_per_thread, (int) a_k_blks);
@@ -1288,6 +1312,11 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS> class tensor_
             if constexpr (std::is_same_v<BLOC_TYPE, block_q6_K> || std::is_same_v<BLOC_TYPE, block_q8_0>) {
                 gemm_kernel     = spacemit_kernels::ime2::gemm_kernel_i8i8;
                 set_kernel_impl = true;
+                if constexpr (std::is_same_v<BLOC_TYPE, block_q8_0>) {
+                    if (spacemit_kernels::q8_prearranged_enabled()) {
+                        gemm_kernel = spacemit_kernels::ime2::gemm_kernel_i8i8_pre;  // weights pre-arranged at repack
+                    }
+                }
             } else if constexpr (std::is_same_v<BLOC_TYPE, block_q4_0> || std::is_same_v<BLOC_TYPE, block_q4_1> ||
                                  std::is_same_v<BLOC_TYPE, block_q4_K>) {
                 if constexpr (INTER_SIZE == 256) {

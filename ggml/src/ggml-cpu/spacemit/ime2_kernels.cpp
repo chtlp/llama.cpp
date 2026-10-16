@@ -5433,6 +5433,230 @@ void gemm_kernel_i8i8_m4(size_t          blk_len,
     }
 }
 
+// gemm_kernel_i8i8_m4 on pre-arranged B (q8_0x32_prearrange: no vupack). A_AL: A in the aligned 192B layout
+// (q8_m4al_blk_size, int8 data at +64) instead of the 152B one.
+template <bool A_AL>
+static void gemm_kernel_i8i8_m4_pre(size_t          blk_len,
+                                    const uint8_t * quant_a_ptr,
+                                    const uint8_t * quant_b_data,
+                                    float *         c_ptr,
+                                    size_t          count_n,
+                                    size_t          k_blks,
+                                    size_t          ldc) {
+    int64_t b_data_stride = k_blks * sizeof(ggml_fp16_t) + k_blks * blk_len;
+    for (size_t ni = 0; ni < count_n; ni += 32) {
+        uint8_t * b_data = (uint8_t *) quant_b_data + ni * b_data_stride;
+        int8_t *  a_data = (int8_t *) quant_a_ptr;
+        float *   dst_c  = c_ptr + ni;
+        size_t    bk     = k_blks;  // counted down by the loop (gemm_kernel_i8i8_m4 declares it input-only)
+
+        asm volatile(
+            "vsetvli        t0, x0, e32, m1       \n\t"
+            "vxor.vv        v28, v28, v28         \n\t"
+            "vxor.vv        v29, v29, v29         \n\t"
+            "vxor.vv        v30, v30, v30         \n\t"
+            "vxor.vv        v31, v31, v31         \n\t"
+
+            ".align 4                             \n\t"
+            "BLK_LOOP%=:                          \n\t"
+            "flw            fa0, (%[A])           \n\t"
+            "flw            fa1, 4(%[A])          \n\t"
+            "flw            fa2, 8(%[A])          \n\t"
+            "flw            fa3, 12(%[A])         \n\t"
+            "addi           %[A], %[A], %[AHDR]   \n\t"
+
+            "vsetvli        t0, x0, e16, mf2      \n\t"
+            "vle16.v        v12, (%[B])           \n\t"
+            "addi           %[B], %[B], 64        \n\t"
+            "vfwcvt.f.f.v   v14, v12              \n\t"
+
+            "vsetvli        t0, x0, e8, m1        \n\t"
+            "vl1r.v         v0, (%[A])            \n\t"
+            "addi           %[A], %[A], 128       \n\t"
+            "vl4r.v         v24, (%[B])           \n\t"  // already in the vmadot i8 K16 layout
+            "addi           %[B], %[B], 512       \n\t"
+            "vl4r.v         v4, (%[B])            \n\t"
+            "addi           %[B], %[B], 512       \n\t"
+
+            "vsetvli        t0, zero, e32, m1     \n\t"
+            "vupack.vv      v2, v0, v0, 1         \n\t"
+
+            "vxor.vv        v16, v16, v16         \n\t"
+            "vxor.vv        v18, v16, v16         \n\t"
+            "vxor.vv        v20, v16, v16         \n\t"
+            "vxor.vv        v22, v16, v16         \n\t"
+
+            "vmadot         v16, v2, v24, i8      \n\t"
+            "vmadot         v18, v2, v26, i8      \n\t"
+            "vmadot         v20, v2, v4, i8       \n\t"
+            "vmadot         v22, v2, v6, i8       \n\t"
+            "vmadot         v16, v3, v25, i8      \n\t"
+            "vmadot         v18, v3, v27, i8      \n\t"
+            "vmadot         v20, v3, v5, i8       \n\t"
+            "vmadot         v22, v3, v7, i8       \n\t"
+
+            "vpack.vv       v0, v16, v18, 2       \n\t"
+            "vpack.vv       v2, v20, v22, 2       \n\t"
+            "vpack.vv       v16, v0, v2, 3        \n\t"
+            "vpack.vv       v18, v1, v3, 3        \n\t"
+
+            "vfcvt.f.x.v    v16, v16              \n\t"
+            "vfcvt.f.x.v    v17, v17              \n\t"
+            "vfcvt.f.x.v    v18, v18              \n\t"
+            "vfcvt.f.x.v    v19, v19              \n\t"
+
+            "vfmul.vv       v16, v16, v14         \n\t"
+            "vfmul.vv       v17, v17, v14         \n\t"
+            "vfmul.vv       v18, v18, v14         \n\t"
+            "vfmul.vv       v19, v19, v14         \n\t"
+
+            "addi           %[BK], %[BK], -1      \n\t"
+            "vfmacc.vf      v28, fa0, v16         \n\t"
+            "vfmacc.vf      v29, fa1, v17         \n\t"
+            "vfmacc.vf      v30, fa2, v18         \n\t"
+            "vfmacc.vf      v31, fa3, v19         \n\t"
+
+            "bgtz           %[BK], BLK_LOOP%=     \n\t"
+
+            "vsetvli        t0, x0, e32, m1       \n\t"
+            "add            t2, %[LDC], %[DST]    \n\t"
+            "vse32.v        v28, (%[DST])         \n\t"
+            "add            t3, %[LDC], t2        \n\t"
+            "vse32.v        v29, (t2)             \n\t"
+            "add            t2, %[LDC], t3        \n\t"
+            "vse32.v        v30, (t3)             \n\t"
+            "vse32.v        v31, (t2)             \n\t"
+            : [A] "+r"(a_data), [B] "+r"(b_data), [BK] "+r"(bk)
+            : [DST] "r"(dst_c), [LDC] "r"(ldc * 4), [AHDR] "i"(A_AL ? 64 : 16 + 8)
+            : "t0", "t1", "t2", "t3", "v0", "v1", "v2", "v3", "v4", "v5", "v6", "v7", "v8", "v9", "v10", "v11", "v12",
+              "v13", "v14", "v15", "v16", "v17", "v18", "v19", "v20", "v21", "v22", "v23", "v24", "v25", "v26", "v27",
+              "v28", "v29", "v30", "v31", "fa0", "fa1", "fa2", "fa3", "memory");
+    }
+}
+
+// gemm_kernel_i8i8_m1 on pre-arranged B (no vupack)
+static void gemm_kernel_i8i8_m1_pre(size_t          blk_len,
+                                    const uint8_t * quant_a_ptr,
+                                    const uint8_t * quant_b_data,
+                                    float *         c_ptr,
+                                    size_t          count_n,
+                                    size_t          k_blks) {
+    for (size_t n = 0; n < count_n; n += 32) {
+        size_t    nblks         = (count_n - n) > 32 ? 32 : count_n - n;
+        uint8_t * QuantBDataPtr = (uint8_t *) quant_b_data + n * k_blks * blk_len + n * k_blks * sizeof(_Float16);
+        float *   CPtr          = c_ptr + n;
+        size_t    cnt           = k_blks;
+
+        __asm__ volatile(
+            "mv           t3, %[BCK]              \n\t"
+            "mv           t4, %[NBLKS]            \n\t"
+            "mv           s2, %[pA]               \n\t"  // s2 = pASCL
+            "addi         s3, %[pA], 4+2          \n\t"  // s3 = pAData, (pA+AScl+ASum)
+            "mv           s4, %[pB]               \n\t"  // s4 = pBSCL
+            "addi         s5, %[pB], 32*2         \n\t"  // s5 = pBdata;
+            "mv           s6, %[pC]               \n\t"
+
+            "vsetvli      t0, x0, e32, m1         \n\t"
+            "vxor.vv      v2, v0, v0              \n\t"  // clear acc
+
+            ".align 4                             \n\t"
+            "_K_LPST%=:                           \n\t"
+
+            "vsetvli      t0, x0, e8, m1          \n\t"
+            "vl4r.v       v24, (s5)               \n\t"  // B data, already in the vmadot i8 K16 layout
+            "addi         s5, s5, 128*4           \n\t"
+            "vl4r.v       v28, (s5)               \n\t"
+            "addi         s5, s5, 128*4+64        \n\t"
+
+            "vsetvli      t0, x0, e8, mf2         \n\t"
+            "vle8.v       v0, (s4)                \n\t"  // B Scale 4VRF*8Row*FP16 = 512bit
+            "addi         s4, s4, 64+128*8        \n\t"
+
+            "vsetvli      t0, x0, e8, mf4         \n\t"
+            "vle8.v       v3, (s3)                \n\t"  // A Data M1*K32*int8 = 256bit
+            "addi         s3, s3, 32+6            \n\t"
+
+            "flw          f0, (s2)                \n\t"  // A Scale fp32
+            "addi         s2, s2, 6+32            \n\t"  // AScale + Asum(FP32+i16)
+
+            "vsetvli      t0, zero, e32, m1       \n\t"
+            "vslidedown.vi  v4, v3, 4             \n\t"
+
+            "vxor.vv      v16, v16, v16           \n\t"
+            "vxor.vv      v18, v16, v16           \n\t"
+            "vxor.vv      v20, v16, v16           \n\t"
+            "vxor.vv      v22, v16, v16           \n\t"
+
+            "vmadot       v16, v3, v24, i8         \n\t"  // M0 N0 - N7 INT32(256bit)
+            "vmadot       v18, v3, v26, i8         \n\t"  // M0 N8 - N15
+            "vmadot       v20, v3, v28, i8         \n\t"  // M0 N16 - N23
+            "vmadot       v22, v3, v30, i8         \n\t"  // M0 N24 - N31
+
+            "vmadot       v16, v4, v25, i8         \n\t"
+            "vmadot       v18, v4, v27, i8         \n\t"
+            "vmadot       v20, v4, v29, i8         \n\t"
+            "vmadot       v22, v4, v31, i8         \n\t"
+
+            "vpack.vv     v24, v16, v18, 2        \n\t"
+            "vpack.vv     v26, v20, v22, 2        \n\t"
+            "vpack.vv     v16, v24, v26, 3        \n\t"
+
+            "vsetvli      t0, x0, e16, mf2        \n\t"
+            "vfwcvt.f.f.v v24, v0                 \n\t"
+            "vsetvli      t0, x0, e32, m1         \n\t"
+            "vfcvt.f.x.v  v26, v16                \n\t"
+            "vfmul.vf     v1, v24, f0             \n\t"
+            "vfmacc.vv    v2, v1, v26             \n\t"
+
+            "addi         t3, t3, -1              \n\t"
+            "bgtz         t3, _K_LPST%=           \n\t"
+
+            "vsetvli      t0, t4, e32, m1         \n\t"
+            "vse32.v      v2, (s6)                \n\t"  // M0 [N0 : N32]; FP32(1024bit)
+            :
+            : [BCK] "r"(cnt), [NBLKS] "r"(nblks), [pA] "r"(quant_a_ptr), [pB] "r"(QuantBDataPtr), [pC] "r"(CPtr)
+            : "cc", "t0", "t3", "t4", "f0", "s2", "s3", "s4", "s5", "s6", "v0", "v1", "v2", "v3", "v4", "v16", "v17",
+              "v18", "v19", "v20", "v21", "v22", "v23", "v24", "v25", "v26", "v27", "v28", "v29", "v30", "v31",
+              "memory");
+    }
+}
+
+size_t gemm_kernel_i8i8_pre(size_t          blk_len,
+                            const uint8_t * quant_a_ptr,
+                            const uint8_t * quant_b_data,
+                            const uint8_t * quant_b_zp,
+                            float *         c_ptr,
+                            size_t          count_m,
+                            size_t          count_n,
+                            size_t          k_blks,
+                            size_t          ldc) {
+    GGML_UNUSED(quant_b_zp);
+    if (count_m >= 4) {
+        gemm_kernel_i8i8_m4_pre<false>(blk_len, quant_a_ptr, quant_b_data, c_ptr, count_n, k_blks, ldc);
+        return 4;
+    }
+    gemm_kernel_i8i8_m1_pre(blk_len, quant_a_ptr, quant_b_data, c_ptr, count_n, k_blks);
+    return 1;
+}
+
+size_t gemm_kernel_i8i8_pre_al(size_t          blk_len,
+                               const uint8_t * quant_a_ptr,
+                               const uint8_t * quant_b_data,
+                               const uint8_t * quant_b_zp,
+                               float *         c_ptr,
+                               size_t          count_m,
+                               size_t          count_n,
+                               size_t          k_blks,
+                               size_t          ldc) {
+    GGML_UNUSED(quant_b_zp);
+    if (count_m >= 4) {
+        gemm_kernel_i8i8_m4_pre<true>(blk_len, quant_a_ptr, quant_b_data, c_ptr, count_n, k_blks, ldc);
+        return 4;
+    }
+    gemm_kernel_i8i8_m1_pre(blk_len, quant_a_ptr, quant_b_data, c_ptr, count_n, k_blks);
+    return 1;
+}
+
 void moe_m2_gemm_kernel_i8i4_impl(size_t           blk_len,
                                   const uint8_t ** quant_a_ptr,
                                   const uint8_t *  quant_b_data,

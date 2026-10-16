@@ -54,6 +54,17 @@ bool hp_m8_enabled();
 // weight repack and the kernels always agree.
 bool hp_aligned_enabled();
 
+// GGML_SPACEMIT_Q8_PRE=0 disables the pre-arranged Q8_0 path (default on; needs the aligned hp path and IME2):
+// Q8_0 weights are stored in the K16 register layout vmadot i8 reads, so gemm_kernel_i8i8 needs no vupack, and the
+// dense 4-row A groups use 192B K32 blocks with the int8 data 64B aligned. Read once, so repack and kernels agree.
+bool q8_prearranged_enabled();
+
+// Aligned 4-row Q8 layout (q8_prearranged_enabled()): per K32 block of 4 rows
+//   [4 x fp32 scale][4 x s16 sum][40B pad][4 x 32 int8]                                     = 192B
+// The per-row stride is 48B, so 1-row blocks (q8_blk_size(32, true) = 38B, contiguous) fit in the same slots.
+constexpr size_t q8_m4al_blk_size     = 192;
+constexpr size_t q8_m4al_row_blk_size = q8_m4al_blk_size / 4;
+
 // Q8K Blk [f32] [s16 * (blk_len / 16)] [int8 * blk_len]
 // Q8K Blk N [f32 * N] [s16 * (blk_len / 16) * N] [int8 * blk_len * N]
 constexpr size_t q8k_blk_size(size_t blk_len) {
@@ -137,6 +148,9 @@ template <typename T> void forward_repeat_dim1(ggml_compute_params * params, ggm
 void quantize_a_row_i8(size_t blk_len, const float * a_ptr, size_t count_k, uint8_t * quant_a_ptr);
 
 void quantize_a_4row_i8(size_t blk_len, const float * a_ptr, size_t count_k, uint8_t * quant_a_ptr);
+
+// quantize_a_4row_i8 into the aligned q8_m4al_blk_size layout (VLEN 1024 only)
+void quantize_a_4row_i8_al(size_t blk_len, const float * a_ptr, size_t count_k, uint8_t * quant_a_ptr);
 
 void quantize_a_row_i8_hp(size_t blk_len, const float * a_ptr, size_t count_k, uint8_t * quant_a_ptr);
 

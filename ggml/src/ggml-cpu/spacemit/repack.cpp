@@ -1857,6 +1857,33 @@ template <> int repack<block_q8_0, 32, 16>(ggml_tensor * t, const void * data, s
     return repack_q8_0_to_q8_0_16_bl_ref(t, 16, data, data_size);
 }
 
+// q8_prearranged_enabled(): store each K32 block's 32x32 int8 data in the order gemm_kernel_i8i8_*_pre loads it.
+// The original kernels apply vupack.vv vd, vs2, vs1, 1 (e32) to each 256B register pair, which moves 16B chunk
+// (o % 8) * 2 + o / 8 of the pair to chunk o (measured on A100, VLEN 1024); doing it here leaves the kernel only
+// the loads.
+static void q8_0x32_prearrange(ggml_tensor * t) {
+    block_q8_0x32 * blk = (block_q8_0x32 *) t->data;
+    const int64_t   n   = (ggml_nrows(t) + 31) / 32 * (t->ne[0] / QK8_0);
+    static_assert(sizeof(blk->qs) == 4 * 256, "q8_0x32 data is four 256B register pairs");
+    for (int64_t i = 0; i < n; i++) {
+        for (int p = 0; p < 4; p++) {
+            uint8_t * pair = blk[i].qs + p * 256;
+            uint8_t   tmp[256];
+            for (int o = 0; o < 16; o++) {
+                memcpy(tmp + o * 16, pair + ((o % 8) * 2 + o / 8) * 16, 16);
+            }
+            memcpy(pair, tmp, sizeof(tmp));
+        }
+    }
+}
+
+static int q8_0x32_finish(ggml_tensor * t, int ret) {
+    if (ret == 0 && spacemit_kernels::q8_prearranged_enabled()) {
+        q8_0x32_prearrange(t);
+    }
+    return ret;
+}
+
 // Q5_0 -> Q8_0 at load time, exact: Q5_0 value d * (q - 16) with q in [0, 31] is Q8_0 with the same d and
 // qs = q - 16. The result is repacked like a Q8_0 tensor and runs on the Q8_0 IME kernels.
 int repack_q5_0_to_q8_0_32(ggml_tensor * t, const void * data, size_t data_size) {
@@ -1878,7 +1905,7 @@ int repack_q5_0_to_q8_0_32(ggml_tensor * t, const void * data, size_t data_size)
             q8[i].qs[j + QK5_0 / 2] = (int8_t) (((src[i].qs[j] >> 4) | xh_1) - 16);
         }
     }
-    return repack_q8_0_to_q8_0_32_bl(t, 32, q8.data(), q8.size() * sizeof(block_q8_0));
+    return q8_0x32_finish(t, repack_q8_0_to_q8_0_32_bl(t, 32, q8.data(), q8.size() * sizeof(block_q8_0)));
 }
 
 // F32 weights (the MoE router) quantized to Q8_0 rows at load time, then laid out as Q8_0 32x32
@@ -1892,12 +1919,12 @@ int repack_f32_to_q8_0_32(ggml_tensor * t, const void * data, size_t data_size) 
     for (int64_t r = 0; r < nrows; r++) {
         quantize_row_q8_0_ref((const float *) data + r * t->ne[0], q8.data() + r * nb, t->ne[0]);
     }
-    return repack_q8_0_to_q8_0_32_bl(t, 32, q8.data(), q8.size() * sizeof(block_q8_0));
+    return q8_0x32_finish(t, repack_q8_0_to_q8_0_32_bl(t, 32, q8.data(), q8.size() * sizeof(block_q8_0)));
 }
 
 template <> int repack<block_q8_0, 32, 32>(ggml_tensor * t, const void * data, size_t data_size) {
 #if 1
-    return repack_q8_0_to_q8_0_32_bl_ref(t, 32, data, data_size);
+    return q8_0x32_finish(t, repack_q8_0_to_q8_0_32_bl_ref(t, 32, data, data_size));
 #else
     return repack_q8_0_to_q8_0_32_bl(t, 32, data, data_size);
 #endif

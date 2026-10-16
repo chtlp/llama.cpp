@@ -1,6 +1,7 @@
 #include "rvv_kernels.h"
 
 #include "common.h"
+#include "ime_env.h"
 #include "ggml.h"
 #include "op-stats.h"
 #include "ops.h"
@@ -2536,6 +2537,39 @@ void quantize_a_4row_i8(size_t blk_len, const float * a_ptr, size_t count_k, uin
     }
 }
 
+void quantize_a_4row_i8_al(size_t blk_len, const float * a_ptr, size_t count_k, uint8_t * quant_a_ptr) {
+    GGML_ASSERT(blk_len == 32 && __riscv_vlenb() == 128);
+    for (size_t k = 0; k < count_k; k += blk_len, quant_a_ptr += q8_m4al_blk_size) {
+        float *   scale_a_ptr = reinterpret_cast<float *>(quant_a_ptr);
+        int16_t * a_sum_ptr   = reinterpret_cast<int16_t *>(quant_a_ptr + sizeof(float) * 4);
+        int8_t *  quant_a_blk = reinterpret_cast<int8_t *>(quant_a_ptr + 64);
+
+        for (size_t mi = 0; mi < 4; mi++) {
+            size_t       vl      = __riscv_vsetvl_e32m1(blk_len);
+            vfloat32m1_t v_a     = __riscv_vle32_v_f32m1(a_ptr + mi * count_k + k, vl);
+            vfloat32m1_t v_a_abs = __riscv_vfabs_v_f32m1(v_a, vl);
+
+            vfloat32m1_t tmp       = __riscv_vfmv_v_f_f32m1(0.0f, vl);
+            vfloat32m1_t v_a_max   = __riscv_vfredmax_vs_f32m1_f32m1(v_a_abs, tmp, vl);
+            float        max_abs_a = __riscv_vfmv_f_s_f32m1_f32(v_a_max);
+
+            float scale_a     = max_abs_a / ((1 << 7) - 1);
+            float rep_scale_a = scale_a ? 1.0f / scale_a : 0.0f;
+            scale_a_ptr[mi]   = scale_a;
+
+            vfloat32m1_t v_a_scale    = __riscv_vfmul_vf_f32m1(v_a, rep_scale_a, vl);
+            vint16mf2_t  v_a_quant    = __riscv_vfncvt_x_f_w_i16mf2(v_a_scale, vl);
+            vint8mf4_t   v_a_quant_i8 = __riscv_vncvt_x_x_w_i8mf4(v_a_quant, vl);
+
+            vint16m1_t tmp_sum = __riscv_vmv_v_x_i16m1(0, vl);
+            vint16m1_t v_a_sum = __riscv_vwredsum_vs_i8mf4_i16m1(v_a_quant_i8, tmp_sum, vl);
+            a_sum_ptr[mi]      = -__riscv_vmv_x_s_i16m1_i16(v_a_sum);
+
+            __riscv_vse8_v_i8mf4(quant_a_blk + mi * blk_len, v_a_quant_i8, vl);
+        }
+    }
+}
+
 void quantize_a_row_i8_hp(size_t blk_len, const float * a_ptr, size_t count_k, uint8_t * quant_a_ptr) {
     constexpr size_t k_subblk_len = 32;
     GGML_ASSERT(blk_len == 256);
@@ -2941,6 +2975,17 @@ void quantize_a_4row_i8_hp_al(size_t blk_len, const float * a_ptr, size_t count_
 }  // namespace spacemit_kernels::rvv
 
 namespace spacemit_kernels {
+bool q8_prearranged_enabled() {
+    static const bool enabled = [] {
+        const char * e = getenv("GGML_SPACEMIT_Q8_PRE");
+        // decided on the loading thread (an X100 core, VLEN 256), so no vlenb check here: the IME2 kernels run on
+        // the A100 cores (VLEN 1024; quantize_a_4row_i8_al asserts it)
+        return hp_aligned_enabled() && ggml::cpu::riscv64_spacemit::global_spine_env_info.use_ime2 &&
+               !(e && e[0] == '0');
+    }();
+    return enabled;
+}
+
 bool hp_m8_enabled() {
     static const bool enabled = [] {
         const char * e = getenv("GGML_SPACEMIT_HP_M8");

@@ -210,6 +210,27 @@ size_t gemm_kernel_i8i8(size_t          blk_len,
                         size_t          k_blks,
                         size_t          ldc);
 
+// gemm_kernel_i8i8 on pre-arranged Q8_0 B (q8_prearranged_enabled()); _al: 4-row A in the aligned 192B layout
+size_t gemm_kernel_i8i8_pre(size_t          blk_len,
+                        const uint8_t * quant_a_ptr,
+                        const uint8_t * quant_b_data,
+                        const uint8_t * quant_b_zp,
+                        float *         c_ptr,
+                        size_t          count_m,
+                        size_t          count_n,
+                        size_t          k_blks,
+                        size_t          ldc);
+
+size_t gemm_kernel_i8i8_pre_al(size_t          blk_len,
+                        const uint8_t * quant_a_ptr,
+                        const uint8_t * quant_b_data,
+                        const uint8_t * quant_b_zp,
+                        float *         c_ptr,
+                        size_t          count_m,
+                        size_t          count_n,
+                        size_t          k_blks,
+                        size_t          ldc);
+
 size_t gemm_kernel_i8mxfp4(size_t          blk_len,
                            const uint8_t * quant_a_ptr,
                            const uint8_t * quant_b_data,
