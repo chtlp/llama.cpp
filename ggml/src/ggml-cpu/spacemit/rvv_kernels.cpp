@@ -2825,7 +2825,6 @@ void quantize_a_8row_i8_hp_m8(size_t blk_len, const float * a_ptr, size_t count_
 
     const float stable_factor = 0.1f;
     float       scale_temp[subblk_count];
-    alignas(64) int8_t q[k_subblk_len];
 
     for (size_t k = 0; k < count_k; k += blk_len, quant_a_ptr += q8_hp_m8_blk_size) {
         _Float16 * scale_ptr = reinterpret_cast<_Float16 *>(quant_a_ptr + 2048);
@@ -2857,19 +2856,17 @@ void quantize_a_8row_i8_hp_m8(size_t blk_len, const float * a_ptr, size_t count_
                 size_t       vl  = __riscv_vsetvl_e32m1(k_subblk_len);
                 vfloat32m1_t v_a = __riscv_vfmul_vf_f32m1(
                     __riscv_vle32_v_f32m1(a_ptr + r * count_k + k + kk * k_subblk_len, vl), rep_scale_a, vl);
-                vint16mf2_t v16 = __riscv_vfncvt_x_f_w_i16mf2(v_a, vl);
-                __riscv_vse8_v_i8mf4(q, __riscv_vncvt_x_x_w_i8mf4(v16, vl), vl);
-
-                // pair even/odd k into bytes: low nibble = even k
-                vl              = __riscv_vsetvl_e8mf4(k_subblk_len / 2);
-                vint8mf4_t ev   = __riscv_vlse8_v_i8mf4(q, 2, vl);
-                vint8mf4_t od   = __riscv_vlse8_v_i8mf4(q + 1, 2, vl);
-                vint8mf4_t l    = __riscv_vor_vv_i8mf4(__riscv_vand_vx_i8mf4(ev, 15, vl),
-                                                       __riscv_vsll_vx_i8mf4(__riscv_vand_vx_i8mf4(od, 15, vl), 4, vl), vl);
-                vint8mf4_t h    = __riscv_vor_vv_i8mf4(__riscv_vand_vx_i8mf4(__riscv_vsra_vx_i8mf4(ev, 4, vl), 15, vl),
-                                                       __riscv_vsll_vx_i8mf4(__riscv_vsra_vx_i8mf4(od, 4, vl), 4, vl), vl);
-                __riscv_vse8_v_i8mf4((int8_t *) lo + r * 16, l, vl);
-                __riscv_vse8_v_i8mf4((int8_t *) hi + r * 16, h, vl);
+                // two consecutive int16 values (k even, k odd) as one u32: build the lo / hi nibble bytes in
+                // registers (bits 4..7 of the two's complement value are the signed hi nibble), then narrow
+                vuint32mf2_t x = __riscv_vreinterpret_v_u16mf2_u32mf2(
+                    __riscv_vreinterpret_v_i16mf2_u16mf2(__riscv_vfncvt_x_f_w_i16mf2(v_a, vl)));
+                vl             = __riscv_vsetvl_e32mf2(k_subblk_len / 2);
+                vuint32mf2_t l = __riscv_vor_vv_u32mf2(__riscv_vand_vx_u32mf2(x, 0xF, vl),
+                                                       __riscv_vand_vx_u32mf2(__riscv_vsrl_vx_u32mf2(x, 12, vl), 0xF0, vl), vl);
+                vuint32mf2_t h = __riscv_vor_vv_u32mf2(__riscv_vand_vx_u32mf2(__riscv_vsrl_vx_u32mf2(x, 4, vl), 0xF, vl),
+                                                       __riscv_vand_vx_u32mf2(__riscv_vsrl_vx_u32mf2(x, 16, vl), 0xF0, vl), vl);
+                __riscv_vse8_v_u8mf8(lo + r * 16, __riscv_vnsrl_wx_u8mf8(__riscv_vnsrl_wx_u16mf4(l, 0, vl), 0, vl), vl);
+                __riscv_vse8_v_u8mf8(hi + r * 16, __riscv_vnsrl_wx_u8mf8(__riscv_vnsrl_wx_u16mf4(h, 0, vl), 0, vl), vl);
             }
         }
     }
