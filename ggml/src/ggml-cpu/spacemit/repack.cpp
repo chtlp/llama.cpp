@@ -6,6 +6,7 @@
 #include "ggml-common.h"
 #include "ggml-cpu.h"
 #include "ggml-impl.h"
+#include "ggml-quants.h"
 #include "ime_kernels.h"
 #include "rvv_kernels.h"
 
@@ -1385,7 +1386,7 @@ static int repack_q8_0_to_q8_0_32_bl(ggml_tensor *              t,
                                      const void * GGML_RESTRICT data,
                                      size_t                     data_size) {
     // Q5_0 tensors arrive here already converted to Q8_0 rows (repack_q5_0_to_q8_0_32)
-    GGML_ASSERT(t->type == GGML_TYPE_Q8_0 || t->type == GGML_TYPE_Q5_0);
+    GGML_ASSERT(t->type == GGML_TYPE_Q8_0 || t->type == GGML_TYPE_Q5_0 || t->type == GGML_TYPE_F32);
     GGML_ASSERT(interleave_block == 32);
 
     constexpr int nrows_interleaved = 32;
@@ -1876,6 +1877,20 @@ int repack_q5_0_to_q8_0_32(ggml_tensor * t, const void * data, size_t data_size)
             q8[i].qs[j]             = (int8_t) (((src[i].qs[j] & 0x0F) | xh_0) - 16);
             q8[i].qs[j + QK5_0 / 2] = (int8_t) (((src[i].qs[j] >> 4) | xh_1) - 16);
         }
+    }
+    return repack_q8_0_to_q8_0_32_bl(t, 32, q8.data(), q8.size() * sizeof(block_q8_0));
+}
+
+// F32 weights (the MoE router) quantized to Q8_0 rows at load time, then laid out as Q8_0 32x32
+int repack_f32_to_q8_0_32(ggml_tensor * t, const void * data, size_t data_size) {
+    GGML_ASSERT(t->type == GGML_TYPE_F32);
+    GGML_ASSERT(t->ne[0] % QK8_0 == 0);
+    const int64_t nrows = ggml_nrows(t);
+    GGML_ASSERT(data_size == (size_t) nrows * t->ne[0] * sizeof(float));
+    const int64_t           nb = t->ne[0] / QK8_0;
+    std::vector<block_q8_0> q8(nrows * nb);
+    for (int64_t r = 0; r < nrows; r++) {
+        quantize_row_q8_0_ref((const float *) data + r * t->ne[0], q8.data() + r * nb, t->ne[0]);
     }
     return repack_q8_0_to_q8_0_32_bl(t, 32, q8.data(), q8.size() * sizeof(block_q8_0));
 }

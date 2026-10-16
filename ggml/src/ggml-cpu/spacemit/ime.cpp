@@ -750,6 +750,13 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS> class tensor_
                         //case GGML_TYPE_MXFP4:
                         forward_mul_mat(params, op);
                         return true;
+                    case GGML_TYPE_F32:
+                        // F32 (router) weights converted to Q8_0 at load (tensor_traits_f32_as_q8_0)
+                        if constexpr (std::is_same_v<BLOC_TYPE, block_q8_0>) {
+                            forward_mul_mat(params, op);
+                            return true;
+                        }
+                        return false;
                     default:
                         // GGML_ABORT("fatal error: unsupported type for src0 in MUL_MAT");
                         return false;
@@ -2333,6 +2340,17 @@ class tensor_traits_q5_0_as_q8_0 : public tensor_traits<block_q8_0, 32, 32> {
 };
 
 static const tensor_traits_q5_0_as_q8_0 q5_0_as_q8_0_32x32;
+
+// F32 MoE router weights (ffn_gate_inp) quantized to Q8_0 at load and run on the Q8_0 IME path
+// (GGML_SPACEMIT_ROUTER_Q8=0 disables; lossy: routing logits from Q8_0 weights)
+class tensor_traits_f32_as_q8_0 : public tensor_traits<block_q8_0, 32, 32> {
+    int repack(ggml_tensor * t, const void * data, size_t data_size) override {
+        GGML_LOG_DEBUG("%s: repack tensor %s (f32) as q8_0_32x32\n", __func__, t->name);
+        return repack_f32_to_q8_0_32(t, data, data_size);
+    }
+};
+
+static const tensor_traits_f32_as_q8_0 f32_as_q8_0_32x32;
 // Impl By RVV
 static const tensor_traits_common               rvv_impl;
 
@@ -2508,6 +2526,21 @@ static const ggml::cpu::tensor_traits * ggml_riscv64_spacemit_get_optimal_repack
                 if (q5_0_as_q8 && cur->ne[1] % 32 == 0 && cur->ne[0] % QK8_0 == 0 &&
                     (ggml::cpu::riscv64_spacemit::global_spine_env_info.use_ime2)) {
                     return &ggml::cpu::riscv64_spacemit::q5_0_as_q8_0_32x32;
+                }
+#endif
+            }
+            break;
+        case GGML_TYPE_F32:
+            {
+#if defined(RISCV64_SPACEMIT_IME2)
+                static const bool router_q8 = [] {
+                    const char * e = getenv("GGML_SPACEMIT_ROUTER_Q8");
+                    return !(e && e[0] == '0');
+                }();
+                if (router_q8 && strstr(cur->name, "ffn_gate_inp") != nullptr && strstr(cur->name, "shexp") == nullptr &&
+                    ggml_n_dims(cur) == 2 && cur->ne[1] % 32 == 0 && cur->ne[0] % QK8_0 == 0 &&
+                    (ggml::cpu::riscv64_spacemit::global_spine_env_info.use_ime2)) {
+                    return &ggml::cpu::riscv64_spacemit::f32_as_q8_0_32x32;
                 }
 #endif
             }
@@ -2696,6 +2729,13 @@ static size_t ggml_backend_cpu_riscv64_spacemit_nbytes(ggml_backend_buffer_type_
                 nbytes = remap_block_nbytes(sizeof(block_q5_0), sizeof(block_q8_0), 32);
             } else {
                 nbytes = remap_block_nbytes(sizeof(block_q5_0), sizeof(spacemit_kernels::nrow_block_q5_0<1>));
+            }
+            break;
+        case GGML_TYPE_F32:
+            if (ggml_riscv64_spacemit_get_optimal_repack_type(tensor) == &ggml::cpu::riscv64_spacemit::f32_as_q8_0_32x32) {
+                nbytes = remap_block_nbytes(QK8_0 * sizeof(float), sizeof(block_q8_0), 32);
+            } else {
+                nbytes = add_strided_nbytes(row_nbytes, 1, 1);
             }
             break;
         default:
