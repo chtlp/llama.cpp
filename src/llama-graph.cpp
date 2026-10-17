@@ -1,5 +1,6 @@
 #include "llama-graph.h"
 
+#include "llama-fakeq.h"
 #include "llama-impl.h"
 #include "llama-model.h"
 #include "llama-batch.h"
@@ -1415,6 +1416,7 @@ ggml_tensor * llm_graph_context::build_lora_mm_id(
           ggml_tensor * cur, // ggml_tensor * b
           ggml_tensor * ids,
           ggml_tensor * w_s) const {
+    cur = llama_fakeq_act(ctx0, cur);
     ggml_tensor * res = ggml_mul_mat_id(ctx0, w, cur, ids);
 
     if (w_s) {

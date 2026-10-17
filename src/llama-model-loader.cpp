@@ -3,6 +3,7 @@
 #include "ggml-alloc.h"
 #include "ggml.h"
 #include "gguf.h"
+#include "llama-fakeq.h"
 #include "llama-hparams.h"
 #include "llama.h"
 
@@ -1530,6 +1531,7 @@ bool llama_model_loader::load_all_data(
         size_t n_size = ggml_nbytes(cur);
 
         if (use_mmap) {
+            GGML_ASSERT(!llama_fakeq_weight_enabled() && "LLAMA_FAKEQ_W requires --no-mmap");
             const auto & mapping = mappings.at(weight->idx);
             ggml_backend_buffer_t buf_mmap = nullptr;
             if (bufs.count(weight->idx)) {
@@ -1563,6 +1565,7 @@ bool llama_model_loader::load_all_data(
             if (ggml_backend_buffer_is_host(cur->buffer)) {
                 file->seek(weight->offs, SEEK_SET);
                 file->read_raw(cur->data, n_size);
+                llama_fakeq_weight(cur);
                 if (check_tensors) {
                     validation_result.emplace_back(std::async(std::launch::async, [cur, n_size] {
                         return std::make_pair(cur, ggml_validate_row_data(cur->type, cur->data, n_size));
@@ -1679,6 +1682,8 @@ bool llama_model_loader::load_all_data(
             return progress_callback(1.0f, progress_callback_user_data);
         }
     }
+
+    llama_fakeq_print_summary();
 
     return true;
 }
