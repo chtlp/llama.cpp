@@ -95,6 +95,52 @@ void forward_l2_norm_f32(ggml::spacemit::context & ctx, ggml_tensor * op) {
     }
 }
 
+// ── ARGSORT ──────────────────────────────────────────────────────────────────
+// Same as the generic CPU op (std::sort of the indices per row), so MoE top-k selection matches it exactly and
+// stays on this backend instead of splitting every MoE layer's graph around a CPU node.
+void forward_argsort_f32(ggml::spacemit::context & ctx, ggml_tensor * op) {
+    const ggml_tensor * src0 = op->src[0];
+    const int64_t       ne0  = src0->ne[0];
+    const int64_t       nr   = ggml_nrows(src0);
+    const ggml_sort_order order = (ggml_sort_order) ggml_get_op_params_i32(op, 0);
+
+    for (int64_t i = ctx.ith; i < nr; i += ctx.nth) {
+        const int64_t i1 = i % src0->ne[1];
+        const int64_t i2 = (i / src0->ne[1]) % src0->ne[2];
+        const int64_t i3 = i / (src0->ne[1] * src0->ne[2]);
+        const float * x  = (const float *) ((const char *) src0->data + i1 * src0->nb[1] + i2 * src0->nb[2] + i3 * src0->nb[3]);
+        int32_t *     y  = (int32_t *) ((char *) op->data + i1 * op->nb[1] + i2 * op->nb[2] + i3 * op->nb[3]);
+        for (int64_t j = 0; j < ne0; j++) {
+            y[j] = (int32_t) j;
+        }
+        if (order == GGML_SORT_ORDER_ASC) {
+            std::sort(y, y + ne0, [x](int32_t a, int32_t b) { return x[a] < x[b]; });
+        } else {
+            std::sort(y, y + ne0, [x](int32_t a, int32_t b) { return x[a] > x[b]; });
+        }
+    }
+}
+
+// ── CLAMP ────────────────────────────────────────────────────────────────────
+void forward_clamp_f32(ggml::spacemit::context & ctx, ggml_tensor * op) {
+    const ggml_tensor * src0 = op->src[0];
+    const float         mn   = ggml_get_op_params_f32(op, 0);
+    const float         mx   = ggml_get_op_params_f32(op, 1);
+    const int64_t       nc   = src0->ne[0];
+    const int64_t       nr   = ggml_nrows(src0);
+
+    for (int64_t i = ctx.ith; i < nr; i += ctx.nth) {
+        const int64_t i1 = i % src0->ne[1];
+        const int64_t i2 = (i / src0->ne[1]) % src0->ne[2];
+        const int64_t i3 = i / (src0->ne[1] * src0->ne[2]);
+        const float * x  = (const float *) ((const char *) src0->data + i1 * src0->nb[1] + i2 * src0->nb[2] + i3 * src0->nb[3]);
+        float *       y  = (float *) ((char *) op->data + i1 * op->nb[1] + i2 * op->nb[2] + i3 * op->nb[3]);
+        for (int64_t j = 0; j < nc; j++) {
+            y[j] = std::max(std::min(x[j], mx), mn);
+        }
+    }
+}
+
 // ── FILL ─────────────────────────────────────────────────────────────────────
 void forward_fill_f32(ggml::spacemit::context & ctx, ggml_tensor * op) {
     const float c = ggml_get_op_params_f32(op, 0);

@@ -745,6 +745,8 @@ static bool ggml_backend_spacemit_device_supports_op(ggml_backend_dev_t dev, con
         case GGML_OP_SOLVE_TRI:
         case GGML_OP_GATED_DELTA_NET:
         case GGML_OP_SSM_CONV:
+        case GGML_OP_ARGSORT:
+        case GGML_OP_CLAMP:
             supp = ggml_spacemit_get_tensor_traits(op) != nullptr;
             break;
 
