@@ -2314,6 +2314,12 @@ class tensor_traits_common : public ggml::spacemit::tensor_traits_base {
             case GGML_OP_GATED_DELTA_NET:
                 spacemit_kernels::rvv::forward_gated_delta_net(ctx, op);
                 return true;
+            case GGML_OP_ARGSORT:
+                spacemit_kernels::scalar::forward_argsort_f32(ctx, op);
+                return true;
+            case GGML_OP_CLAMP:
+                spacemit_kernels::scalar::forward_clamp_f32(ctx, op);
+                return true;
             case GGML_OP_SSM_CONV:
                 if (op->src[0]->op == GGML_OP_CONCAT && ggml_get_op_params_i32(op->src[0], FUSE_P_STATE) > 0) {
                     // the concat only materialized its trailing columns; read its inputs directly
@@ -3010,6 +3016,16 @@ const ggml::spacemit::tensor_traits_base * ggml_spacemit_get_tensor_traits(const
             break;
         case GGML_OP_SSM_CONV:
             if (op->src[0] && op->src[0]->type == GGML_TYPE_F32)
+                return common;
+            break;
+        case GGML_OP_ARGSORT:
+            if (op->src[0] && op->src[0]->type == GGML_TYPE_F32 && op->type == GGML_TYPE_I32 &&
+                op->src[0]->nb[0] == sizeof(float) && op->nb[0] == sizeof(int32_t))
+                return common;
+            break;
+        case GGML_OP_CLAMP:
+            if (op->src[0] && op->src[0]->type == GGML_TYPE_F32 && op->type == GGML_TYPE_F32 &&
+                op->src[0]->nb[0] == sizeof(float) && op->nb[0] == sizeof(float) && ggml_are_same_shape(op, op->src[0]))
                 return common;
             break;
         case GGML_OP_MUL_MAT:
