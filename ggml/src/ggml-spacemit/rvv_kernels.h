@@ -39,7 +39,49 @@ constexpr size_t q8k_blk_size(size_t blk_len) {
 
 using quantize_a_row_def = std::function<void(size_t, const float *, size_t, uint8_t *)>;
 
+// Aligned 4-row Q8 HP layout used with signed-int4 Q4_0 weights (GGML_SPACEMIT_HP_ALIGNED, see
+// hp_aligned_enabled()). Per K256 block of 4 rows:
+//   [8 x 128B int8 4x32 subblock data][8 x 8B subblock scale headers (fp16 scale + pad)]
+//   [72B trailer: fp16 a_sum[4][8] + fp16 scale_avg at +64][56B pad]                    = 1216B
+// The int8 data must be 64B aligned: misaligned whole-register vector loads are 2.7x-7.7x slower on A100.
+// The trailer sits at +1088 like the original layout; the original 1160B layout puts data at k*136+8.
+constexpr size_t q8_hp_m4al_blk_size = 1216;
+// per-row stride per K256 block when 4-row aligned groups and 1-row (q8_hp_blk_size) rows share a buffer
+constexpr size_t q8_hp_al_row_blk_size = q8_hp_m4al_blk_size / 4;
+constexpr size_t q8_hp_al_align        = 128;
+
+// 8-row pre-split Q8 HP layout for the m8 kernel (GGML_SPACEMIT_HP_M8). One fp16 scale per K32 subblock shared
+// by the 8 rows; each int8 value v = 16 * hi + lo is stored as two int4 register images that vmadot.hp reads
+// directly (row r = bytes 16r..16r+15, k in low-then-high nibble order). Per K256 block of 8 rows:
+//   [8 x (128B lo u4 | 128B hi s4)][8 x fp16 scale][fp16 scale_avg][110B pad]                         = 2176B
+constexpr size_t q8_hp_m8_blk_size = 2176;
+
+// GGML_SPACEMIT_HP_M8=0 disables the 8-row kernel (default on; needs the aligned hp path).
+bool hp_m8_enabled();
+
+// GGML_SPACEMIT_HP_ALIGNED=0 disables the aligned-A / signed-B Q4_0 hp path (default on). Read once, so the
+// weight repack and the kernels always agree.
+bool hp_aligned_enabled();
+
+// GGML_SPACEMIT_Q8_PRE=0 disables the pre-arranged Q8_0 path (default on; needs the aligned hp path and IME2):
+// Q8_0 weights are stored in the K16 register layout vmadot i8 reads, so gemm_kernel_i8i8 needs no vupack, and the
+// dense 4-row A groups use 192B K32 blocks with the int8 data 64B aligned. Read once, so repack and kernels agree.
+bool q8_prearranged_enabled();
+
+// Aligned 4-row Q8 layout (q8_prearranged_enabled()): per K32 block of 4 rows
+//   [4 x fp32 scale][4 x s16 sum][40B pad][4 x 32 int8]                                     = 192B
+// The per-row stride is 48B, so 1-row blocks (q8_blk_size(32, true) = 38B, contiguous) fit in the same slots.
+constexpr size_t q8_m4al_blk_size     = 192;
+constexpr size_t q8_m4al_row_blk_size = q8_m4al_blk_size / 4;
+
 namespace rvv {
+// quantize_a_4row_i8 into the aligned q8_m4al_blk_size layout (VLEN 1024 only)
+void quantize_a_4row_i8_al(size_t blk_len, const float * a_ptr, size_t count_k, uint8_t * quant_a_ptr);
+// aligned 4-row layout (q8_hp_m4al_blk_size per K256 block)
+void quantize_a_4row_i8_hp_al(size_t blk_len, const float * a_ptr, size_t count_k, uint8_t * quant_a_ptr);
+// 8 rows (row stride count_k) in the m8 layout (q8_hp_m8_blk_size per K256 block); quant_a_ptr 128B aligned
+void quantize_a_8row_i8_hp_m8(size_t blk_len, const float * a_ptr, size_t count_k, uint8_t * quant_a_ptr);
+
 void memcpy1d(void * dst, const void * src, int64_t size);
 
 void memcpy2d(void * dst, int64_t dst_stride, const void * src, int64_t src_stride, int64_t tile_rows, int64_t size);

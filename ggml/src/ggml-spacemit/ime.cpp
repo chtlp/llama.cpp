@@ -28,6 +28,11 @@
 #include <cstdio>  // for GGML_ASSERT
 #include <stdexcept>
 #include <thread>
+#include <cstring>
+#include <mutex>
+#include <string>
+#include <unordered_map>
+#include <vector>
 // clang-format off
 #if defined(__riscv)
 
@@ -104,9 +109,552 @@ template <typename BLOC_TYPE> constexpr bool block_type_has_zp() {
     }
 }
 
-template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS>
-class tensor_traits : public ggml::spacemit::tensor_traits_base {
-    bool work_size(int /* n_threads */, const ggml_tensor * op, size_t & size) const override {
+// ---- ported from ggml-cpu/spacemit (linpengt/qwen35-opt): matmul kernels, MoE m8/m4 paths, fusions ----
+// GGML_OP_STATS sub-phase timing lives in ggml-cpu (op-stats.c); not available in this backend.
+static inline bool    ggml_op_stats_enabled() { return false; }
+static inline int64_t ggml_op_stats_now_ns() { return 0; }
+
+// MUL_MAT_ID sub-phase stats, enabled with GGML_OP_STATS=1. Index 0: single-token graphs, 1: multi-token.
+struct alignas(64) mmid_phase_stats {
+    int64_t calls;
+    int64_t t_total;
+    int64_t t_quant;
+    int64_t t_route;
+    int64_t t_sync;
+    int64_t t_wcopy;
+    int64_t t_agather;
+    int64_t t_kernel;
+    int64_t rows_m4;
+    int64_t rows_m2;
+    int64_t rows_m1;
+    int64_t t_quant4;
+    int64_t w_tcm_hit;
+    int64_t w_tcm_miss;
+    int64_t fast_path;
+    double  kernel_flops;
+    // m8/m4 group path, split out of t_kernel / t_quant4
+    int64_t t_k8;
+    int64_t t_k4;
+    int64_t t_scatter;
+    int64_t t_q4wait;
+    int64_t t_scatter_wide;  // part of t_scatter for outputs wider than 1024 (ffn_down)
+    int64_t rows_m8;
+    double  flops_m8;
+    double  flops_m4;
+};
+
+// Dense MUL_MAT (multi-row) sub-phase stats, GGML_OP_STATS=1. Index: 0 q4_0, 1 q8_0, 2 other.
+struct alignas(64) dense_phase_stats {
+    int64_t calls;
+    int64_t t_total;
+    int64_t t_quant;
+    int64_t t_sync;
+    int64_t t_acopy;
+    int64_t t_bcopy;
+    int64_t t_barrier;
+    int64_t t_gemm;
+    int64_t branch[3];
+    double  flops;
+    double  b_bytes;  // weight bytes the kernels read (per pass over B)
+};
+
+struct mmid_route_stats {
+    int64_t calls;
+    int64_t active_experts;
+    int64_t rows;
+    int64_t hist[9];  // rows per active expert: 1, 2-3, 4-7, ..., 128-255, >=256
+    int64_t tcm_size;
+};
+
+// Prototype: run MoE expert rows through the 4-row hp kernel (GGML_SPACEMIT_MOE_M4=0 disables).
+static bool mmid_m4_enabled() {
+    static const bool enabled = [] {
+        const char * e = getenv("GGML_SPACEMIT_MOE_M4");
+        return !(e && e[0] == '0');
+    }();
+    return enabled;
+}
+
+// Graph-level fusions, decided once per graph compute by ggml_spacemit_graph_prepare()
+// and recorded in spare op_params slots of the nodes involved:
+//  - conv: concat(conv_states, transpose(qkv)) -> ssm_conv. SSM_CONV reads the two concat inputs directly
+//    and CONCAT only writes the trailing columns that are read back through views (the conv state update).
+//  - moe_w: mul(mul_mat_id(...), weights). MUL_MAT_ID scales each output row by its routing weight as it
+//    writes it, and the MUL becomes a no-op (or a copy when it is not in place).
+// GGML_SPACEMIT_FUSE_CONV=0 / GGML_SPACEMIT_FUSE_MOE_W=0 disable them.
+static bool fuse_env_enabled(const char * name) {
+    const char * e = getenv(name);
+    return !(e && e[0] == '0');
+}
+
+// RVV replacements for ops that otherwise run as scalar generic code (GGML_SPACEMIT_RVV_RMS_MUL / _SIGMOID / _L2=0
+// turn them off): the fused RMS_NORM + MUL, SIGMOID and L2_NORM
+static bool rvv_rms_mul_enabled() {
+    static const bool v = fuse_env_enabled("GGML_SPACEMIT_RVV_RMS_MUL");
+    return v;
+}
+
+static bool rvv_sigmoid_enabled() {
+    static const bool v = fuse_env_enabled("GGML_SPACEMIT_RVV_SIGMOID");
+    return v;
+}
+
+static bool rvv_l2_enabled() {
+    static const bool v = fuse_env_enabled("GGML_SPACEMIT_RVV_L2");
+    return v;
+}
+
+// MoE m8/m4 row write-out: scale by the routing weight while copying (GGML_SPACEMIT_MOE_STORE1=0: copy, then scale
+// in place as before)
+static bool moe_store1_enabled() {
+    static const bool v = fuse_env_enabled("GGML_SPACEMIT_MOE_STORE1");
+    return v;
+}
+
+// MoE: rows left after the full 8-row groups of an expert (1..7, including experts with fewer than 8 rows) run as
+// one zero-padded m8 group instead of a 4-row group plus single rows (GGML_SPACEMIT_MOE_PAD8=0 disables)
+static bool moe_pad8_enabled() {
+    static const bool v = fuse_env_enabled("GGML_SPACEMIT_MOE_PAD8");
+    return v;
+}
+
+// MoE: the up and gate MUL_MAT_ID of a layer are adjacent and read the same activations with the same expert ids;
+// the second one reuses the routing tables and 8-row groups the first one left in the work buffer
+// (GGML_SPACEMIT_MOE_REUSEQ=0 disables)
+static bool moe_reuseq_enabled() {
+    static const bool v = fuse_env_enabled("GGML_SPACEMIT_MOE_REUSEQ");
+    return v;
+}
+
+static bool fuse_conv_enabled() {
+    static const bool enabled = fuse_env_enabled("GGML_SPACEMIT_FUSE_CONV");
+    return enabled;
+}
+
+static bool fuse_moe_w_enabled() {
+    static const bool enabled = fuse_env_enabled("GGML_SPACEMIT_FUSE_MOE_W");
+    return enabled;
+}
+
+// op_params slots (int32 index); CONCAT uses [0] (dim), MUL_MAT_ID and MUL use none.
+constexpr int FUSE_P_PTR     = 8;   // MUL_MAT_ID: weights tensor pointer (2 slots)
+constexpr int FUSE_P_USES    = 11;  // scratch during graph prepare
+constexpr int FUSE_P_APPLIED = 12;  // MUL_MAT_ID: set to 1 by the kernel once it applied the weights
+constexpr int FUSE_P_REUSEQ  = 13;  // MUL_MAT_ID: 1 = reuse routing + 8-row quantization of the previous node
+constexpr int FUSE_P_AUX     = 14;  // scratch during graph prepare
+constexpr int FUSE_P_STATE   = 15;  // CONCAT: first column to write + 1 (0 = not fused); MUL_MAT_ID: 1 = fused
+
+static void fuse_set_ptr(ggml_tensor * t, const ggml_tensor * p) {
+    memcpy((char *) t->op_params + FUSE_P_PTR * sizeof(int32_t), &p, sizeof(p));
+}
+
+static const ggml_tensor * fuse_get_ptr(const ggml_tensor * t) {
+    const ggml_tensor * p;
+    memcpy(&p, (const char *) t->op_params + FUSE_P_PTR * sizeof(int32_t), sizeof(p));
+    return p;
+}
+
+static bool is_transposed_concat_f32(const ggml_tensor * t) {
+    if (t->op != GGML_OP_CONCAT || ggml_get_op_params_i32(t, 0) != 0) {
+        return false;
+    }
+    const ggml_tensor * s0 = t->src[0];
+    const ggml_tensor * s1 = t->src[1];
+    return t->type == GGML_TYPE_F32 && s0->type == GGML_TYPE_F32 && s1->type == GGML_TYPE_F32 &&
+           t->nb[0] == sizeof(float) && s0->nb[0] == sizeof(float) && s1->nb[1] == sizeof(float) &&
+           s1->nb[0] != sizeof(float) && s0->ne[1] == t->ne[1] && s1->ne[1] == t->ne[1] && s0->ne[2] == t->ne[2] &&
+           s1->ne[2] == t->ne[2] && t->ne[3] == 1 && !(t->flags & GGML_TENSOR_FLAG_OUTPUT);
+}
+
+// First column of concat c covered by view v, or -1 if v is not a plain window of whole rows' trailing
+// columns (same row/plane strides, starting in row 0).
+static int64_t concat_view_first_col(const ggml_tensor * c, const ggml_tensor * v) {
+    if (v->type != c->type || v->nb[0] != c->nb[0] || (v->ne[1] > 1 && v->nb[1] != c->nb[1]) ||
+        (v->ne[2] > 1 && v->nb[2] != c->nb[2]) || v->ne[3] != 1 || v->view_offs / c->nb[1] != 0) {
+        return -1;
+    }
+    const int64_t col = (int64_t) ((v->view_offs % c->nb[1]) / c->nb[0]);
+    if (col + v->ne[0] > c->ne[0] || v->ne[1] > c->ne[1] || v->ne[2] > c->ne[2]) {
+        return -1;
+    }
+    return col;
+}
+
+static bool rvv_op_disabled(const ggml_tensor * op);
+
+// Both halves of a fusion must run in this backend's kernels (a generic fallback would read unwritten
+// concat columns or apply the routing weights twice), so ops routed elsewhere by GGML_SPACEMIT_RVV_OFF
+// are never fused.
+static void graph_prepare_fusions(ggml_cgraph * gf) {
+    const int n = ggml_graph_n_nodes(gf);
+
+    // reset; mark candidates
+    for (int i = 0; i < n; ++i) {
+        ggml_tensor * t = ggml_graph_node(gf, i);
+        if (t->op == GGML_OP_CONCAT) {
+            const bool cand = fuse_conv_enabled() && is_transposed_concat_f32(t) && !rvv_op_disabled(t) &&
+                              t->src[0]->ne[0] == 3;
+            ggml_set_op_params_i32(t, FUSE_P_STATE, cand ? -1 : 0);  // -1: candidate, still valid
+            ggml_set_op_params_i32(t, FUSE_P_AUX, (int32_t) t->ne[0]);  // min column read through views
+            ggml_set_op_params_i32(t, FUSE_P_USES, 0);                  // ssm_conv users
+        } else if (t->op == GGML_OP_MUL_MAT_ID) {
+            ggml_set_op_params_i32(t, FUSE_P_STATE, 0);
+            ggml_set_op_params_i32(t, FUSE_P_APPLIED, 0);
+            ggml_set_op_params_i32(t, FUSE_P_USES, 0);
+            ggml_set_op_params_i32(t, FUSE_P_REUSEQ, 0);
+        }
+    }
+
+    // adjacent MUL_MAT_IDs with the same activations, expert ids and expert matrix shape/type (ffn_up -> ffn_gate):
+    // nothing runs between them, so the work buffer still holds the first one's routing and quantized groups
+    if (moe_reuseq_enabled()) {
+        for (int i = 0; i + 1 < n; ++i) {
+            const ggml_tensor * a = ggml_graph_node(gf, i);
+            ggml_tensor *       b = ggml_graph_node(gf, i + 1);
+            if (a->op != GGML_OP_MUL_MAT_ID || b->op != GGML_OP_MUL_MAT_ID || a->src[1] != b->src[1] ||
+                a->src[2] != b->src[2] || a->src[0]->type != GGML_TYPE_Q4_0 || b->src[0]->type != GGML_TYPE_Q4_0 ||
+                !ggml_are_same_shape(a->src[0], b->src[0]) || a->src[0]->extra == nullptr || b->src[0]->extra == nullptr ||
+                (b->flags & GGML_TENSOR_FLAG_COMPUTE) == 0 || (a->flags & GGML_TENSOR_FLAG_COMPUTE) == 0) {
+                continue;
+            }
+            ggml_set_op_params_i32(b, FUSE_P_REUSEQ, 1);
+        }
+    }
+
+    auto concat_view_use = [](ggml_tensor * c, const ggml_tensor * v) {
+        const int64_t col = concat_view_first_col(c, v);
+        if (col < 0) {
+            ggml_set_op_params_i32(c, FUSE_P_STATE, 0);
+        } else if (col < ggml_get_op_params_i32(c, FUSE_P_AUX)) {
+            ggml_set_op_params_i32(c, FUSE_P_AUX, (int32_t) col);
+        }
+    };
+
+    // scan all uses
+    for (int i = 0; i < n; ++i) {
+        ggml_tensor * t = ggml_graph_node(gf, i);
+        if (t->view_src && t->view_src->op == GGML_OP_CONCAT && ggml_get_op_params_i32(t->view_src, FUSE_P_STATE)) {
+            concat_view_use(t->view_src, t);
+        }
+        for (int j = 0; j < GGML_MAX_SRC; ++j) {
+            ggml_tensor * s = t->src[j];
+            if (s == nullptr) {
+                continue;
+            }
+            if (s->op == GGML_OP_CONCAT && ggml_get_op_params_i32(s, FUSE_P_STATE)) {
+                if (t->view_src == s) {
+                    // the view node itself, handled above
+                } else if (t->op == GGML_OP_SSM_CONV && j == 0 && t->src[1]->ne[0] == 4 && !rvv_op_disabled(t) &&
+                           t->src[2] == s->src[1] && t->src[3] == s->src[0]) {
+                    // the graph keeps the concat inputs alive until this node (build_ssm_conv)
+                    ggml_set_op_params_i32(s, FUSE_P_USES, ggml_get_op_params_i32(s, FUSE_P_USES) + 1);
+                } else {
+                    ggml_set_op_params_i32(s, FUSE_P_STATE, 0);
+                }
+            } else if (s->view_src && s->view_src->op == GGML_OP_CONCAT &&
+                       ggml_get_op_params_i32(s->view_src, FUSE_P_STATE)) {
+                concat_view_use(s->view_src, s);
+            }
+            const ggml_tensor * m = s->view_src ? s->view_src : s;
+            if (m->op == GGML_OP_MUL_MAT_ID) {
+                ggml_tensor * mm = const_cast<ggml_tensor *>(m);
+                ggml_set_op_params_i32(mm, FUSE_P_USES, ggml_get_op_params_i32(mm, FUSE_P_USES) + 1);
+            }
+        }
+    }
+
+    std::unordered_map<const ggml_tensor *, int> node_idx;
+    if (fuse_moe_w_enabled()) {
+        node_idx.reserve(n);
+        for (int i = 0; i < n; ++i) {
+            node_idx[ggml_graph_node(gf, i)] = i;
+        }
+    }
+    auto computed_before = [&](const ggml_tensor * a, const ggml_tensor * b) {
+        const ggml_tensor * ab = a->view_src ? a->view_src : a;
+        const auto          ia = node_idx.find(a);
+        const auto          iab = node_idx.find(ab);
+        const auto          ib = node_idx.find(b);
+        if (ib == node_idx.end()) {
+            return false;
+        }
+        // a leaf (not a node) is always available; otherwise a and its base must come first
+        return (ia == node_idx.end() || ia->second < ib->second) && (iab == node_idx.end() || iab->second < ib->second);
+    };
+
+    for (int i = 0; i < n; ++i) {
+        ggml_tensor * t = ggml_graph_node(gf, i);
+        if (t->op == GGML_OP_CONCAT) {
+            const bool ok = ggml_get_op_params_i32(t, FUSE_P_STATE) == -1 && ggml_get_op_params_i32(t, FUSE_P_USES) > 0;
+            ggml_set_op_params_i32(t, FUSE_P_STATE, ok ? ggml_get_op_params_i32(t, FUSE_P_AUX) + 1 : 0);
+        } else if (t->op == GGML_OP_MUL && fuse_moe_w_enabled() && !rvv_op_disabled(t)) {
+            ggml_tensor *       m = t->src[0];
+            const ggml_tensor * w = t->src[1];
+            if (m->op == GGML_OP_MUL_MAT_ID && m->view_src == nullptr && ggml_get_op_params_i32(m, FUSE_P_USES) == 1 &&
+                !(m->flags & GGML_TENSOR_FLAG_OUTPUT) && m->type == GGML_TYPE_F32 && t->type == GGML_TYPE_F32 &&
+                w->type == GGML_TYPE_F32 && w->ne[0] == 1 && w->ne[1] == m->ne[1] && w->ne[2] == m->ne[2] &&
+                m->ne[3] == 1 && w->ne[3] == 1 && ggml_are_same_shape(t, m) && ggml_is_contiguous(m) &&
+                ggml_is_contiguous(t) && computed_before(w, m)) {
+                ggml_set_op_params_i32(m, FUSE_P_STATE, 1);
+                fuse_set_ptr(m, w);
+            }
+        }
+    }
+}
+
+// MUL_MAT_ID side of the moe_w fusion: routing weight for output row (i1 = slot, i2 = token), or nullptr
+// when the op is not fused.
+static const ggml_tensor * mmid_fused_weights(ggml_tensor * op) {
+    if (ggml_get_op_params_i32(op, FUSE_P_STATE) != 1) {
+        return nullptr;
+    }
+    ggml_set_op_params_i32(op, FUSE_P_APPLIED, 1);
+    return fuse_get_ptr(op);
+}
+
+static inline void mmid_scale_row(float * y, int64_t n, const ggml_tensor * w, int64_t i1, int64_t i2) {
+    if (w == nullptr) {
+        return;
+    }
+    const float s = *(const float *) ((const char *) w->data + i1 * w->nb[1] + i2 * w->nb[2]);
+    for (int64_t i = 0; i < n;) {
+        const size_t vl = __riscv_vsetvl_e32m8(n - i);
+        __riscv_vse32_v_f32m8(y + i, __riscv_vfmul_vf_f32m8(__riscv_vle32_v_f32m8(y + i, vl), s, vl), vl);
+        i += vl;
+    }
+}
+
+// y = src * routing weight (or a plain copy without fused weights), one pass
+static inline void mmid_store_row(float * y, const float * src, int64_t n, const ggml_tensor * w, int64_t i1, int64_t i2) {
+    if (w == nullptr) {
+        memcpy(y, src, n * sizeof(float));
+        return;
+    }
+    if (!moe_store1_enabled()) {
+        memcpy(y, src, n * sizeof(float));
+        mmid_scale_row(y, n, w, i1, i2);
+        return;
+    }
+    const float s = *(const float *) ((const char *) w->data + i1 * w->nb[1] + i2 * w->nb[2]);
+    for (int64_t i = 0; i < n;) {
+        const size_t vl = __riscv_vsetvl_e32m8(n - i);
+        __riscv_vse32_v_f32m8(y + i, __riscv_vfmul_vf_f32m8(__riscv_vle32_v_f32m8(src + i, vl), s, vl), vl);
+        i += vl;
+    }
+}
+
+// MUL side: true if src0 already carries the weights (dst then only needs src0's values).
+static bool mul_is_fused_moe_w(const ggml_tensor * op) {
+    const ggml_tensor * m = op->src[0];
+    return m->op == GGML_OP_MUL_MAT_ID && ggml_get_op_params_i32(m, FUSE_P_STATE) == 1 &&
+           ggml_get_op_params_i32(m, FUSE_P_APPLIED) == 1 && fuse_get_ptr(m) == op->src[1];
+}
+
+// Debug: GGML_SPACEMIT_RVV_OFF=ADD,MUL,... (ggml_op_name) or ALL routes those ops to the generic CPU path.
+static bool rvv_op_disabled(const ggml_tensor * op) {
+    static const std::vector<bool> off = [] {
+        std::vector<bool> v(GGML_OP_COUNT, false);
+        const char * e = getenv("GGML_SPACEMIT_RVV_OFF");
+        if (!e) {
+            return v;
+        }
+        const std::string s = std::string(",") + e + ",";
+        for (int i = 0; i < GGML_OP_COUNT; i++) {
+            const std::string name = ggml_op_name((ggml_op) i);
+            v[i] = s.find(",ALL,") != std::string::npos || s.find("," + name + ",") != std::string::npos;
+        }
+        return v;
+    }();
+    return off[op->op];
+}
+
+// extra MUL_MAT_ID workspace for the 4-row path: grouped q8 rows, per-expert offsets, group list, per-thread scratch
+static size_t mmid_m4_work_size(int n_threads, const ggml_tensor * op, size_t nbw1) {
+    const int64_t n_rows = op->src[2]->ne[0] * op->src[2]->ne[1];  // n_expert_used * n_tokens
+    const int64_t n_as   = op->src[0]->ne[2];
+    size_t        size   = 64;
+    // per-expert alignment and up to 8 padding rows per expert (zero-padded m8 groups)
+    size += GGML_PAD(n_rows * nbw1, 64) + n_as * (spacemit_kernels::q8_hp_al_align + 8 * nbw1);
+    size += GGML_PAD(n_as * sizeof(int64_t), 64);
+    size += GGML_PAD((n_rows / 4 + 1 + n_as) * 3 * sizeof(int32_t) + sizeof(int64_t), 64);
+    size += (size_t) n_threads * GGML_PAD((8 * op->src[1]->ne[0] + 8 * op->src[0]->ne[1]) * sizeof(float), 64);
+    return size;
+}
+
+static constexpr int     mmid_stats_max_threads = 64;
+static mmid_phase_stats  g_mmid_stats[2][mmid_stats_max_threads];
+static mmid_route_stats  g_mmid_route[2];
+static std::once_flag    g_mmid_stats_once;
+static dense_phase_stats g_dense_stats[3][mmid_stats_max_threads];
+static std::once_flag    g_dense_stats_once;
+
+static void dense_stats_dump() {
+    const char * kinds[3] = { "q4_0", "q8_0", "other" };
+    for (int k = 0; k < 3; k++) {
+        dense_phase_stats sum = {};
+        int               nth = 0;
+        for (int i = 0; i < mmid_stats_max_threads; i++) {
+            const dense_phase_stats & t = g_dense_stats[k][i];
+            if (t.calls == 0) {
+                continue;
+            }
+            nth++;
+            sum.calls += t.calls;
+            sum.t_total += t.t_total;
+            sum.t_quant += t.t_quant;
+            sum.t_sync += t.t_sync;
+            sum.t_acopy += t.t_acopy;
+            sum.t_bcopy += t.t_bcopy;
+            sum.t_barrier += t.t_barrier;
+            sum.t_gemm += t.t_gemm;
+            for (int b = 0; b < 3; b++) {
+                sum.branch[b] += t.branch[b];
+            }
+            sum.flops += t.flops;
+            sum.b_bytes += t.b_bytes;
+        }
+        if (nth == 0 || sum.t_total == 0) {
+            continue;
+        }
+        auto phase = [&](const char * name, int64_t ns) {
+            fprintf(stderr, "  %-34s %10.1f ms/thread %6.2f%%\n", name, ns / 1e6 / nth, 100.0 * ns / sum.t_total);
+        };
+        fprintf(stderr, "\n== spacemit dense MUL_MAT sub-phases (%s, multi-row): calls=%lld threads=%d ==\n", kinds[k],
+                (long long) (sum.calls / nth), nth);
+        fprintf(stderr, "  %-34s %10.1f ms/thread\n", "total", sum.t_total / 1e6 / nth);
+        phase("quantize A", sum.t_quant);
+        phase("grid sync after quantize", sum.t_sync);
+        phase("A copy to TCM", sum.t_acopy);
+        phase("B copy to TCM", sum.t_bcopy);
+        phase("pair barrier", sum.t_barrier);
+        phase("gemm kernels", sum.t_gemm);
+        phase("other", sum.t_total - sum.t_quant - sum.t_sync - sum.t_acopy - sum.t_bcopy - sum.t_barrier - sum.t_gemm);
+        const double gemm_s = sum.t_gemm / 1e9 / nth;
+        const double tot_s  = sum.t_total / 1e9 / nth;
+        fprintf(stderr, "  gemm throughput: %.1f GOP/s over %d threads (whole op %.1f GOP/s)\n",
+                gemm_s > 0 ? sum.flops / 1e9 / gemm_s : 0.0, nth, tot_s > 0 ? sum.flops / 1e9 / tot_s : 0.0);
+        fprintf(stderr, "  weight bytes read by kernels: %.1f GB/s during gemm (%.2f GB total)\n",
+                gemm_s > 0 ? sum.b_bytes / 1e9 / gemm_s : 0.0, sum.b_bytes / 1e9);
+        fprintf(stderr, "  branch calls (per thread): A-in-TCM %lld, B-in-TCM %lld, generic %lld\n",
+                (long long) (sum.branch[0] / nth), (long long) (sum.branch[1] / nth), (long long) (sum.branch[2] / nth));
+    }
+}
+
+static void mmid_stats_dump() {
+    const char * kinds[2] = { "1 token", "multi-token" };
+    for (int k = 0; k < 2; k++) {
+        const mmid_route_stats & r = g_mmid_route[k];
+        if (r.calls == 0) {
+            continue;
+        }
+        mmid_phase_stats sum = {};
+        int              nth = 0;
+        for (int i = 0; i < mmid_stats_max_threads; i++) {
+            const mmid_phase_stats & t = g_mmid_stats[k][i];
+            if (t.calls == 0) {
+                continue;
+            }
+            nth++;
+            sum.t_total += t.t_total;
+            sum.t_quant += t.t_quant;
+            sum.t_route += t.t_route;
+            sum.t_sync += t.t_sync;
+            sum.t_wcopy += t.t_wcopy;
+            sum.t_agather += t.t_agather;
+            sum.t_kernel += t.t_kernel;
+            sum.rows_m4 += t.rows_m4;
+            sum.t_quant4 += t.t_quant4;
+            sum.rows_m2 += t.rows_m2;
+            sum.rows_m1 += t.rows_m1;
+            sum.w_tcm_hit += t.w_tcm_hit;
+            sum.w_tcm_miss += t.w_tcm_miss;
+            sum.fast_path += t.fast_path;
+            sum.kernel_flops += t.kernel_flops;
+            sum.t_k8 += t.t_k8;
+            sum.t_k4 += t.t_k4;
+            sum.t_scatter += t.t_scatter;
+            sum.t_q4wait += t.t_q4wait;
+            sum.t_scatter_wide += t.t_scatter_wide;
+            sum.rows_m8 += t.rows_m8;
+            sum.flops_m8 += t.flops_m8;
+            sum.flops_m4 += t.flops_m4;
+        }
+        if (nth == 0) {
+            continue;
+        }
+        const double tot   = sum.t_total / 1e6 / nth;
+        auto         phase = [&](const char * name, int64_t ns) {
+            fprintf(stderr, "  %-34s %10.1f ms/thread %6.2f%%\n", name, ns / 1e6 / nth, 100.0 * ns / sum.t_total);
+        };
+        fprintf(stderr, "\n== spacemit MUL_MAT_ID sub-phases (%s graphs): calls=%lld threads=%d tcm_size=%lld B ==\n",
+                kinds[k], (long long) r.calls, nth, (long long) r.tcm_size);
+        fprintf(stderr, "  %-34s %10.1f ms/thread\n", "total", tot);
+        phase("quantize activations", sum.t_quant);
+        phase("routing (thread 0 only)", sum.t_route);
+        phase("grid sync after routing", sum.t_sync);
+        phase("8/4-row quantize", sum.t_quant4);
+        phase("grid sync after 8/4-row quantize", sum.t_q4wait);
+        phase("weight copy to TCM", sum.t_wcopy);
+        phase("activation gather to TCM", sum.t_agather);
+        phase("gemm m8", sum.t_k8);
+        phase("gemm m4", sum.t_k4);
+        phase("m8/m4 output scatter + scale", sum.t_scatter);
+        phase("  of which ne01 > 1024 (down)", sum.t_scatter_wide);
+        phase("gemm m2/m1 + bookkeeping", sum.t_kernel);
+        phase("other", sum.t_total - sum.t_quant - sum.t_route - sum.t_sync - sum.t_quant4 - sum.t_q4wait -
+                           sum.t_wcopy - sum.t_agather - sum.t_kernel - sum.t_k8 - sum.t_k4 - sum.t_scatter);
+        auto tput = [&](const char * name, double flops, int64_t ns) {
+            const double s = ns / 1e9 / nth;
+            fprintf(stderr, "  %-34s %10.1f GOP/s over %d threads\n", name, s > 0 ? flops / 1e9 / s : 0.0, nth);
+        };
+        tput("m8 kernel throughput", sum.flops_m8, sum.t_k8);
+        tput("m4 kernel throughput", sum.flops_m4, sum.t_k4);
+        tput("m2/m1 kernel throughput", sum.kernel_flops - sum.flops_m8 - sum.flops_m4, sum.t_kernel);
+        fprintf(stderr, "  rows via m8 kernel: %lld\n", (long long) sum.rows_m8);
+        const double kernel_s = (sum.t_kernel + sum.t_k8 + sum.t_k4 + sum.t_scatter) / 1e9 / nth;
+        fprintf(stderr, "  kernel throughput: %.1f GOP/s over %d threads (%.2f GOP/s/thread)\n",
+                kernel_s > 0 ? sum.kernel_flops / 1e9 / kernel_s : 0.0, nth,
+                kernel_s > 0 ? sum.kernel_flops / 1e9 / kernel_s / nth : 0.0);
+        fprintf(stderr, "  rows via m4 kernel (incl. m8): %lld, m2 kernel: %lld, m1 kernel: %lld (summed over threads)\n",
+                (long long) sum.rows_m4, (long long) sum.rows_m2, (long long) sum.rows_m1);
+        fprintf(stderr, "  expert weight slice in TCM: %lld, not in TCM: %lld, fast-path calls: %lld\n",
+                (long long) sum.w_tcm_hit, (long long) sum.w_tcm_miss, (long long) sum.fast_path);
+        fprintf(stderr, "  active experts/call: %.1f, rows/active expert: %.2f\n",
+                (double) r.active_experts / r.calls, r.active_experts ? (double) r.rows / r.active_experts : 0.0);
+        const char * labels[9] = { "1", "2-3", "4-7", "8-15", "16-31", "32-63", "64-127", "128-255", ">=256" };
+        fprintf(stderr, "  rows/expert histogram:");
+        for (int b = 0; b < 9; b++) {
+            fprintf(stderr, " %s:%.1f%%", labels[b], r.active_experts ? 100.0 * r.hist[b] / r.active_experts : 0.0);
+        }
+        fprintf(stderr, "\n");
+    }
+}
+
+template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS> class tensor_traits : public ggml::spacemit::tensor_traits_base {
+    // Q4_0 hp: aligned 4-row A layout + signed int4 B (GGML_SPACEMIT_HP_ALIGNED, default on). The weights are
+    // repacked accordingly at load time, so this must be decided once per process.
+    static bool hp_aligned() {
+        if constexpr (std::is_same_v<BLOC_TYPE, block_q4_0> && INTER_SIZE == 256) {
+            return spacemit_kernels::hp_aligned_enabled();
+        } else {
+            return false;
+        }
+    }
+
+    // Q8_0 pre-arranged path (GGML_SPACEMIT_Q8_PRE, default on): B in the vmadot i8 layout, 4-row A groups in the
+    // aligned 192B layout (48B per row and K32 block; single rows keep 38B blocks, contiguous, in the same slots)
+    static bool q8_pre() {
+        if constexpr (std::is_same_v<BLOC_TYPE, block_q8_0>) {
+            return spacemit_kernels::q8_prearranged_enabled();
+        } else {
+            return false;
+        }
+    }
+
+    // the A workspace base is aligned to q8_hp_al_align
+    static bool a_aligned() { return hp_aligned() || q8_pre(); }
+
+    bool work_size(int n_threads, const ggml_tensor * op, size_t & size) const override {
         switch (op->op) {
             case GGML_OP_MUL_MAT:
                 {
@@ -117,15 +665,21 @@ class tensor_traits : public ggml::spacemit::tensor_traits_base {
                             spacemit_kernels::div_round_up(src1_nelements, QK_K) * spacemit_kernels::q8k_blk_size(QK_K);
                     } else if constexpr (INTER_SIZE == QK4_0) {
                         size = spacemit_kernels::div_round_up(src1_nelements, QK4_0) *
-                               spacemit_kernels::q8_blk_size(QK4_0, true);
+                               (q8_pre() ? spacemit_kernels::q8_m4al_row_blk_size :
+                                           spacemit_kernels::q8_blk_size(QK4_0, true));
                     } else if constexpr (INTER_SIZE == 256) {
                         size = spacemit_kernels::div_round_up(src1_nelements, 256) *
-                               spacemit_kernels::q8_hp_blk_size(256, true, true);
+                               (hp_aligned() ? spacemit_kernels::q8_hp_al_row_blk_size :
+                                               spacemit_kernels::q8_hp_blk_size(256, true, true));
                     } else {
                         GGML_ABORT("unsupported block type");
                     }
 
                     size = GGML_PAD(size, sizeof(int64_t));
+                    if (a_aligned()) {
+                        // room to align the workspace base and pad the A buffer (B may follow it in TCM)
+                        size = GGML_PAD(size, spacemit_kernels::q8_hp_al_align) + spacemit_kernels::q8_hp_al_align;
+                    }
 
                     return true;
                 }
@@ -156,6 +710,17 @@ class tensor_traits : public ggml::spacemit::tensor_traits_base {
 
                     size = GGML_PAD(size, sizeof(int64_t));
 
+                    if constexpr (INTER_SIZE == 256 && !std::is_same_v<BLOC_TYPE, block_q2_K> &&
+                                  !std::is_same_v<BLOC_TYPE, block_q3_K>) {
+                        const size_t nbw1 = spacemit_kernels::div_round_up(op->src[1]->ne[0], 256) *
+                                            (hp_aligned() ? spacemit_kernels::q8_hp_al_row_blk_size :
+                                                            spacemit_kernels::q8_hp_blk_size(256, true, true));
+                        size += mmid_m4_work_size(n_threads, op, nbw1);
+                        if (hp_aligned()) {
+                            size += spacemit_kernels::q8_hp_al_align;  // 128B alignment of the 4-row groups
+                        }
+                    }
+
                     return true;
                 }
             default:
@@ -180,7 +745,15 @@ class tensor_traits : public ggml::spacemit::tensor_traits_base {
                     case GGML_TYPE_Q5_1:
                     case GGML_TYPE_Q5_K:
                         //case GGML_TYPE_MXFP4:
-                        return forward_mul_mat(ctx, op);
+                        forward_mul_mat(ctx, op);
+                        return true;
+                    case GGML_TYPE_F32:
+                        // F32 (router) weights converted to Q8_0 at load (tensor_traits_f32_as_q8_0)
+                        if constexpr (std::is_same_v<BLOC_TYPE, block_q8_0>) {
+                            forward_mul_mat(ctx, op);
+                            return true;
+                        }
+                        return false;
                     default:
                         // GGML_ABORT("fatal error: unsupported type for src0 in MUL_MAT");
                         return false;
@@ -199,7 +772,8 @@ class tensor_traits : public ggml::spacemit::tensor_traits_base {
                     case GGML_TYPE_Q5_1:
                     case GGML_TYPE_Q5_K:
                         //case GGML_TYPE_MXFP4:
-                        return forward_mul_mat_id(ctx, op);
+                        forward_mul_mat_id(ctx, op);
+                        return true;
                     default:
                         // GGML_ABORT("fatal error: unsupported type for src0 in MUL_MAT_ID");
                         return false;
@@ -212,7 +786,7 @@ class tensor_traits : public ggml::spacemit::tensor_traits_base {
         return false;
     }
 
-    bool forward_mul_mat(ggml::spacemit::context & ctx, ggml_tensor * op) const {
+    void forward_mul_mat(ggml::spacemit::context & ctx, ggml_tensor * op) const {
         constexpr size_t a_blk_len = INTER_SIZE;
         constexpr size_t b_blk_len = INTER_SIZE;
 
@@ -239,6 +813,7 @@ class tensor_traits : public ggml::spacemit::tensor_traits_base {
         spacemit_kernels::quantize_a_row_def       quantize_a_4row_i8;
         spacemit_kernels::gemm_kernel_quantize_def gemm_kernel;
         bool                                       set_kernel_impl = false;
+        bool                                       use_m8          = false;  // 8-row A groups (Q4_0 hp)
 
         int64_t block_stride_a = spacemit_kernels::q8_blk_size(a_blk_len);
 
@@ -251,6 +826,14 @@ class tensor_traits : public ggml::spacemit::tensor_traits_base {
             if constexpr (std::is_same_v<BLOC_TYPE, block_q6_K> || std::is_same_v<BLOC_TYPE, block_q8_0>) {
                 gemm_kernel     = spacemit_kernels::ime2::gemm_kernel_i8i8;
                 set_kernel_impl = true;
+                if constexpr (std::is_same_v<BLOC_TYPE, block_q8_0>) {
+                    if (spacemit_kernels::q8_prearranged_enabled()) {
+                        // B pre-arranged at repack; 4-row A groups in 192B K32 blocks (data 64B aligned)
+                        gemm_kernel        = spacemit_kernels::ime2::gemm_kernel_i8i8_pre_al;
+                        quantize_a_4row_i8 = spacemit_kernels::rvv::quantize_a_4row_i8_al;
+                        block_stride_a     = spacemit_kernels::q8_m4al_row_blk_size;
+                    }
+                }
             } else if constexpr (std::is_same_v<BLOC_TYPE, block_q4_0> || std::is_same_v<BLOC_TYPE, block_q4_1> ||
                                  std::is_same_v<BLOC_TYPE, block_q4_K>) {
                 if constexpr (INTER_SIZE == 256) {
@@ -258,6 +841,19 @@ class tensor_traits : public ggml::spacemit::tensor_traits_base {
                     quantize_a_row_i8  = spacemit_kernels::rvv::quantize_a_row_i8_hp;
                     quantize_a_4row_i8 = spacemit_kernels::rvv::quantize_a_4row_i8_hp;
                     block_stride_a     = spacemit_kernels::q8_hp_blk_size(a_blk_len, true, true);
+                    if (hp_aligned()) {
+                        // 4-row groups take 4 * 304B per K256; single rows keep the 290B layout in a 304B slot
+                        gemm_kernel        = spacemit_kernels::ime2::gemm_kernel_i8i4_hp_al;
+                        quantize_a_4row_i8 = spacemit_kernels::rvv::quantize_a_4row_i8_hp_al;
+                        block_stride_a     = spacemit_kernels::q8_hp_al_row_blk_size;
+                        if constexpr (std::is_same_v<BLOC_TYPE, block_q4_0>) {
+                            // 8-row groups (2176B per K256) fit in 8 row slots (8 * 304B), 128B aligned
+                            if (spacemit_kernels::hp_m8_enabled()) {
+                                gemm_kernel = spacemit_kernels::ime2::gemm_kernel_i8i4_hp_m8_al;
+                                use_m8      = true;
+                            }
+                        }
+                    }
                     set_kernel_impl    = true;
                 } else {
                     gemm_kernel        = spacemit_kernels::ime2::gemm_kernel_i8i4;
@@ -311,20 +907,30 @@ class tensor_traits : public ggml::spacemit::tensor_traits_base {
         const int64_t b_k_blks = spacemit_kernels::div_round_up(gemm_k, b_blk_len);
 
         const int64_t row_stride_a        = a_k_blks * block_stride_a;
-        const int64_t gemm_workspace_size = GGML_PAD(gemm_m * row_stride_a, alignof(int64_t));
+        const int64_t ws_align            = a_aligned() ? spacemit_kernels::q8_hp_al_align : alignof(int64_t);
+        const int64_t gemm_workspace_size = GGML_PAD(gemm_m * row_stride_a, ws_align);
 
-        if (ith == 0 && ctx.workspace_size < gemm_workspace_size) {
+        if (ith == 0 && ctx.workspace_size < gemm_workspace_size + (a_aligned() ? ws_align : 0)) {
             GGML_ABORT("wsize less than gemm_workspace_size");
         }
 
         uintptr_t ws_ptr = reinterpret_cast<uintptr_t>(ctx.workspace);
+        if (a_aligned()) {
+            ws_ptr = (ws_ptr + ws_align - 1) & ~(uintptr_t) (ws_align - 1);
+        }
 
+        const int64_t tcm_buffer_size = (int64_t) ctx.shared.size;
         void *        tcm_buffer      = ctx.shared.data;
-        const int64_t tcm_buffer_size = ctx.shared.size;
 
         auto * quant_a_buffer = reinterpret_cast<uint8_t *>(ws_ptr);
 
-        constexpr int64_t row_align = 4;
+        const int64_t row_align = use_m8 ? 8 : 4;
+        // GGML_SPACEMIT_DENSE_MBLK=R (default 8, 1 = old behaviour): each thread runs R consecutive row groups
+        // per pass over B, so a B tile is read once per R groups instead of once per group
+        static const int64_t dense_mblk = [] {
+            const char * e = getenv("GGML_SPACEMIT_DENSE_MBLK");
+            return e ? std::max<int64_t>(1, atoll(e)) : (int64_t) 8;
+        }();
         const int64_t     row_blks  = spacemit_kernels::div_round_up(gemm_m, row_align);
 
         const int64_t row_stride_b      = b_k_blks * get_repacked_block_type_size<BLOC_TYPE, INTER_SIZE, NB_COLS>();
@@ -333,17 +939,52 @@ class tensor_traits : public ggml::spacemit::tensor_traits_base {
 
         const int64_t barrier_idx = static_cast<int64_t>(ith / 2);
 
+        const bool          dstats = gemm_m > 1 && ggml_op_stats_enabled() && ith < mmid_stats_max_threads;
+        dense_phase_stats * ds     = dstats ? &g_dense_stats[std::is_same_v<BLOC_TYPE, block_q4_0>   ? 0 :
+                                                             std::is_same_v<BLOC_TYPE, block_q8_0> ? 1 :
+                                                                                                     2][ith] :
+                                              nullptr;
+        const int64_t       ds_t0  = dstats ? ggml_op_stats_now_ns() : 0;
+        int64_t             ds_t   = ds_t0;
+        int64_t             ds_dummy = 0;
+        auto                ds_lap = [&](int64_t & acc) {
+            if (dstats) {
+                const int64_t now = ggml_op_stats_now_ns();
+                acc += now - ds_t;
+                ds_t = now;
+            }
+        };
+        struct ds_finish_t {
+            std::function<void()> f;
+            ~ds_finish_t() { f(); }
+        } ds_finish{ [&] {
+            if (dstats) {
+                ds_lap(ds->t_gemm);
+                ds->t_total += ds_t - ds_t0;
+                ds->calls++;
+            }
+        } };
+        if (dstats) {
+            std::call_once(g_dense_stats_once, [] { atexit(dense_stats_dump); });
+        }
+
         GGML_ASSERT(global_spine_env_info.init_barrier != nullptr);
-        GGML_ASSERT(barrier_idx < spine_init_barrier_count);
+        GGML_ASSERT(barrier_idx < static_cast<int64_t>(spine_init_barrier_count));
         spine_barrier_t * cur_barrier = &global_spine_env_info.init_barrier[barrier_idx];
 
         if (gemm_m == 1) {
+            // the 1-row kernels walk K blocks contiguously, so split at the 1-row block size (block_stride_a is
+            // the padded per-row slot size in the aligned hp and Q8_0 pre layouts)
+            const int64_t blk_stride_1row =
+                hp_aligned() ? (int64_t) spacemit_kernels::q8_hp_blk_size(a_blk_len, true, true) :
+                q8_pre()     ? (int64_t) spacemit_kernels::q8_blk_size(a_blk_len, true) :
+                               block_stride_a;
             int task_per_thread = spacemit_kernels::div_round_up(a_k_blks, nth);
             int a_blk_start     = ith * task_per_thread;
             int a_blk_end       = std::min(a_blk_start + task_per_thread, (int) a_k_blks);
             if (a_blk_start < a_blk_end) {
                 quantize_a_row_i8(a_blk_len, feature + a_blk_start * a_blk_len, (a_blk_end - a_blk_start) * a_blk_len,
-                                  quant_a_buffer + a_blk_start * block_stride_a);
+                                  quant_a_buffer + a_blk_start * blk_stride_1row);
             }
         } else {
             int task_per_thread = spacemit_kernels::div_round_up(row_blks, nth);
@@ -353,11 +994,21 @@ class tensor_traits : public ggml::spacemit::tensor_traits_base {
                 int m_idx             = m_row_blk * row_align;
                 int rows_tobe_handled = (gemm_m - m_idx) > row_align ? row_align : (gemm_m - m_idx);
 
-                if (rows_tobe_handled == row_align && quantize_a_4row_i8 != nullptr) {
+                if (use_m8 && rows_tobe_handled == 8) {
+                    spacemit_kernels::rvv::quantize_a_8row_i8_hp_m8(a_blk_len, feature + m_idx * gemm_k, gemm_k,
+                                                                    quant_a_buffer + m_idx * row_stride_a);
+                } else if (rows_tobe_handled == row_align && quantize_a_4row_i8 != nullptr) {
                     const float * a_row_ptr       = feature + m_idx * gemm_k;
                     auto *        quant_a_row_ptr = quant_a_buffer + m_idx * row_stride_a;
                     quantize_a_4row_i8(a_blk_len, a_row_ptr, gemm_k, quant_a_row_ptr);
                 } else {
+                    // tail: one 4-row group if possible (gemm_kernel_i8i4_hp_m8_al falls back the same way)
+                    if (use_m8 && rows_tobe_handled >= 4) {
+                        quantize_a_4row_i8(a_blk_len, feature + m_idx * gemm_k, gemm_k,
+                                           quant_a_buffer + m_idx * row_stride_a);
+                        rows_tobe_handled -= 4;
+                        m_idx += 4;
+                    }
                     while (rows_tobe_handled) {
                         const float * a_row_ptr       = feature + m_idx * gemm_k;
                         auto *        quant_a_row_ptr = quant_a_buffer + m_idx * row_stride_a;
@@ -369,7 +1020,9 @@ class tensor_traits : public ggml::spacemit::tensor_traits_base {
             }
         }
 
+        ds_lap(dstats ? ds->t_quant : ds_dummy);
         ctx.sync();
+        ds_lap(dstats ? ds->t_sync : ds_dummy);
 
         const int64_t gemm_m_stride     = gemm_n / gemm_m > 64 ? gemm_m : 16;
         const int64_t gemm_m_blocked    = spacemit_kernels::div_round_up(gemm_m, gemm_m_stride);
@@ -382,14 +1035,33 @@ class tensor_traits : public ggml::spacemit::tensor_traits_base {
         }
 
         if (gemm_n_stride == gemm_n && tcm_buffer != nullptr && per_mb_rows_wsize <= tcm_buffer_size) {
-            for (int64_t m_start = ith * row_align; m_start < gemm_m; m_start += row_align * nth) {
+            if (dstats) {
+                ds->branch[0]++;
+            }
+            int64_t m_blk = row_align;
+            if (dense_mblk > 1 && gemm_m > row_align) {
+                // largest R' <= R that still gives every thread a block and fits TCM
+                for (int64_t r = dense_mblk; r >= 1; r--) {
+                    if (r * row_align * row_stride_a <= tcm_buffer_size &&
+                        spacemit_kernels::div_round_up(gemm_m, r * row_align) >= nth) {
+                        m_blk = r * row_align;
+                        break;
+                    }
+                }
+            }
+            for (int64_t m_start = ith * m_blk; m_start < gemm_m; m_start += m_blk * nth) {
                 uint8_t * b_col    = reinterpret_cast<uint8_t *>(w_data);
                 uint8_t * b_col_zp = block_type_has_zp<BLOC_TYPE>() ? b_col : nullptr;
 
-                int64_t m_row_real = std::min(gemm_m - m_start, row_align);
+                int64_t m_row_real = std::min(gemm_m - m_start, m_blk);
 
                 spacemit_kernels::rvv::memcpy1d(tcm_buffer, quant_a_buffer + m_start * row_stride_a,
                                                 m_row_real * row_stride_a);
+                if (dstats) {
+                    ds_lap(ds->t_acopy);
+                    ds->flops += 2.0 * m_row_real * gemm_n * gemm_k;
+                    ds->b_bytes += (double) gemm_n * row_stride_b;
+                }
 
                 int64_t n_blk_real = 0;
                 for (int64_t ni = 0; ni < gemm_n; ni += n_blk_real, b_col += n_blk_real * row_stride_b) {
@@ -410,8 +1082,12 @@ class tensor_traits : public ggml::spacemit::tensor_traits_base {
                         rows_remaining -= rows_handled;
                     }
                 }
+                ds_lap(dstats ? ds->t_gemm : ds_dummy);
             }
         } else if (tcm_buffer != nullptr && per_nb_cols_wsize <= tcm_buffer_size) {
+            if (dstats) {
+                ds->branch[1]++;
+            }
             uint8_t * a_row = quant_a_buffer;
             uint8_t * b_col = reinterpret_cast<uint8_t *>(tcm_buffer);
             if ((gemm_workspace_size + per_nb_cols_wsize) <= tcm_buffer_size) {
@@ -432,7 +1108,7 @@ class tensor_traits : public ggml::spacemit::tensor_traits_base {
                         uint8_t *     b_row_zp = block_type_has_zp<BLOC_TYPE>() ? b_row : nullptr;
                         gemm_kernel(b_blk_len, a_row, b_row, b_row_zp, output + ni, 1, nb_real, b_k_blks, gemm_n);
                     }
-                    return true;
+                    return;
                 }
             }
 
@@ -501,6 +1177,9 @@ class tensor_traits : public ggml::spacemit::tensor_traits_base {
                 }
             }
         } else {
+            if (dstats) {
+                ds->branch[2]++;
+            }
             const int64_t task_count_m = spacemit_kernels::div_round_up(gemm_m, gemm_m_stride);
             const int64_t task_count_n = spacemit_kernels::div_round_up(gemm_n, gemm_n_stride);
 
@@ -548,10 +1227,9 @@ class tensor_traits : public ggml::spacemit::tensor_traits_base {
                 }
             }
         }
-        return true;
     }
 
-    bool forward_mul_mat_id(ggml::spacemit::context & ctx, ggml_tensor * op) const {
+    void forward_mul_mat_id(ggml::spacemit::context & ctx, ggml_tensor * op) const {
         constexpr size_t a_blk_len = INTER_SIZE;
         constexpr size_t b_blk_len = INTER_SIZE;
 
@@ -569,6 +1247,25 @@ class tensor_traits : public ggml::spacemit::tensor_traits_base {
         const int n_ids = ids->ne[0];  // n_expert_used
         const int n_as  = ne02;        // n_expert
 
+        const ggml_tensor * fw = mmid_fused_weights(op);  // routing weights folded into the output, or nullptr
+
+        const bool         op_stats = ggml_op_stats_enabled() && ith < mmid_stats_max_threads;
+        const int          st_kind  = ids->ne[1] > 1 ? 1 : 0;
+        mmid_phase_stats * st       = op_stats ? &g_mmid_stats[st_kind][ith] : nullptr;
+        const int64_t      st_t0    = op_stats ? ggml_op_stats_now_ns() : 0;
+        int64_t            st_t     = st_t0;
+        auto               st_lap   = [&](int64_t & acc) {
+            if (op_stats) {
+                const int64_t now = ggml_op_stats_now_ns();
+                acc += now - st_t;
+                st_t = now;
+            }
+        };
+        if (op_stats) {
+            std::call_once(g_mmid_stats_once, [] { atexit(mmid_stats_dump); });
+            st->calls++;
+        }
+
         struct mmid_row_mapping {
             int32_t i1;
             int32_t i2;
@@ -576,7 +1273,8 @@ class tensor_traits : public ggml::spacemit::tensor_traits_base {
 
         spacemit_kernels::quantize_a_row_def           quantize_a_row_i8;
         spacemit_kernels::gemm_kernel_quantize_def     gemm_kernel;
-        spacemit_kernels::moe_gemm_kernel_quantize_def moe_gemm_kernel_m2;
+        spacemit_kernels::moe_gemm_kernel_quantize_def moe_gemm_kernel_m2 = nullptr;
+        spacemit_kernels::quantize_a_row_def           quantize_a_4row_i8 = nullptr;
         bool                                           set_kernel_impl = false;
         size_t                                         block_stride_a  = spacemit_kernels::q8_blk_size(QK4_0);
 
@@ -588,13 +1286,27 @@ class tensor_traits : public ggml::spacemit::tensor_traits_base {
             if constexpr (std::is_same_v<BLOC_TYPE, block_q6_K> || std::is_same_v<BLOC_TYPE, block_q8_0>) {
                 gemm_kernel     = spacemit_kernels::ime2::gemm_kernel_i8i8;
                 set_kernel_impl = true;
+                if constexpr (std::is_same_v<BLOC_TYPE, block_q8_0>) {
+                    if (spacemit_kernels::q8_prearranged_enabled()) {
+                        gemm_kernel = spacemit_kernels::ime2::gemm_kernel_i8i8_pre;  // weights pre-arranged at repack
+                    }
+                }
             } else if constexpr (std::is_same_v<BLOC_TYPE, block_q4_0> || std::is_same_v<BLOC_TYPE, block_q4_1> ||
                                  std::is_same_v<BLOC_TYPE, block_q4_K>) {
                 if constexpr (INTER_SIZE == 256) {
                     gemm_kernel       = spacemit_kernels::ime2::gemm_kernel_i8i4_hp;
                     quantize_a_row_i8 = spacemit_kernels::rvv::quantize_a_row_i8_hp;
                     block_stride_a    = spacemit_kernels::q8_hp_blk_size(a_blk_len, true, true);
-                    set_kernel_impl   = true;
+                    if (mmid_m4_enabled()) {
+                        quantize_a_4row_i8 = spacemit_kernels::rvv::quantize_a_4row_i8_hp;
+                    }
+                    if (hp_aligned()) {
+                        gemm_kernel = spacemit_kernels::ime2::gemm_kernel_i8i4_hp_al;
+                        if (mmid_m4_enabled()) {
+                            quantize_a_4row_i8 = spacemit_kernels::rvv::quantize_a_4row_i8_hp_al;
+                        }
+                    }
+                    set_kernel_impl = true;
                 } else {
                     gemm_kernel        = spacemit_kernels::ime2::gemm_kernel_i8i4;
                     moe_gemm_kernel_m2 = spacemit_kernels::ime2::moe_m2_gemm_kernel_i8i4;
@@ -651,7 +1363,19 @@ class tensor_traits : public ggml::spacemit::tensor_traits_base {
         const uintptr_t ws_ptr         = reinterpret_cast<uintptr_t>(ctx.workspace);
         auto *          quant_a_buffer = reinterpret_cast<uint8_t *>(ws_ptr);
 
-        if (ne11 == 1) {
+        // every row goes through the 8-row groups (zero-padded tail): the 1-row quantized copy is not needed
+        bool pad8_all = false;
+        if constexpr (std::is_same_v<BLOC_TYPE, block_q4_0> && INTER_SIZE == 256) {
+            pad8_all = ids->ne[1] > 1 && quantize_a_4row_i8 != nullptr && ne01 % 32 == 0 && hp_aligned() &&
+                       spacemit_kernels::hp_m8_enabled() && moe_pad8_enabled();
+        }
+
+        // routing and 8-row groups already in the work buffer (previous node, same inputs); needs pad8_all on both
+        const bool reuse_q = pad8_all && ggml_get_op_params_i32(op, FUSE_P_REUSEQ) == 1;
+
+        if (pad8_all) {
+            // nothing: rows are quantized per 8-row group below
+        } else if (ne11 == 1) {
             for (int64_t ii = ith; ii < ne12 * a_k_blks; ii += nth) {
                 int64_t i12       = ii / a_k_blks;
                 int64_t ak_blk_id = ii % a_k_blks;
@@ -669,13 +1393,64 @@ class tensor_traits : public ggml::spacemit::tensor_traits_base {
 
 #define MMID_MATRIX_ROW(row_id, i1) matrix_rows[(row_id) *ne12 + (i1)]
 
+        st_lap(op_stats ? st->t_quant : st_t);
+
         int64_t *          matrix_row_counts       = (int64_t *) (ws_ptr + gemm_workspace_size);
         int32_t *          valid_ep_count          = (int32_t *) (matrix_row_counts + n_as);
         int32_t *          valid_act_count         = (int32_t *) (valid_ep_count + 1);
         int64_t *          valid_matrix_row_counts = (int64_t *) (valid_act_count + 1);
         mmid_row_mapping * matrix_rows             = (mmid_row_mapping *) (valid_matrix_row_counts + n_as);
 
+        // 4-row path workspace (sized by mmid_m4_work_size)
+        const bool use_m4  = quantize_a_4row_i8 != nullptr && ne01 % 32 == 0;
+        // 8-row groups first, then at most one 4-row group per expert (signed-int4 Q4_0 only)
+        bool use_m8 = false;
+        if constexpr (std::is_same_v<BLOC_TYPE, block_q4_0> && INTER_SIZE == 256) {
+            use_m8 = use_m4 && hp_aligned() && spacemit_kernels::hp_m8_enabled();
+        }
+        const size_t m8_grp_bytes = a_k_blks * spacemit_kernels::q8_hp_m8_blk_size;
+        const int64_t n_rows_all = (int64_t) n_ids * ids->ne[1];
+        auto align64 = [](uintptr_t p) { return (p + 63) & ~(uintptr_t) 63; };
+        // per-row stride of the 4-row groups: 4 * nbw1_m4 bytes per group
+        const size_t nbw1_m4 = hp_aligned() ? a_k_blks * spacemit_kernels::q8_hp_al_row_blk_size : nbw1;
+        uintptr_t m4_ptr     = align64(reinterpret_cast<uintptr_t>(matrix_rows + n_as * ne12));
+        if (hp_aligned()) {
+            m4_ptr = (m4_ptr + spacemit_kernels::q8_hp_al_align - 1) & ~(uintptr_t) (spacemit_kernels::q8_hp_al_align - 1);
+        }
+        uint8_t * m4_quant         = reinterpret_cast<uint8_t *>(m4_ptr);
+        m4_ptr = align64(m4_ptr + n_rows_all * nbw1_m4 + n_as * (spacemit_kernels::q8_hp_al_align + 8 * nbw1_m4));
+        int64_t * m4_expert_offset = reinterpret_cast<int64_t *>(m4_ptr);  // byte offset of each expert's groups
+        m4_ptr                     = align64(m4_ptr + n_as * sizeof(int64_t));
+        int64_t * m4_n_groups      = reinterpret_cast<int64_t *>(m4_ptr);
+        int32_t * m4_groups        = reinterpret_cast<int32_t *>(m4_n_groups + 1);  // (expert, first row, rows)
+        m4_ptr = align64(m4_ptr + sizeof(int64_t) + (n_rows_all / 4 + 1 + n_as) * 3 * sizeof(int32_t));
+        const size_t m4_scratch_sz = GGML_PAD((8 * ne10 + 8 * ne01) * sizeof(float), 64);
+        float *      m4_a_f32      = reinterpret_cast<float *>(m4_ptr + ith * m4_scratch_sz);
+        float *      m4_c_tmp      = m4_a_f32 + 8 * ne10;
+        if (use_m4 && ith == 0) {
+            GGML_ASSERT(m4_ptr + nth * m4_scratch_sz <= reinterpret_cast<uintptr_t>(ctx.workspace) + ctx.workspace_size);
+        }
+
         if (ith == 0) {
+            static FILE * ids_dump = [] {
+                const char * e = getenv("GGML_SPACEMIT_DUMP_IDS");
+                return e && e[0] ? fopen(e, "wb") : (FILE *) nullptr;
+            }();
+            if (ids_dump && ids->ne[1] > 1 && strstr(op->name, "ffn_moe_up") != nullptr && ids->type == GGML_TYPE_I32) {
+                // record: name[64], ne0, ne1, then ne0 x ne1 int32 (rows contiguous in ne0)
+                char name[64] = { 0 };
+                snprintf(name, sizeof(name), "%s", op->name);
+                const int32_t dims[2] = { (int32_t) ids->ne[0], (int32_t) ids->ne[1] };
+                fwrite(name, 1, sizeof(name), ids_dump);
+                fwrite(dims, sizeof(int32_t), 2, ids_dump);
+                for (int64_t i1 = 0; i1 < ids->ne[1]; i1++) {
+                    fwrite((const char *) ids->data + i1 * ids->nb[1], sizeof(int32_t), ids->ne[0], ids_dump);
+                }
+                fflush(ids_dump);
+            }
+        }
+
+        if (ith == 0 && !reuse_q) {
             // initialize matrix_row_counts
             memset(matrix_row_counts, 0, n_as * sizeof(int64_t));
 
@@ -705,25 +1480,110 @@ class tensor_traits : public ggml::spacemit::tensor_traits_base {
             }
             valid_ep_count[0]  = valid_ep_count_t;
             valid_act_count[0] = valid_act_count_t;
+
+            if (use_m4) {
+                int64_t n_groups = 0;
+                int64_t offset   = 0;
+                for (int cur_a = 0; cur_a < n_as; ++cur_a) {
+                    const int64_t cne1 = matrix_row_counts[cur_a];
+                    offset = (offset + spacemit_kernels::q8_hp_al_align - 1) & ~(int64_t) (spacemit_kernels::q8_hp_al_align - 1);
+                    m4_expert_offset[cur_a] = offset;
+                    int64_t r = 0;
+                    for (; use_m8 && r + 8 <= cne1; r += 8) {
+                        m4_groups[3 * n_groups + 0] = cur_a;
+                        m4_groups[3 * n_groups + 1] = (int32_t) r;
+                        m4_groups[3 * n_groups + 2] = 8;
+                        n_groups++;
+                        offset += m8_grp_bytes;
+                    }
+                    if (pad8_all && r < cne1) {
+                        m4_groups[3 * n_groups + 0] = cur_a;
+                        m4_groups[3 * n_groups + 1] = (int32_t) r;
+                        m4_groups[3 * n_groups + 2] = (int32_t) (cne1 - r);  // 1..7 real rows of an 8-row group
+                        n_groups++;
+                        offset += m8_grp_bytes;
+                        r = cne1;
+                    }
+                    for (; r + 4 <= cne1; r += 4) {
+                        m4_groups[3 * n_groups + 0] = cur_a;
+                        m4_groups[3 * n_groups + 1] = (int32_t) r;
+                        m4_groups[3 * n_groups + 2] = 4;
+                        n_groups++;
+                        offset += 4 * nbw1_m4;
+                    }
+                }
+                m4_n_groups[0] = n_groups;
+            }
+
+            if (op_stats) {
+                mmid_route_stats & r = g_mmid_route[st_kind];
+                r.calls++;
+                r.active_experts += valid_ep_count_t;
+                r.rows += valid_act_count_t;
+                for (int cur_a = 0; cur_a < n_as; ++cur_a) {
+                    int64_t c = matrix_row_counts[cur_a];
+                    if (c == 0) {
+                        continue;
+                    }
+                    int b = 0;
+                    while (c > 1 && b < 8) {
+                        c >>= 1;
+                        b++;
+                    }
+                    r.hist[b]++;
+                }
+                r.tcm_size = (int64_t) ctx.shared.size;
+            }
+            st_lap(op_stats ? st->t_route : st_t);
         }
 
+        const int64_t barrier_idx = static_cast<int64_t>(ith / 2);
+
+        GGML_ASSERT(global_spine_env_info.init_barrier != nullptr);
+        GGML_ASSERT(barrier_idx < static_cast<int64_t>(spine_init_barrier_count));
+        spine_barrier_t * cur_barrier = &global_spine_env_info.init_barrier[barrier_idx];
+
         ctx.sync();
+
+        st_lap(op_stats ? st->t_sync : st_t);
+
+        if (use_m4 && m4_n_groups[0] > 0 && !reuse_q) {
+            const int64_t n_groups = m4_n_groups[0];
+            for (int64_t gi = ith; gi < n_groups; gi += nth) {
+                const int     cur_a = m4_groups[3 * gi + 0];
+                const int64_t r0    = m4_groups[3 * gi + 1];
+                const int     nr    = m4_groups[3 * gi + 2];
+                for (int r = 0; r < nr; ++r) {
+                    const mmid_row_mapping rm = MMID_MATRIX_ROW(cur_a, r0 + r);
+                    const float * src = (const float *) ((const char *) src1->data + (rm.i1 % ne11) * nb11 + rm.i2 * nb12);
+                    memcpy(m4_a_f32 + r * ne10, src, ne10 * sizeof(float));
+                }
+                // groups of an expert are laid out in row order: n8 x m8 group, then at most one m4 group
+                const int64_t n8  = use_m8 ? std::min<int64_t>(r0, (matrix_row_counts[cur_a] / 8) * 8) / 8 : 0;
+                uint8_t *     out = m4_quant + m4_expert_offset[cur_a] + n8 * m8_grp_bytes + (r0 - n8 * 8) * nbw1_m4;
+                if (nr < 8 && pad8_all) {
+                    memset(m4_a_f32 + nr * ne10, 0, (8 - nr) * ne10 * sizeof(float));
+                    spacemit_kernels::rvv::quantize_a_8row_i8_hp_m8(a_blk_len, m4_a_f32, ne10, out);
+                } else if (nr == 8) {
+                    spacemit_kernels::rvv::quantize_a_8row_i8_hp_m8(a_blk_len, m4_a_f32, ne10, out);
+                } else {
+                    quantize_a_4row_i8(a_blk_len, m4_a_f32, ne10, out);
+                }
+            }
+            st_lap(op_stats ? st->t_quant4 : st_t);
+            ctx.sync();
+            st_lap(op_stats ? st->t_q4wait : st_t);
+        }
 
         const size_t row_stride_b      = b_k_blks * get_repacked_block_type_size<BLOC_TYPE, INTER_SIZE, NB_COLS>();
         const size_t expert_b_stride   = ne01 * row_stride_b;
         const size_t per_nb_cols_wsize = NB_COLS * row_stride_b;
 
-        const int64_t barrier_idx = static_cast<int64_t>(ith / 2);
-
-        GGML_ASSERT(global_spine_env_info.init_barrier != nullptr);
-        GGML_ASSERT(barrier_idx < spine_init_barrier_count);
-        spine_barrier_t * cur_barrier = &global_spine_env_info.init_barrier[barrier_idx];
-
         std::array<const uint8_t *, 2> src_workspaces;
         std::array<float *, 2>         dst_workspaces;
 
-        auto *     tcm_buffer      = ctx.shared.data;
-        const auto tcm_buffer_size = ctx.shared.size;
+        const int64_t tcm_buffer_size = (int64_t) ctx.shared.size;
+        void *        tcm_buffer      = ctx.shared.data;
 
         const auto valid_ep_count_t  = valid_ep_count[0];
         const auto valid_act_count_t = valid_act_count[0];
@@ -734,9 +1594,13 @@ class tensor_traits : public ggml::spacemit::tensor_traits_base {
         int ith_es = ith % nth_es;
         int ith_n  = (ith / nth_es) % nth_n;
 
-        if (valid_ep_count_t % nth == 0 && tcm_buffer != nullptr && valid_ep_count_t == n_as &&
+        if (!pad8_all && valid_ep_count_t % nth == 0 && tcm_buffer != nullptr && valid_ep_count_t == n_as &&
             valid_act_count_t == n_as && per_nb_cols_wsize <= tcm_buffer_size) {
             const bool has_pair = ((ith & 1) != 0) || (ith + 1 < nth);
+
+            if (op_stats) {
+                st->fast_path++;
+            }
 
             for (int64_t valid_id = ith; valid_id < valid_ep_count_t; valid_id += nth) {
                 const int64_t cur_a = valid_matrix_row_counts[valid_id];
@@ -786,7 +1650,9 @@ class tensor_traits : public ggml::spacemit::tensor_traits_base {
                     if (has_pair && ith % 2 != 0) {
                         spine_barrier_wait(cur_barrier);
                     }
+
                     gemm_kernel(b_blk_len, a_row, b_col, b_col_zp, c_blk + ni, 1, nb_real, b_k_blks, ne01);
+                    mmid_scale_row(c_blk + ni, nb_real, fw, i1, i2);
 
                     if (has_pair && ith % 2 == 0) {
                         spine_barrier_wait(cur_barrier);
@@ -825,8 +1691,17 @@ class tensor_traits : public ggml::spacemit::tensor_traits_base {
 
                 size_t extra_tcm_buffer_size = tcm_buffer_size;
                 void * extra_tcm_buffer      = tcm_buffer;
+                if (op_stats) {
+                    st_lap(st->t_kernel);  // bookkeeping between experts
+                    st->kernel_flops += 2.0 * (double) ne00 * (double) (src0_cur_end - src0_cur_start) *
+                                        (double) (src1_cur_end - src1_cur_start);
+                }
+
                 if (tcm_buffer != nullptr && (src1_cur_end - src1_cur_start) >= 4 &&
                     (src0_cur_end - src0_cur_start) * row_stride_b <= tcm_buffer_size) {
+                    if (op_stats) {
+                        st->w_tcm_hit++;
+                    }
                     spacemit_kernels::rvv::memcpy1d(tcm_buffer, src0_cur,
                                                     (src0_cur_end - src0_cur_start) * row_stride_b);
                     src0_cur = reinterpret_cast<uint8_t *>(tcm_buffer);
@@ -834,9 +1709,83 @@ class tensor_traits : public ggml::spacemit::tensor_traits_base {
                     extra_tcm_buffer_size -= (src0_cur_end - src0_cur_start) * row_stride_b;
                     extra_tcm_buffer = reinterpret_cast<void *>(reinterpret_cast<uintptr_t>(tcm_buffer) +
                                                                 (src0_cur_end - src0_cur_start) * row_stride_b);
+                    st_lap(op_stats ? st->t_wcopy : st_t);
+                } else if (op_stats) {
+                    st->w_tcm_miss++;
                 }
 
                 int ir1 = src1_cur_start;
+
+                const int64_t n_cols = src0_cur_end - src0_cur_start;
+                if (pad8_all) {
+                    GGML_ASSERT(use_m8 && n_cols % 32 == 0);
+                }
+                if (use_m4 && n_cols % 32 == 0 && (cne1 >= 4 || pad8_all)) {
+                    const uint8_t * a_grp = m4_quant + m4_expert_offset[cur_a];
+                    st_lap(op_stats ? st->t_kernel : st_t);
+                    for (; use_m8 && ir1 + 8 <= src1_cur_end; ir1 += 8, a_grp += m8_grp_bytes) {
+                        spacemit_kernels::ime2::gemm_kernel_i8i4_hp_m8(b_blk_len, a_grp, src0_cur, nullptr, m4_c_tmp, 8,
+                                                                       n_cols, b_k_blks, n_cols);
+                        if (op_stats) {
+                            st_lap(st->t_k8);
+                            st->rows_m8 += 8;
+                            st->flops_m8 += 2.0 * 8 * ne00 * n_cols;
+                        }
+                        for (int r = 0; r < 8; ++r) {
+                            const mmid_row_mapping rm = MMID_MATRIX_ROW(cur_a, ir1 + r);
+                            float * dst_row = (float *) ((char *) dst->data + (rm.i1 * nb1 + rm.i2 * nb2)) + src0_cur_start;
+                            mmid_store_row(dst_row, m4_c_tmp + r * n_cols, n_cols, fw, rm.i1, rm.i2);
+                        }
+                        if (op_stats && ne01 > 1024) {
+                            const int64_t t_before = st->t_scatter;
+                            st_lap(st->t_scatter);
+                            st->t_scatter_wide += st->t_scatter - t_before;
+                        } else {
+                            st_lap(op_stats ? st->t_scatter : st_t);
+                        }
+                    }
+                    if (pad8_all && ir1 < src1_cur_end) {
+                        // zero-padded tail group: compute 8 rows, keep the real ones
+                        const int nr = (int) (src1_cur_end - ir1);
+                        spacemit_kernels::ime2::gemm_kernel_i8i4_hp_m8(b_blk_len, a_grp, src0_cur, nullptr, m4_c_tmp, 8,
+                                                                       n_cols, b_k_blks, n_cols);
+                        if (op_stats) {
+                            st_lap(st->t_k8);
+                            st->rows_m8 += nr;
+                            st->flops_m8 += 2.0 * 8 * ne00 * n_cols;
+                        }
+                        for (int r = 0; r < nr; ++r) {
+                            const mmid_row_mapping rm = MMID_MATRIX_ROW(cur_a, ir1 + r);
+                            float * dst_row = (float *) ((char *) dst->data + (rm.i1 * nb1 + rm.i2 * nb2)) + src0_cur_start;
+                            mmid_store_row(dst_row, m4_c_tmp + r * n_cols, n_cols, fw, rm.i1, rm.i2);
+                        }
+                        st_lap(op_stats ? st->t_scatter : st_t);
+                        ir1 = src1_cur_end;
+                    }
+                    for (; ir1 + 4 <= src1_cur_end; ir1 += 4, a_grp += 4 * nbw1_m4) {
+                        gemm_kernel(b_blk_len, a_grp, src0_cur, b_col_zp, m4_c_tmp, 4, n_cols, b_k_blks, n_cols);
+                        if (op_stats) {
+                            st_lap(st->t_k4);
+                            st->flops_m4 += 2.0 * 4 * ne00 * n_cols;
+                        }
+                        for (int r = 0; r < 4; ++r) {
+                            const mmid_row_mapping rm = MMID_MATRIX_ROW(cur_a, ir1 + r);
+                            float * dst_row = (float *) ((char *) dst->data + (rm.i1 * nb1 + rm.i2 * nb2)) + src0_cur_start;
+                            mmid_store_row(dst_row, m4_c_tmp + r * n_cols, n_cols, fw, rm.i1, rm.i2);
+                        }
+                        if (op_stats && ne01 > 1024) {
+                            const int64_t t_before = st->t_scatter;
+                            st_lap(st->t_scatter);
+                            st->t_scatter_wide += st->t_scatter - t_before;
+                        } else {
+                            st_lap(op_stats ? st->t_scatter : st_t);
+                        }
+                    }
+                    if (op_stats) {
+                        st->rows_m4 += (cne1 / 4) * 4;
+                    }
+                    st_lap(op_stats ? st->t_kernel : st_t);
+                }
 
                 if (extra_tcm_buffer_size >= nbw1 && extra_tcm_buffer != nullptr) {
                     int64_t quant_a_tile_size = extra_tcm_buffer_size / nbw1;
@@ -859,6 +1808,8 @@ class tensor_traits : public ggml::spacemit::tensor_traits_base {
                             quant_a_tile_buffer = quant_a_tile_buffer + nbw1;
                         }
 
+                        st_lap(op_stats ? st->t_agather : st_t);
+
                         quant_a_tile_buffer = reinterpret_cast<uint8_t *>(extra_tcm_buffer);
                         iir1                = ir1;
 
@@ -879,18 +1830,30 @@ class tensor_traits : public ggml::spacemit::tensor_traits_base {
                                 moe_gemm_kernel_m2(b_blk_len, src_workspaces.data(), src0_cur, b_col_zp,
                                                    dst_workspaces.data(), 1, src0_cur_end - src0_cur_start, b_k_blks,
                                                    ne01);
+                                mmid_scale_row(dst_workspaces[0], src0_cur_end - src0_cur_start, fw, row_mapping_0.i1,
+                                               row_mapping_0.i2);
+                                mmid_scale_row(dst_workspaces[1], src0_cur_end - src0_cur_start, fw, row_mapping_1.i1,
+                                               row_mapping_1.i2);
+                                if (op_stats) {
+                                    st->rows_m2 += 2;
+                                }
                             }
                         }
 
                         for (; iir1 < (ir1 + quant_a_tile_size); iir1++, quant_a_tile_buffer += nbw1) {
                             mmid_row_mapping row_mapping_0 = MMID_MATRIX_ROW(cur_a, iir1);
+                            if (op_stats) {
+                                st->rows_m1++;
+                            }
 
-                            gemm_kernel(
-                                b_blk_len, quant_a_tile_buffer, src0_cur, b_col_zp,
-                                (float *) ((char *) dst->data + (row_mapping_0.i1 * nb1 + row_mapping_0.i2 * nb2)) +
-                                    src0_cur_start,
-                                1, src0_cur_end - src0_cur_start, b_k_blks, ne01);
+                            float * y = (float *) ((char *) dst->data + (row_mapping_0.i1 * nb1 + row_mapping_0.i2 * nb2)) +
+                                        src0_cur_start;
+                            gemm_kernel(b_blk_len, quant_a_tile_buffer, src0_cur, b_col_zp, y, 1,
+                                        src0_cur_end - src0_cur_start, b_k_blks, ne01);
+                            mmid_scale_row(y, src0_cur_end - src0_cur_start, fw, row_mapping_0.i1, row_mapping_0.i2);
                         }
+
+                        st_lap(op_stats ? st->t_kernel : st_t);
 
                         ir1 += quant_a_tile_size;
                     } while (ir1 < src1_cur_end);
@@ -916,10 +1879,23 @@ class tensor_traits : public ggml::spacemit::tensor_traits_base {
 
                             moe_gemm_kernel_m2(b_blk_len, src_workspaces.data(), src0_cur, b_col_zp,
                                                dst_workspaces.data(), 1, src0_cur_end - src0_cur_start, b_k_blks, ne01);
+                            if (fw != nullptr) {
+                                for (int iir1 = 0; iir1 < 2; ++iir1) {
+                                    const mmid_row_mapping rm = MMID_MATRIX_ROW(cur_a, ir1 + iir1);
+                                    mmid_scale_row(dst_workspaces[iir1], src0_cur_end - src0_cur_start, fw, rm.i1,
+                                                   rm.i2);
+                                }
+                            }
+                            if (op_stats) {
+                                st->rows_m2 += 2;
+                            }
                         }
                     }
 
                     for (; ir1 < src1_cur_end; ir1++) {
+                        if (op_stats) {
+                            st->rows_m1++;
+                        }
                         mmid_row_mapping row_mapping = MMID_MATRIX_ROW(cur_a, ir1);
 
                         const int id = row_mapping.i1;  // selected expert index
@@ -932,15 +1908,21 @@ class tensor_traits : public ggml::spacemit::tensor_traits_base {
 
                         auto * src1_col = quant_a_buffer + (i11 * nbw1 + i12 * nbw2);
 
-                        gemm_kernel(b_blk_len, src1_col, src0_cur, b_col_zp,
-                                    (float *) ((char *) dst->data + (i1 * nb1 + i2 * nb2)) + src0_cur_start, 1,
-                                    src0_cur_end - src0_cur_start, b_k_blks, ne01);
+                        float * y = (float *) ((char *) dst->data + (i1 * nb1 + i2 * nb2)) + src0_cur_start;
+                        gemm_kernel(b_blk_len, src1_col, src0_cur, b_col_zp, y, 1, src0_cur_end - src0_cur_start,
+                                    b_k_blks, ne01);
+                        mmid_scale_row(y, src0_cur_end - src0_cur_start, fw, i1, i2);
                     }
+                    st_lap(op_stats ? st->t_kernel : st_t);
                 }
             }
         }
+
+        if (op_stats) {
+            st_lap(st->t_kernel);  // fast path and trailing bookkeeping
+            st->t_total += st_t - st_t0;
+        }
 #undef MMID_MATRIX_ROW
-        return true;
     }
 
     int repack(ggml_tensor * t, const void * data, size_t data_size) const override {
@@ -1423,6 +2405,35 @@ static const tensor_traits<block_mxfp4, 32, 32> mxfp4_32x32_q8_0;
 static const tensor_traits<block_q5_K, 32, 32>  q5_k_32x32_q8_0;
 static const tensor_traits<block_q5_1, 32, 32>  q5_1_32x32_q8_0;
 static const tensor_traits<block_q5_0, 32, 32>  q5_0_32x32_q8_0;
+
+// Q5_0 weights converted exactly to Q8_0 at load time and run on the Q8_0 IME path (the Q5_0 IME kernel is
+// opt-in: GGML_SPACEMIT_Q5_0_IME=1)
+class tensor_traits_q5_0_as_q8_0 : public tensor_traits<block_q8_0, 32, 32> {
+    int repack(ggml_tensor * t, const void * data, size_t data_size) const override {
+        return repack_q5_0_to_q8_0_32(t, data, data_size);
+    }
+};
+
+static const tensor_traits_q5_0_as_q8_0 q5_0_as_q8_0_32x32;
+
+// F32 MoE router weights (ffn_gate_inp) quantized to Q8_0 at load and run on the Q8_0 IME path
+// (GGML_SPACEMIT_ROUTER_Q8=0 disables; lossy: routing logits from Q8_0 weights)
+class tensor_traits_f32_as_q8_0 : public tensor_traits<block_q8_0, 32, 32> {
+    int repack(ggml_tensor * t, const void * data, size_t data_size) const override {
+        return repack_f32_to_q8_0_32(t, data, data_size);
+    }
+};
+
+static const tensor_traits_f32_as_q8_0 f32_as_q8_0_32x32;
+
+// Q6_K lm_head (output.weight) requantized to Q4_0 at load (GGML_SPACEMIT_LM_Q4=1; lossy)
+class tensor_traits_q6_k_as_q4_0 : public tensor_traits<block_q4_0, 256, 32> {
+    int repack(ggml_tensor * t, const void * data, size_t data_size) const override {
+        return repack_q6_k_to_q4_0_256_32(t, data, data_size);
+    }
+};
+
+static const tensor_traits_q6_k_as_q4_0 q6_k_as_q4_0_32x256;
 // Impl By RVV
 static const tensor_traits_common               rvv_impl;
 
@@ -1507,6 +2518,14 @@ const ggml::spacemit::tensor_traits_base * ggml_spacemit_get_optimal_repack_type
         case GGML_TYPE_Q6_K:
             {
 #if defined(RISCV64_SPACEMIT_IME2)
+                static const bool lm_q4 = [] {
+                    const char * e = getenv("GGML_SPACEMIT_LM_Q4");
+                    return e && e[0] == '1';
+                }();
+                if (lm_q4 && strcmp(cur->name, "output.weight") == 0 && ggml_n_dims(cur) == 2 && cur->ne[1] % 32 == 0 &&
+                    cur->ne[0] % QK_K == 0 && (ggml::cpu::riscv64_spacemit::global_spine_env_info.use_ime2)) {
+                    return &ggml::cpu::riscv64_spacemit::q6_k_as_q4_0_32x256;
+                }
                 if ((ggml::cpu::riscv64_spacemit::global_spine_env_info.use_ime2)) {
                     return &ggml::cpu::riscv64_spacemit::q6_k_32x32_q8_0;
                 }
@@ -1553,8 +2572,40 @@ const ggml::spacemit::tensor_traits_base * ggml_spacemit_get_optimal_repack_type
         case GGML_TYPE_Q5_0:
             {
 #if defined(RISCV64_SPACEMIT_IME2)
-                if (cur->ne[1] % 32 == 0 && (ggml::cpu::riscv64_spacemit::global_spine_env_info.use_ime2)) {
+                static const bool q5_0_ime = [] {
+                    const char * e = getenv("GGML_SPACEMIT_Q5_0_IME");
+                    return e && e[0] == '1';
+                }();
+                if (q5_0_ime && cur->ne[1] % 32 == 0 && (ggml::cpu::riscv64_spacemit::global_spine_env_info.use_ime2)) {
                     return &ggml::cpu::riscv64_spacemit::q5_0_32x32_q8_0;
+                }
+                // default: exact conversion to Q8_0 at load (GGML_SPACEMIT_Q5_0_AS_Q8=0 keeps the Q5_0 kernel)
+                static const bool q5_0_as_q8 = [] {
+                    const char * e = getenv("GGML_SPACEMIT_Q5_0_AS_Q8");
+                    return !(e && e[0] == '0');
+                }();
+                if (cur->ne[1] % 32 == 0 && cur->ne[0] % QK8_0 == 0 &&
+                    (ggml::cpu::riscv64_spacemit::global_spine_env_info.use_ime2)) {
+                    return q5_0_as_q8 ? (const ggml::spacemit::tensor_traits_base *) &ggml::cpu::riscv64_spacemit::q5_0_as_q8_0_32x32
+                                      : &ggml::cpu::riscv64_spacemit::q5_0_32x32_q8_0;
+                }
+#endif
+            }
+            break;
+        case GGML_TYPE_F32:
+            {
+#if defined(RISCV64_SPACEMIT_IME2)
+                // init_tensor sees activations too: only weights (name "*.weight") qualify
+                static const bool router_q8 = [] {
+                    const char * e = getenv("GGML_SPACEMIT_ROUTER_Q8");
+                    return !(e && e[0] == '0');
+                }();
+                const size_t nl = strlen(cur->name);
+                if (router_q8 && strstr(cur->name, "ffn_gate_inp") != nullptr && strstr(cur->name, "shexp") == nullptr &&
+                    nl > 7 && strcmp(cur->name + nl - 7, ".weight") == 0 && ggml_n_dims(cur) == 2 &&
+                    cur->ne[1] % 32 == 0 && cur->ne[0] % QK8_0 == 0 &&
+                    (ggml::cpu::riscv64_spacemit::global_spine_env_info.use_ime2)) {
+                    return &ggml::cpu::riscv64_spacemit::f32_as_q8_0_32x32;
                 }
 #endif
             }
@@ -1616,7 +2667,11 @@ size_t ggml_spacemit_nbytes(ggml_backend_buffer_type_t buft, const ggml_tensor *
             nbytes = remap_block_nbytes(sizeof(block_q4_K), sizeof(block_q4_1) * 8);
             break;
         case GGML_TYPE_Q6_K:
-            nbytes = remap_block_nbytes(sizeof(block_q6_K), sizeof(block_q8_0) * 8, 32);
+            if (ggml_spacemit_get_optimal_repack_type(tensor) == &ggml::cpu::riscv64_spacemit::q6_k_as_q4_0_32x256) {
+                nbytes = remap_block_nbytes(sizeof(block_q6_K), sizeof(block_q4_0) * (QK_K / QK4_0));
+            } else {
+                nbytes = remap_block_nbytes(sizeof(block_q6_K), sizeof(block_q8_0) * 8, 32);
+            }
             break;
         case GGML_TYPE_Q8_0:
             nbytes = remap_block_nbytes(sizeof(block_q8_0), sizeof(block_q8_0), 32);
@@ -1637,7 +2692,11 @@ size_t ggml_spacemit_nbytes(ggml_backend_buffer_type_t buft, const ggml_tensor *
             nbytes = remap_block_nbytes(sizeof(block_q5_1), sizeof(spacemit_kernels::nrow_block_q5_1<1>));
             break;
         case GGML_TYPE_Q5_0:
-            nbytes = remap_block_nbytes(sizeof(block_q5_0), sizeof(spacemit_kernels::nrow_block_q5_0<1>));
+            if (ggml_spacemit_get_optimal_repack_type(tensor) == &ggml::cpu::riscv64_spacemit::q5_0_as_q8_0_32x32) {
+                nbytes = remap_block_nbytes(sizeof(block_q5_0), sizeof(block_q8_0), 32);
+            } else {
+                nbytes = remap_block_nbytes(sizeof(block_q5_0), sizeof(spacemit_kernels::nrow_block_q5_0<1>));
+            }
             break;
         default:
             nbytes = add_strided_nbytes(row_nbytes, 1, 1);
