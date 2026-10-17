@@ -1967,6 +1967,9 @@ class tensor_traits_common : public ggml::spacemit::tensor_traits_base {
                     // Per-thread: VKQ accmulator (DV), partial M, partial S + intra-thread scratch for V, Q and VKQ
                     size_t n_chunks = n_tasks;
                     size_t decode   = sizeof(float) * n_tasks * (DK + 2 * DV + 64);
+                    // split-KV decode partials (up to 4 query tokens, FA_SPLIT_KV_MAX_Q)
+                    const size_t n_q = (size_t) std::min<int64_t>(op->src[0]->ne[1], 4);
+                    decode = MAX(decode, sizeof(float) * (n_q * neq2 * n_chunks * (2 + DV) + n_tasks * (DK + 2 * DV)));
 
                     size = MAX(prefill, decode);
                 }
@@ -2382,6 +2385,24 @@ class tensor_traits_common : public ggml::spacemit::tensor_traits_base {
         // if (nth == 1 || nchunk < nth) {
         //     nchunk = nth;
         // }
+
+        // decode / MTP verification (1-4 query tokens): split the KV range across threads so each K/V row is
+        // read once, then merge the partials (GGML_SPACEMIT_FA_SPLITKV=0 disables; ported from ggml-cpu/spacemit)
+        static const bool split_kv = [] {
+            const char * e = getenv("GGML_SPACEMIT_FA_SPLITKV");
+            return !(e && e[0] == '0');
+        }();
+        const int n_split = (split_kv && !use_tiled && ctx.shared.data != nullptr) ?
+                                spacemit_kernels::rvv::flash_attn_ext_f16_split_kv_chunks_vlen1024_vf16(dst, nth) :
+                                0;
+        if (n_split > 0) {
+            float * partials = (float *) ctx.workspace;
+            spacemit_kernels::rvv::forward_flash_attn_ext_f16_split_kv_partial_vlen1024_vf16(
+                ctx, dst, n_split, partials, ctx.shared.data, ctx.shared.size);
+            ctx.sync();
+            spacemit_kernels::rvv::forward_flash_attn_ext_f16_split_kv_reduce_vlen1024_vf16(ctx, dst, n_split, partials);
+            return true;
+        }
 
         int64_t nchunk = nth;
 
