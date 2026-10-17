@@ -1269,6 +1269,9 @@ class tensor_traits_common : public ggml::spacemit::tensor_traits_base {
                 return true;
             case GGML_OP_CONCAT:
                 {
+                    if (spacemit_kernels::rvv::forward_concat_dim0_transposed_f32(ctx, op, 0)) {
+                        return true;
+                    }
                     const int32_t dim = ggml_get_op_params_i32(op, 0);
                     if (dim == 0 && op->type == op->src[0]->type) {
                         switch (op->src[0]->type) {
@@ -1315,7 +1318,9 @@ class tensor_traits_common : public ggml::spacemit::tensor_traits_base {
                 spacemit_kernels::rvv::forward_gated_delta_net(ctx, op);
                 return true;
             case GGML_OP_SSM_CONV:
-                spacemit_kernels::scalar::forward_ssm_conv_f32(ctx, op);
+                if (!spacemit_kernels::rvv::forward_ssm_conv_f32(ctx, op)) {
+                    spacemit_kernels::scalar::forward_ssm_conv_f32(ctx, op);
+                }
                 return true;
             default:
                 break;

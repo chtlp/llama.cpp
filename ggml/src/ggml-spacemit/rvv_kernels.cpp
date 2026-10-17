@@ -4456,6 +4456,113 @@ template void forward_repeat_dim1<int32_t>(ggml::spacemit::context & ctx, ggml_t
 template void forward_repeat_dim1<int16_t>(ggml::spacemit::context & ctx, ggml_tensor * op);
 template void forward_get_rows<int32_t>(ggml::spacemit::context & ctx, ggml_tensor * op);
 template void forward_get_rows<int16_t>(ggml::spacemit::context & ctx, ggml_tensor * op);
+// Ported from ggml-cpu/spacemit (linpengt/qwen35-opt).
+// f32 concat along dim 0 where src1 is a transposed view (nb10 != 4, nb11 == 4), e.g. the delta-net
+// conv_input = concat(conv_states, transpose(qkv_mixed)). Threads split dim 1 (channels); each token's run
+// of channels is loaded contiguously and written to the dst channel rows with a strided store.
+// Only columns >= col0 are written (col0 > 0 when SSM_CONV reads the inputs directly and only the
+// trailing columns are read back through views).
+bool forward_concat_dim0_transposed_f32(ggml::spacemit::context & ctx, ggml_tensor * op, int64_t col0) {
+    const ggml_tensor * src0 = op->src[0];
+    const ggml_tensor * src1 = op->src[1];
+    const ggml_tensor * dst  = op;
+
+    GGML_TENSOR_BINARY_OP_LOCALS
+
+    if (ggml_get_op_params_i32(op, 0) != 0 || op->type != GGML_TYPE_F32 || src0->type != GGML_TYPE_F32 ||
+        src1->type != GGML_TYPE_F32 || nb0 != sizeof(float) || nb00 != sizeof(float) ||
+        nb11 != sizeof(float) || nb10 == sizeof(float) || ne01 != ne1 || ne11 != ne1 || ne02 != ne2 ||
+        ne12 != ne2 || ne03 != ne3 || ne13 != ne3) {
+        return false;
+    }
+
+    const int64_t dc = (ne1 + (int64_t) ctx.nth - 1) / (int64_t) ctx.nth;
+    const int64_t c0 = dc * (int64_t) ctx.ith;
+    const int64_t c1 = std::min(c0 + dc, ne1);
+
+    for (int64_t i3 = 0; i3 < ne3; i3++) {
+        for (int64_t i2 = 0; i2 < ne2; i2++) {
+            const char * s0 = (const char *) src0->data + i2 * nb02 + i3 * nb03;
+            const char * s1 = (const char *) src1->data + i2 * nb12 + i3 * nb13;
+            char *       d  = (char *) op->data + i2 * nb2 + i3 * nb3;
+
+            for (int64_t c = c0; c < c1;) {
+                const size_t vl = __riscv_vsetvl_e32m4(c1 - c);
+                for (int64_t i0 = col0; i0 < ne00; i0++) {
+                    vfloat32m4_t v = __riscv_vlse32_v_f32m4((const float *) (s0 + i0 * nb00 + c * nb01), nb01, vl);
+                    __riscv_vsse32_v_f32m4((float *) (d + i0 * nb0 + c * nb1), nb1, v, vl);
+                }
+                for (int64_t t = std::max<int64_t>(0, col0 - ne00); t < ne10; t++) {
+                    vfloat32m4_t v = __riscv_vle32_v_f32m4((const float *) (s1 + t * nb10 + c * nb11), vl);
+                    __riscv_vsse32_v_f32m4((float *) (d + (ne00 + t) * nb0 + c * nb1), nb1, v, vl);
+                }
+                c += vl;
+            }
+        }
+    }
+    return true;
+}
+
+// ssm_conv for d_conv == 4: dst[c, t] = sum_k x[c, t + k] * w[c, k]. Vectorized over channels with the
+// 4-wide sliding window kept in registers (one strided load per token).
+bool forward_ssm_conv_f32(ggml::spacemit::context & ctx, ggml_tensor * dst) {
+    const ggml_tensor * src0 = dst->src[0];  // conv_x {d_conv - 1 + n_t, d_inner, n_s}
+    const ggml_tensor * src1 = dst->src[1];  // conv1d.weight {d_conv, d_inner}
+
+    const int64_t nc  = src1->ne[0];
+    const int64_t nr  = src0->ne[1];
+    const int64_t n_t = dst->ne[1];
+    const int64_t n_s = dst->ne[2];
+
+    if (nc != 4 || src0->type != GGML_TYPE_F32 || src1->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32 ||
+        src0->nb[0] != sizeof(float) || src1->nb[0] != sizeof(float) || dst->nb[0] != sizeof(float) ||
+        dst->ne[0] != nr) {
+        return false;
+    }
+
+    const ptrdiff_t xs = src0->nb[1];  // channel stride of x
+    const ptrdiff_t ws = src1->nb[1];  // channel stride of w
+
+    const int64_t dr  = (nr + (int64_t) ctx.nth - 1) / (int64_t) ctx.nth;
+    const int64_t ir0 = dr * (int64_t) ctx.ith;
+    const int64_t ir1 = std::min(ir0 + dr, nr);
+
+    for (int64_t i3 = 0; i3 < n_s; ++i3) {
+        for (int64_t c = ir0; c < ir1;) {
+            const size_t vl = __riscv_vsetvl_e32m4(ir1 - c);
+
+            const char * wp = (const char *) src1->data + c * ws;
+            const vfloat32m4_t w0 = __riscv_vlse32_v_f32m4((const float *) wp + 0, ws, vl);
+            const vfloat32m4_t w1 = __riscv_vlse32_v_f32m4((const float *) wp + 1, ws, vl);
+            const vfloat32m4_t w2 = __riscv_vlse32_v_f32m4((const float *) wp + 2, ws, vl);
+            const vfloat32m4_t w3 = __riscv_vlse32_v_f32m4((const float *) wp + 3, ws, vl);
+
+            const float * xp = (const float *) ((const char *) src0->data + c * xs + i3 * src0->nb[2]);
+            vfloat32m4_t  x0 = __riscv_vlse32_v_f32m4(xp + 0, xs, vl);
+            vfloat32m4_t  x1 = __riscv_vlse32_v_f32m4(xp + 1, xs, vl);
+            vfloat32m4_t  x2 = __riscv_vlse32_v_f32m4(xp + 2, xs, vl);
+
+            for (int64_t t = 0; t < n_t; ++t) {
+                const vfloat32m4_t x3 = __riscv_vlse32_v_f32m4(xp + t + 3, xs, vl);
+
+                vfloat32m4_t acc = __riscv_vfmul_vv_f32m4(x0, w0, vl);
+                acc              = __riscv_vfmacc_vv_f32m4(acc, x1, w1, vl);
+                acc              = __riscv_vfmacc_vv_f32m4(acc, x2, w2, vl);
+                acc              = __riscv_vfmacc_vv_f32m4(acc, x3, w3, vl);
+
+                float * y = (float *) ((char *) dst->data + c * sizeof(float) + t * dst->nb[1] + i3 * dst->nb[2]);
+                __riscv_vse32_v_f32m4(y, acc, vl);
+
+                x0 = x1;
+                x1 = x2;
+                x2 = x3;
+            }
+            c += vl;
+        }
+    }
+    return true;
+}
+
 template void forward_concat<int32_t>(ggml::spacemit::context & ctx, ggml_tensor * op);
 template void forward_concat<int16_t>(ggml::spacemit::context & ctx, ggml_tensor * op);
 

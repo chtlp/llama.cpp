@@ -66,6 +66,11 @@ template <typename T> void forward_get_rows(ggml::spacemit::context & ctx, ggml_
 
 template <typename T> void forward_concat(ggml::spacemit::context & ctx, ggml_tensor * op);
 void forward_gated_delta_net(ggml::spacemit::context & ctx, ggml_tensor * op);
+// dim-0 concat of a contiguous src0 and a transposed src1 (channels contiguous), vectorized over rows;
+// writes columns >= col0 only
+bool forward_concat_dim0_transposed_f32(ggml::spacemit::context & ctx, ggml_tensor * op, int64_t col0);
+// ssm_conv, d_conv == 4, vectorized over channels
+bool forward_ssm_conv_f32(ggml::spacemit::context & ctx, ggml_tensor * dst);
 
 template <ggml_op op_type, typename T> void forward_binary(ggml::spacemit::context & ctx, ggml_tensor * op);
 
