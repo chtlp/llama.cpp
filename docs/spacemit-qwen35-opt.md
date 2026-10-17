@@ -63,6 +63,7 @@ Qwen3-30B-A3B（只覆盖 Qwen3 阶段的改动）：pp512 54.0 → **76.9**（+
 | `5013fc6fb` | legacy 矩阵乘类整体移植（m8、A 对齐、Q8_0 预排、MoE m4/m8、路由 Q8_0、Q5_0 → Q8_0、lm_head Q4_0） | 102.6 |
 | `5bc2583a3` | 图级融合（concat → ssm_conv、MoE 路由权重、RMS_NORM + MUL），在主机上于 launch 之前决定 | 127.3 |
 | `a6f7d2365` | ARGSORT、CLAMP 放到设备上（切图从 163 段降到 3 段，pp512 不变） | 127.0 |
+| `9e73a7486` | split-KV FA decode（1～4 个 query token，即 `9f1f5f143` 和 `cac4ebc65` 的 FA 部分） | 126.3 |
 
 最终对比（同一 binary，各 2 次）：
 
@@ -75,8 +76,24 @@ Qwen3-30B-A3B（只覆盖 Qwen3 阶段的改动）：pp512 54.0 → **76.9**（+
 
 精度：独立后端对 legacy 的 KLD，`-c 512` 是 0.0066，`-c 2048` 是 0.0074（top-1 96.6%）。
 
+decode（tg32，t/s）：
+
+| | 4K | 8K |
+|---|---:|---:|
+| legacy | 7.75 | 7.11 |
+| 独立后端，不开 split-KV | 6.85 | 5.24 |
+| 独立后端 | **7.86** | **7.24** |
+
+MTP（llama-server `draft-mtp`，n-max 1，LM_Q4，t/s）：
+
+| | 4K | 8K |
+|---|---:|---:|
+| legacy | 9.88 | 9.09 |
+| 独立后端 | 9.86 | 8.95 |
+
+待查：在新的 upstream 上，legacy 的 MTP 贪心输出也与非 MTP 不再逐字相同（10-15 时相同）；关掉我们 10-15 之后的全部优化开关仍然不同，可能来自上游的 speculative 改动。
+
 尚未移植：
-- split-KV decode FA 和 MTP 验证（`9f1f5f143`、`cac4ebc65`），长上下文 decode 和 MTP 要单独比较；
 - `GGML_OP_STATS` 子阶段计时；
 - GDN 的 IME 版本（legacy 上默认关）。
 
