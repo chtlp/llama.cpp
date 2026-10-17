@@ -6,12 +6,15 @@
 #include "ggml-common.h"
 #include "ggml-cpu.h"
 #include "ggml-impl.h"
+#include "ggml-quants.h"
 #include "ime_kernels.h"
+#include "rvv_kernels.h"
 
 #include <algorithm>
 #include <cassert>
 #include <cmath>
 #include <cstring>
+#include <vector>
 
 // clang-format off
 #if defined(__riscv)
@@ -593,7 +596,7 @@ static int repack_q4_0_to_q4_0_256_32_bl_ref(ggml_tensor *              t,
                                              int                        interleave_block,
                                              const void * GGML_RESTRICT data,
                                              size_t                     data_size) {
-    GGML_ASSERT(t->type == GGML_TYPE_Q4_0);
+    GGML_ASSERT(t->type == GGML_TYPE_Q4_0 || t->type == GGML_TYPE_Q6_K);  // Q6_K: repack_q6_k_to_q4_0_256_32
     GGML_ASSERT(interleave_block == 32);  // unused
 
     constexpr int nrows_interleaved = 32;
@@ -1314,7 +1317,8 @@ static int repack_q8_0_to_q8_0_32_bl(ggml_tensor *              t,
                                      int                        interleave_block,
                                      const void * GGML_RESTRICT data,
                                      size_t                     data_size) {
-    GGML_ASSERT(t->type == GGML_TYPE_Q8_0);
+    // Q5_0 tensors arrive here already converted to Q8_0 rows (repack_q5_0_to_q8_0_32)
+    GGML_ASSERT(t->type == GGML_TYPE_Q8_0 || t->type == GGML_TYPE_Q5_0 || t->type == GGML_TYPE_F32);
     GGML_ASSERT(interleave_block == 32);
 
     constexpr int nrows_interleaved = 32;
@@ -1734,10 +1738,42 @@ template <> int repack<block_q4_0, 32, 32>(ggml_tensor * t, const void * data, s
 
 template <> int repack<block_q4_0, 256, 32>(ggml_tensor * t, const void * data, size_t data_size) {
 #if 1
-    return repack_q4_0_to_q4_0_256_32_bl_ref(t, 32, data, data_size);
+    int ret = repack_q4_0_to_q4_0_256_32_bl_ref(t, 32, data, data_size);
 #else
     //return repack_q4_0_to_q4_0_256_32_bl(t, 32, data, data_size);
 #endif
+    if (ret == 0 && spacemit_kernels::hp_aligned_enabled()) {
+        // signed int4 for gemm_kernel_i8i4_hp_al: q - 8 in two's complement is q ^ 8 per nibble
+        block_q4_0x32x256 * dst = (block_q4_0x32x256 *) t->data;
+        const int64_t       n   = ggml_nrows(t) / 32 * (t->ne[0] / 256);
+        for (int64_t i = 0; i < n; i++) {
+            for (auto & blk : dst[i].blocks) {
+                for (auto & q : blk.qs) {
+                    q ^= 0x88;
+                }
+            }
+        }
+    }
+    return ret;
+}
+
+// Q6_K -> Q4_0 at load (lossy; same as an offline requant without imatrix): dequantize each row, quantize it with
+// the Q4_0 reference quantizer, then repack as Q4_0 32x256 for the hp kernels.
+int repack_q6_k_to_q4_0_256_32(ggml_tensor * t, const void * data, size_t data_size) {
+    GGML_ASSERT(t->type == GGML_TYPE_Q6_K);
+    GGML_ASSERT(t->ne[0] % QK_K == 0);
+    const int64_t nrows = ggml_nrows(t);
+    const int64_t nb_k  = t->ne[0] / QK_K;
+    const int64_t nb_4  = t->ne[0] / QK4_0;
+    GGML_ASSERT(data_size == (size_t) nrows * nb_k * sizeof(block_q6_K));
+
+    std::vector<block_q4_0> q4(nrows * nb_4);
+    std::vector<float>      row(t->ne[0]);
+    for (int64_t r = 0; r < nrows; r++) {
+        dequantize_row_q6_K((const block_q6_K *) data + r * nb_k, row.data(), t->ne[0]);
+        quantize_row_q4_0_ref(row.data(), q4.data() + r * nb_4, t->ne[0]);
+    }
+    return repack<block_q4_0, 256, 32>(t, q4.data(), q4.size() * sizeof(block_q4_0));
 }
 
 template <> int repack<block_q4_1, 32, 32>(ggml_tensor * t, const void * data, size_t data_size) {
@@ -1768,9 +1804,74 @@ template <> int repack<block_q6_K, 32, 32>(ggml_tensor * t, const void * data, s
 #endif
 }
 
+// q8_prearranged_enabled(): store each K32 block's 32x32 int8 data in the order gemm_kernel_i8i8_*_pre loads it.
+// The original kernels apply vupack.vv vd, vs2, vs1, 1 (e32) to each 256B register pair, which moves 16B chunk
+// (o % 8) * 2 + o / 8 of the pair to chunk o (measured on A100, VLEN 1024); doing it here leaves the kernel only
+// the loads.
+static void q8_0x32_prearrange(ggml_tensor * t) {
+    block_q8_0x32 * blk = (block_q8_0x32 *) t->data;
+    const int64_t   n   = (ggml_nrows(t) + 31) / 32 * (t->ne[0] / QK8_0);
+    static_assert(sizeof(blk->qs) == 4 * 256, "q8_0x32 data is four 256B register pairs");
+    for (int64_t i = 0; i < n; i++) {
+        for (int p = 0; p < 4; p++) {
+            uint8_t * pair = blk[i].qs + p * 256;
+            uint8_t   tmp[256];
+            for (int o = 0; o < 16; o++) {
+                memcpy(tmp + o * 16, pair + ((o % 8) * 2 + o / 8) * 16, 16);
+            }
+            memcpy(pair, tmp, sizeof(tmp));
+        }
+    }
+}
+
+static int q8_0x32_finish(ggml_tensor * t, int ret) {
+    if (ret == 0 && spacemit_kernels::q8_prearranged_enabled()) {
+        q8_0x32_prearrange(t);
+    }
+    return ret;
+}
+
+// Q5_0 -> Q8_0 at load time, exact: Q5_0 value d * (q - 16) with q in [0, 31] is Q8_0 with the same d and
+// qs = q - 16. The result is repacked like a Q8_0 tensor and runs on the Q8_0 IME kernels.
+int repack_q5_0_to_q8_0_32(ggml_tensor * t, const void * data, size_t data_size) {
+    GGML_ASSERT(t->type == GGML_TYPE_Q5_0);
+    const int64_t nblocks = ggml_nrows(t) * (t->ne[0] / QK5_0);
+    GGML_ASSERT(t->ne[0] % QK5_0 == 0);
+    GGML_ASSERT(data_size == (size_t) nblocks * sizeof(block_q5_0));
+
+    const block_q5_0 *      src = (const block_q5_0 *) data;
+    std::vector<block_q8_0> q8(nblocks);
+    for (int64_t i = 0; i < nblocks; i++) {
+        uint32_t qh;
+        memcpy(&qh, src[i].qh, sizeof(qh));
+        q8[i].d = src[i].d;
+        for (int j = 0; j < QK5_0 / 2; j++) {
+            const uint8_t xh_0 = ((qh >> (j + 0)) << 4) & 0x10;
+            const uint8_t xh_1 = ((qh >> (j + 12))) & 0x10;
+            q8[i].qs[j]             = (int8_t) (((src[i].qs[j] & 0x0F) | xh_0) - 16);
+            q8[i].qs[j + QK5_0 / 2] = (int8_t) (((src[i].qs[j] >> 4) | xh_1) - 16);
+        }
+    }
+    return q8_0x32_finish(t, repack_q8_0_to_q8_0_32_bl(t, 32, q8.data(), q8.size() * sizeof(block_q8_0)));
+}
+
+// F32 weights (the MoE router) quantized to Q8_0 rows at load time, then laid out as Q8_0 32x32
+int repack_f32_to_q8_0_32(ggml_tensor * t, const void * data, size_t data_size) {
+    GGML_ASSERT(t->type == GGML_TYPE_F32);
+    GGML_ASSERT(t->ne[0] % QK8_0 == 0);
+    const int64_t nrows = ggml_nrows(t);
+    GGML_ASSERT(data_size == (size_t) nrows * t->ne[0] * sizeof(float));
+    const int64_t           nb = t->ne[0] / QK8_0;
+    std::vector<block_q8_0> q8(nrows * nb);
+    for (int64_t r = 0; r < nrows; r++) {
+        quantize_row_q8_0_ref((const float *) data + r * t->ne[0], q8.data() + r * nb, t->ne[0]);
+    }
+    return q8_0x32_finish(t, repack_q8_0_to_q8_0_32_bl(t, 32, q8.data(), q8.size() * sizeof(block_q8_0)));
+}
+
 template <> int repack<block_q8_0, 32, 32>(ggml_tensor * t, const void * data, size_t data_size) {
 #if 1
-    return repack_q8_0_to_q8_0_32_bl_ref(t, 32, data, data_size);
+    return q8_0x32_finish(t, repack_q8_0_to_q8_0_32_bl_ref(t, 32, data, data_size));
 #else
     return repack_q8_0_to_q8_0_32_bl(t, 32, data, data_size);
 #endif
