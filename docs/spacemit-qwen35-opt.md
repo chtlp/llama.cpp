@@ -4,7 +4,8 @@
 
 - 测试环境：`k3-dev-006`，8×A100 @1.8 GHz，legacy CPU IME 路径（`GGML_SPACEMIT_BACKEND=0 -ngl 0`），FP16 KV，`-t 8 -fa on -mmp 0 -b 2048 -ub 512`。
 - 主要模型：bartowski `Qwen_Qwen3.6-35B-A3B-Q4_0.gguf`（`qwen35moe`：40 层，30 层 Gated DeltaNet + 10 层全注意力，head_dim 256，256 专家激活 8 个，带 1 层 MTP）。部分改动也在 Qwen3-30B-A3B Q4_0 上测过。
-- 所有改动只在 legacy CPU 路径（`ggml-cpu/spacemit`）上，独立 `ggml-spacemit` 后端未改动。
+- 第 1～4 节的改动都在 legacy CPU 路径（`ggml-cpu/spacemit`）上。
+- **2026-10-17 更新**：分支 `linpengt/qwen35-opt-rebase` 是本分支 rebase 到 `mtmd-backend` `6df9f7504` 的版本，并把这些优化移植到了独立 `ggml-spacemit` 后端（`-dev SPACEMIT0 -ngl 99`），见第 0 节。
 
 ## 结论
 
@@ -21,6 +22,65 @@
 ² MTP 数字使用 lm_head 改为 Q4_0 的模型变体（`-shexpq8-lmq4`），用 llama-server `--spec-type draft-mtp --spec-draft-n-max 1` 测得。
 
 Qwen3-30B-A3B（只覆盖 Qwen3 阶段的改动）：pp512 54.0 → **76.9**（+42%），pp2048 39.4 → **57.9**（+47%），decode 不变（tg64 约 12.1）。
+
+## 0. rebase 与独立后端（`linpengt/qwen35-opt-rebase`，2026-10-17）
+
+**rebase**：32 个提交 rebase 到 `mtmd-backend` `6df9f7504`（1594 个上游提交）。
+
+- 冲突：`repack.cpp` 两处（上游新增 X60 的 Q8_0 IME1 repack，两边都保留）；`compute_forward` 里的 Q5_0 case 和上游 #26792 重复，已在引入它的提交里改掉。
+- legacy 路径 rebase 前后对比：
+
+  | | rebase 前 | rebase 后 |
+  |---|---:|---:|
+  | pp512（t/s） | 121.1 | 124.2 |
+  | pp2048 | 110.9 | 112.6 |
+  | tg32 | 8.82 | 8.82 |
+
+- 贪心输出逐字相同。KLD 0.0051 全部来自上游 #28068：GDN 的 q/k 归一化改为 eps 在根号内的 `rms_norm` + `scale`，与 FLA 参考实现一致；把这一行改回后 KLD 是 0.0001。这个改动让 RVV L2_NORM 对 Qwen3.6 不再生效，归一化多约 0.04 ms/token。
+
+**新增 `7f47630a9`**：lm_head Q6_K → Q4_0 在加载时转换（`GGML_SPACEMIT_LM_Q4=1`，默认关）。用原始 GGUF 就能得到 `-shexpq8-lmq4` 文件的 decode 速度（tg32 9.41 t/s；Q6_K 的 lm_head 是 8.82），贪心输出与该文件相同。
+
+**独立后端**：上游原版加 Q5_0 分派修复后，pp512 是 35.7 t/s，与我们优化之前的 legacy（35.3）相当。trace 显示瓶颈全部在 kernel：
+
+| 算子 | ms/token |
+|---|---:|
+| 转置 concat（标量） | 4.9 |
+| 逐 token 递推的 GDN | 4.3 |
+| 标量 FA（head_dim 256 不支持） | 3.3 |
+| 原版 MoE / dense 矩阵乘 | 11.2 |
+| 标量 ssm_conv | 1.8 |
+
+图被 MoE 路由的 ARGSORT/CLAMP 切成 163 段，但这部分只占约 0.6 ms/token，不是主因。
+
+独立后端的 `ime2_kernels.cpp`、`repack.cpp`、`ime_kernels.h` 与 legacy 原版逐字节相同，`ime.cpp` 的矩阵乘类只是接口不同（`params` → `ctx`），所以按以下 7 个提交移植。每步都在同一 binary 上与 legacy 对比，贪心输出都逐字相同：
+
+| 提交 | 内容 | pp512 |
+|---|---|---:|
+| `28d9ecbc3` | Q5_0 分派（不补就跑不起来） | 35.7 |
+| `da18597d0` | RVV 转置 concat、ssm_conv | 44.6 |
+| `6b6506a87` | FA head_dim ≤ 256 | 51.7 |
+| `de2e9ad1d` | 分块 GDN | 61.0 |
+| `5013fc6fb` | legacy 矩阵乘类整体移植（m8、A 对齐、Q8_0 预排、MoE m4/m8、路由 Q8_0、Q5_0 → Q8_0、lm_head Q4_0） | 102.6 |
+| `5bc2583a3` | 图级融合（concat → ssm_conv、MoE 路由权重、RMS_NORM + MUL），在主机上于 launch 之前决定 | 127.3 |
+| `a6f7d2365` | ARGSORT、CLAMP 放到设备上（切图从 163 段降到 3 段，pp512 不变） | 127.0 |
+
+最终对比（同一 binary，各 2 次）：
+
+| | legacy | 独立后端 |
+|---|---:|---:|
+| pp512（t/s） | 123.8 | **127.4** |
+| pp2048 | 111.8 | **115.1** |
+| tg32 | 8.66 | **8.98** |
+| tg32，LM_Q4 | 9.35 | **9.52** |
+
+精度：独立后端对 legacy 的 KLD，`-c 512` 是 0.0066，`-c 2048` 是 0.0074（top-1 96.6%）。
+
+尚未移植：
+- split-KV decode FA 和 MTP 验证（`9f1f5f143`、`cac4ebc65`），长上下文 decode 和 MTP 要单独比较；
+- `GGML_OP_STATS` 子阶段计时；
+- GDN 的 IME 版本（legacy 上默认关）。
+
+另外，上游的 trace 分析器（`GGML_BUILD_PROFILE`）只能用静态库构建：`ggml-profile.h` 的函数没有 `GGML_API`。静态构建又不能同时开两个后端，因为两边的 `spacemit_kernels::*` 符号同名。
 
 ## 1. 改动
 
