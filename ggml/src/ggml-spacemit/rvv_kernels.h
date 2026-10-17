@@ -113,6 +113,10 @@ void forward_gated_delta_net(ggml::spacemit::context & ctx, ggml_tensor * op);
 bool forward_concat_dim0_transposed_f32(ggml::spacemit::context & ctx, ggml_tensor * op, int64_t col0);
 // ssm_conv, d_conv == 4, vectorized over channels
 bool forward_ssm_conv_f32(ggml::spacemit::context & ctx, ggml_tensor * dst);
+// ssm_conv reading its concat(conv_states, transpose(qkv)) inputs directly (fused conv)
+bool forward_ssm_conv_concat_f32(ggml::spacemit::context & ctx, ggml_tensor * dst);
+// RMS_NORM followed by MUL with a weight row, written to the MUL's dst
+void forward_rms_norm_mul_f32(ggml::spacemit::context & ctx, const ggml_tensor * rms, ggml_tensor * mul);
 
 template <ggml_op op_type, typename T> void forward_binary(ggml::spacemit::context & ctx, ggml_tensor * op);
 

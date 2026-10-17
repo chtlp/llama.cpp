@@ -515,10 +515,26 @@ static ggml_status ggml_backend_spacemit_graph_compute(ggml_backend_t backend, g
     ggml_tensor ** nodes   = graph->nodes;
     int             n_nodes = graph->n_nodes;
 
+    // host-side fusion decisions: concat -> ssm_conv and MoE routing weights (recorded in op_params), and
+    // RMS_NORM + MUL pairs run as one kernel (the MUL node is then skipped)
+    ggml_spacemit_graph_prepare(graph);
+    std::vector<uint8_t> fuse_rms_mul(n_nodes, 0);
+    {
+        static const enum ggml_op rms_mul_ops[] = { GGML_OP_RMS_NORM, GGML_OP_MUL };
+        for (int i = 0; i + 1 < n_nodes; ++i) {
+            if (nodes[i]->op == GGML_OP_RMS_NORM && ggml_can_fuse(graph, i, rms_mul_ops, 2) &&
+                ggml_spacemit_rms_norm_mul_supported(nodes[i], nodes[i + 1])) {
+                fuse_rms_mul[i] = 1;
+                ++i;
+            }
+        }
+    }
+    const uint8_t * fuse_rms = fuse_rms_mul.data();
+
     auto * contexts = sess->contexts.data();
     auto fut = stream.launch(
         spert::Grid{(uint32_t)n_threads},
-        [nodes, n_nodes, workspace_size = sess->workspace_size, workspace, contexts,
+        [nodes, n_nodes, fuse_rms, workspace_size = sess->workspace_size, workspace, contexts,
          shared_mem_size = spert::backend_info().shared_mem_size](spert::Context * runtime) {
             // Match the old ggml-cpu/spacemit path: use the complete
             // worker-local TCM buffer directly.  alloc_shared() is a
@@ -542,6 +558,14 @@ static ggml_status ggml_backend_spacemit_graph_compute(ggml_backend_t backend, g
                 }
 
                 ggml_profile_log_spacemit_op_begin(node, (int) ith, (int) runtime->grid_dim(0));
+
+                if (fuse_rms[i]) {
+                    ggml_spacemit_rms_norm_mul(ctx, node, nodes[i + 1]);
+                    ggml_profile_log_spacemit_op_end(node, (int) ith, (int) runtime->grid_dim(0));
+                    ctx.sync();
+                    ++i;  // the MUL
+                    continue;
+                }
 
                 if (!ggml_spacemit_compute_forward(ctx, node)) {
                     throw std::runtime_error(std::string("ggml-spacemit: failed to dispatch op ") +

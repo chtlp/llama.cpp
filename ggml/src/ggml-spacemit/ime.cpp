@@ -2051,6 +2051,19 @@ class tensor_traits_common : public ggml::spacemit::tensor_traits_base {
                         return false;
                 }
             case GGML_OP_MUL:
+                if (mul_is_fused_moe_w(op)) {
+                    // src0 already holds the weighted rows (MUL_MAT_ID applied them, see graph_prepare_fusions)
+                    if (op->data != op->src[0]->data) {
+                        const size_t n  = ggml_nbytes(op);
+                        const size_t dn = (n / ctx.nth + 63) & ~(size_t) 63;
+                        const size_t b0 = std::min(n, dn * ctx.ith);
+                        const size_t b1 = std::min(n, b0 + dn);
+                        if (b1 > b0) {
+                            memcpy((char *) op->data + b0, (const char *) op->src[0]->data + b0, b1 - b0);
+                        }
+                    }
+                    return true;
+                }
                 switch (op->src[0]->type) {
                     case GGML_TYPE_F32:
                         spacemit_kernels::rvv::forward_binary<GGML_OP_MUL, float>(ctx, op);
@@ -2251,7 +2264,9 @@ class tensor_traits_common : public ggml::spacemit::tensor_traits_base {
                 return true;
             case GGML_OP_CONCAT:
                 {
-                    if (spacemit_kernels::rvv::forward_concat_dim0_transposed_f32(ctx, op, 0)) {
+                    // fused with the ssm_conv: only the trailing columns read back through views are written
+                    const int32_t fused_col = ggml_get_op_params_i32(op, FUSE_P_STATE);
+                    if (spacemit_kernels::rvv::forward_concat_dim0_transposed_f32(ctx, op, fused_col > 0 ? fused_col - 1 : 0)) {
                         return true;
                     }
                     const int32_t dim = ggml_get_op_params_i32(op, 0);
@@ -2300,6 +2315,13 @@ class tensor_traits_common : public ggml::spacemit::tensor_traits_base {
                 spacemit_kernels::rvv::forward_gated_delta_net(ctx, op);
                 return true;
             case GGML_OP_SSM_CONV:
+                if (op->src[0]->op == GGML_OP_CONCAT && ggml_get_op_params_i32(op->src[0], FUSE_P_STATE) > 0) {
+                    // the concat only materialized its trailing columns; read its inputs directly
+                    if (!spacemit_kernels::rvv::forward_ssm_conv_concat_f32(ctx, op)) {
+                        GGML_ABORT("fused ssm_conv: unsupported shape");
+                    }
+                    return true;
+                }
                 if (!spacemit_kernels::rvv::forward_ssm_conv_f32(ctx, op)) {
                     spacemit_kernels::scalar::forward_ssm_conv_f32(ctx, op);
                 }
@@ -2704,6 +2726,27 @@ size_t ggml_spacemit_nbytes(ggml_backend_buffer_type_t buft, const ggml_tensor *
     }
 
     return nbytes;
+}
+
+// Graph-level fusions (concat -> ssm_conv, MoE routing weights), decided on the host before the graph launch.
+void ggml_spacemit_graph_prepare(ggml_cgraph * cgraph) {
+    ggml::cpu::riscv64_spacemit::graph_prepare_fusions(cgraph);
+}
+
+// RMS_NORM rms followed by MUL mul (rms, weight): true if the pair can run as one fused kernel
+bool ggml_spacemit_rms_norm_mul_supported(const ggml_tensor * rms, const ggml_tensor * mul) {
+    if (!ggml::cpu::riscv64_spacemit::rvv_rms_mul_enabled() || ggml::cpu::riscv64_spacemit::rvv_op_disabled(rms) ||
+        mul->op != GGML_OP_MUL || (mul->src[0] != rms && mul->src[1] != rms)) {
+        return false;
+    }
+    const ggml_tensor * w = mul->src[0] == rms ? mul->src[1] : mul->src[0];
+    return rms->src[0]->type == GGML_TYPE_F32 && rms->src[0]->nb[0] == sizeof(float) && mul->type == GGML_TYPE_F32 &&
+           mul->nb[0] == sizeof(float) && w->type == GGML_TYPE_F32 && w->nb[0] == sizeof(float) &&
+           w->ne[0] == rms->ne[0] && ggml_are_same_shape(rms->src[0], mul);
+}
+
+void ggml_spacemit_rms_norm_mul(ggml::spacemit::context & ctx, ggml_tensor * rms, ggml_tensor * mul) {
+    spacemit_kernels::rvv::forward_rms_norm_mul_f32(ctx, rms, mul);
 }
 
 const ggml::spacemit::tensor_traits_base * ggml_spacemit_get_tensor_traits(const ggml_tensor * op) {
