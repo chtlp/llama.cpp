@@ -14,27 +14,36 @@
 - 模型：bartowski `Qwen_Qwen3.6-35B-A3B-Q4_0.gguf`，原始 GGUF，不需要重新量化。
 - 参数：`GGML_SPACEMIT_BACKEND=1 -dev SPACEMIT0 -ngl 99 -t 8 -fa 1 -lm none -b 2048 -ub 512`。
 
-| | 本分支基线（`6df9f7504` + Q5_0 分派修复） | 本分支 |
+| | 基线（`6df9f7504` + Q5_0 分派修复） | 本分支（`37acff6dd`） |
 |---|---:|---:|
-| pp512（t/s） | 35.7 | **127.4** |
-| pp2048 | 23.5 | **115.1** |
-| tg32 | 7.4 | **9.0** |
-| tg32，上下文 4K / 8K | 6.9 / 5.2（其余移植后、split-KV 前） | **7.9 / 7.2** |
-| MTP（`draft-mtp`，n-max 1），4K / 8K | — | **9.9 / 9.0** |
+| pp512（t/s） | 34.29 ± 0.17 | **126.37** ± 0.12 |
+| pp2048 | 23.50 ± 0.01 | **115.27** ± 0.18 |
+| tg32 | 7.40 ± 0.15 | **8.85** ± 0.15 |
+| tg32，上下文 4096 / 8192 | — | **8.26 / 7.27** |
 
 - 不修 Q5_0 分派时，`6df9f7504` 原样运行这个模型会中止：`failed to dispatch op MUL_MAT (f32)`。
-- MTP 一行用了 `GGML_SPACEMIT_LM_Q4=1`。
+- 基线没有测长上下文。作为参考，除 split-KV 外全部移植后、`GGML_SPACEMIT_FA_SPLITKV=0` 时是 6.85 / 5.24。
+- 两列来自不同时间的运行，每项 2 次（深度测试 1 次）。
+
+MTP（llama-server，`--spec-type draft-mtp --spec-draft-n-max 1`，贪心 192 token，`GGML_SPACEMIT_LM_Q4=1`；t/s；在同时开两个后端的构建上测，独立后端代码与本分支相同）：
+
+| 上下文（token） | 不开 MTP | MTP（接受 / 草稿） |
+|---|---:|---:|
+| 30 | 9.58 | 10.16（82/109） |
+| 3979 | 8.64 | 9.86（88/102） |
+| 8154 | 7.67 | 8.95（89/102） |
+
 - 精度：每个提交都用同一构建里的 legacy 路径（`GGML_SPACEMIT_BACKEND=0 -ngl 0`）对比。
   - 96 token 贪心输出每步都逐字相同。
   - `-t 2` 与 `-t 8` 逐字相同。
-  - 最终 KLD：`-c 512` 是 0.0066，`-c 2048` 是 0.0074（top-1 96.6%）。两条路径的 RMS_NORM、softmax、RoPE、FA 实现不同，这个量级是正常的数值差。
+  - 最终 KLD：`-c 512` 是 0.0066（top-1 92.4%），`-c 2048 -ub 512` 是 0.0074（top-1 96.6%）。两条路径的 RMS_NORM、softmax、RoPE、FA 实现不同，这个量级是正常的数值差。
 
 ## 提交
 
 | 提交 | 内容 | pp512 |
 |---|---|---:|
 | qwen35/qwen3next: keep the conv-state concat inputs alive until ssm_conv | 把 concat 的两个输入挂到 SSM_CONV 的额外 src 上，让分配器保留到 conv 为止，后端才能直接读它们（下面的 concat → ssm_conv 融合依赖这一点；不读额外 src 的后端不受影响） | — |
-| dispatch Q5_0 MUL_MAT / MUL_MAT_ID | `compute_forward` 漏了 Q5_0（`supports_op` 和 repack 都接受），Qwen3.6 的共享专家是 Q5_0 | 35.7 |
+| dispatch Q5_0 MUL_MAT / MUL_MAT_ID | `compute_forward` 漏了 Q5_0（`supports_op` 和 repack 都接受），Qwen3.6 的共享专家是 Q5_0 | 34.3～35.7 |
 | RVV transposed concat and ssm_conv | conv 状态的 concat 原来是标量逐元素拷贝（4.9 ms/token），ssm_conv 是标量（1.8 ms/token） | 44.6 |
 | flash attention for head_dim up to 256 | RVV FA 只支持 head_dim ≤ 128；Qwen3.6 是 256，退回标量 FA（3.3 ms/token） | 51.7 |
 | chunkwise gated delta net for prefill | prefill 原来逐 token 递推（4.3 ms/token），改为 chunk 16 的分块形式，全部是 4 行分块的 RVV fp32 矩阵乘 | 61.0 |
@@ -84,12 +93,20 @@
 ## 复现
 
 ```bash
-cmake -B build-k3 -DCMAKE_BUILD_TYPE=Release -DGGML_SPACEMIT=ON -DSPERT_DIR=<spine-runtime> \
-  -DGGML_CPU_REPACK=OFF -DGGML_RVV=ON -DGGML_RV_ZVFH=ON -DGGML_RV_ZFH=ON -DGGML_RV_ZICBOP=ON \
-  -DGGML_RV_ZIHINTPAUSE=ON -DGGML_RV_ZBA=ON -DCMAKE_TOOLCHAIN_FILE=$PWD/cmake/riscv64-spacemit-linux-gnu-gcc.cmake
-cmake --build build-k3 --target llama-bench llama-completion
-GGML_SPACEMIT_BACKEND=1 GGML_SPACEMIT_WORKERS=8 build-k3/bin/llama-bench -m Qwen_Qwen3.6-35B-A3B-Q4_0.gguf \
-  -dev SPACEMIT0 -ngl 99 -t 8 -fa 1 -lm none -b 2048 -ub 512 -p 512,2048 -n 32
+SPERT=/home/linpengt/spine-runtime.riscv64.0.6.3
+M=/home/linpengt/models/Qwen_Qwen3.6-35B-A3B-GGUF/Qwen_Qwen3.6-35B-A3B-Q4_0.gguf
+cmake -B build-k3 -DCMAKE_BUILD_TYPE=Release -DGGML_SPACEMIT=ON -DSPERT_DIR=$SPERT \
+  -DGGML_CPU_REPACK=OFF -DLLAMA_OPENSSL=OFF -DGGML_RVV=ON -DGGML_RV_ZVFH=ON -DGGML_RV_ZFH=ON \
+  -DGGML_RV_ZICBOP=ON -DGGML_RV_ZIHINTPAUSE=ON -DGGML_RV_ZBA=ON -DLLAMA_BUILD_UI=OFF -DLLAMA_BUILD_EXAMPLES=OFF \
+  -DLLAMA_BUILD_TESTS=OFF -DCMAKE_TOOLCHAIN_FILE=$PWD/cmake/riscv64-spacemit-linux-gnu-gcc.cmake
+cmake --build build-k3 --parallel 8 --target llama-bench llama-completion llama-perplexity
+export LD_LIBRARY_PATH=$SPERT/lib GGML_SPACEMIT_WORKERS=8 GGML_SPACEMIT_BACKEND=1
+build-k3/bin/llama-bench -m $M -dev SPACEMIT0 -ngl 99 -t 8 -fa 1 -lm none -b 2048 -ub 512 -p 512,2048 -n 32 -r 2 -o jsonl
+build-k3/bin/llama-bench -m $M -dev SPACEMIT0 -ngl 99 -t 8 -fa 1 -lm none -b 2048 -ub 512 -p 0 -n 32 -d 4096,8192 -r 1 -o jsonl
 ```
+
+以上是板上实际运行的命令。正确性（贪心输出、KLD）和 MTP 的命令及原始日志见 PR 说明（chtlp/llama.cpp#1）。
+
+结果在 `37acff6dd` 上测得。之后的 `common : drop the stale duplicate -lm/--load-mode option` 只改 `common/arg.cpp`（`mtmd-backend` 合并上游时留下了两份 `-lm` 定义，`test-arg-parser` 失败），没有重跑板上测试。
 
 完整的测试脚本和原始输出：[chtlp/edge-ai-exp](https://github.com/chtlp/edge-ai-exp) `bench-results/k3/20261017-k3-dev006-qwen36-standalone-port/`（逐步对比、最终对比、decode/MTP）和 `20261017-k3-dev006-qwen36-standalone-backend/`（移植前的逐算子 trace）。
