@@ -1430,7 +1430,6 @@ void forward_flash_attn_ext_f16_split_kv_partial_vlen1024_vf16(ggml::spacemit::c
     }
 
     const int64_t chunk  = (n_kv + n_chunks - 1) / n_chunks;
-    const int64_t stride = n_chunks * (2 + DV);
 
     std::array<float *, 16> pq;
     std::array<float *, 16> pr;
