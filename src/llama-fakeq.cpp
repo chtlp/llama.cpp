@@ -14,7 +14,8 @@
 #include <thread>
 #include <vector>
 
-enum fakeq_fmt { FQ_NONE, FQ_Q4_0, FQ_MXFP4, FQ_MXFP4B, FQ_NVFP4, FQ_MXFP8 };
+enum fakeq_fmt { FQ_NONE, FQ_Q4_0, FQ_MXFP4, FQ_MXFP4B, FQ_NVFP4, FQ_MXFP8,
+                 FQ_INT4U, FQ_INT4_E4M3, FQ_INT4_E4M3_G16, FQ_SCALE_E4M3 };
 
 static fakeq_fmt fakeq_parse(const char * name, const char * s) {
     if (!s || !*s) {
@@ -26,6 +27,10 @@ static fakeq_fmt fakeq_parse(const char * name, const char * s) {
     if (v == "mxfp4b") { return FQ_MXFP4B; }
     if (v == "nvfp4")  { return FQ_NVFP4; }
     if (v == "mxfp8")  { return FQ_MXFP8; }
+    if (v == "int4u")          { return FQ_INT4U; }          // int4, unsigned FP16 scale per 32
+    if (v == "int4_e4m3")      { return FQ_INT4_E4M3; }      // int4, UE4M3 scale per 32 + FP32 global
+    if (v == "int4_e4m3_g16")  { return FQ_INT4_E4M3_G16; }  // same, per 16
+    if (v == "scale_e4m3")     { return FQ_SCALE_E4M3; }     // Q4_0/Q4_1 tensors: block scale d -> E4M3
     GGML_ABORT("%s: unknown format '%s'", name, s);
 }
 
@@ -138,6 +143,24 @@ static void fq_nvfp4(float * x, int64_t n, float g) {
     }
 }
 
+// INT4 (-8..7) with an unsigned block scale: the largest-magnitude element maps to -8 if negative,
+// +7 if positive. The scale is FP16, or UE4M3 relative to an FP32 global g (amax / (7 * 448)).
+static void fq_int4u(float * x, int64_t n, int bs, bool e4m3_scale, float g) {
+    for (int64_t b = 0; b < n; b += bs) {
+        float * y = x + b;
+        float mx = 0.0f;
+        for (int j = 0; j < bs; j++) {
+            if (fabsf(mx) < fabsf(y[j])) { mx = y[j]; }
+        }
+        float d = mx < 0 ? -mx / 8 : mx / 7;
+        d = e4m3_scale ? (g ? e4m3(d / g) * g : 0.0f) : ggml_fp16_to_fp32(ggml_fp32_to_fp16(d));
+        const float id = d ? 1.0f / d : 0.0f;
+        for (int j = 0; j < bs; j++) {
+            y[j] = std::clamp(nearbyintf(y[j] * id), -8.0f, 7.0f) * d;
+        }
+    }
+}
+
 static void fq_row(fakeq_fmt f, float * x, int64_t n, float g) {
     switch (f) {
         case FQ_Q4_0:   fq_q4_0(x, n); break;
@@ -145,6 +168,9 @@ static void fq_row(fakeq_fmt f, float * x, int64_t n, float g) {
         case FQ_MXFP4B: fq_mx(x, n, false, true);  break;
         case FQ_MXFP8:  fq_mx(x, n, true,  false); break;
         case FQ_NVFP4:  fq_nvfp4(x, n, g); break;
+        case FQ_INT4U:         fq_int4u(x, n, 32, false, 0.0f); break;
+        case FQ_INT4_E4M3:     fq_int4u(x, n, 32, true, g * 6.0f / 7.0f); break;
+        case FQ_INT4_E4M3_G16: fq_int4u(x, n, 16, true, g * 6.0f / 7.0f); break;
         default: break;
     }
 }
@@ -166,6 +192,41 @@ void llama_fakeq_weight(ggml_tensor * t) {
     }
     const char * pat = getenv("LLAMA_FAKEQ_W_PAT");
     if (!strstr(ggml_get_name(t), pat && *pat ? pat : "_exps.weight")) {
+        return;
+    }
+    if (f == FQ_SCALE_E4M3) {
+        // existing Q4_0 / Q4_1 weights: keep the int4 codes, round each block scale d to E4M3
+        // relative to a per-matrix FP32 global (max |d| / 448); the sign of d is kept and Q4_1's min stays FP16
+        if (t->type != GGML_TYPE_Q4_0 && t->type != GGML_TYPE_Q4_1) {   // e.g. the Q8_0 MTP layer
+            LLAMA_LOG_WARN("%s: skip %s (type %s)\n", __func__, ggml_get_name(t), ggml_type_name(t->type));
+            return;
+        }
+        const size_t bsz   = t->type == GGML_TYPE_Q4_0 ? 18 : 20;
+        const int64_t nblk = t->ne[0] / 32 * t->ne[1];   // blocks per matrix
+        const int64_t nmat = ggml_nrows(t) / t->ne[1];
+        double err = 0.0, ref = 0.0;
+        for (int64_t e = 0; e < nmat; e++) {
+            uint8_t * base = (uint8_t *) t->data + (size_t) e * nblk * bsz;
+            float dmax = 0.0f;
+            for (int64_t i = 0; i < nblk; i++) {
+                dmax = std::max(dmax, fabsf(ggml_fp16_to_fp32(*(ggml_fp16_t *) (base + i * bsz))));
+            }
+            const float g = dmax / 448.0f;
+            for (int64_t i = 0; i < nblk; i++) {
+                ggml_fp16_t * pd = (ggml_fp16_t *) (base + i * bsz);
+                const float d  = ggml_fp16_to_fp32(*pd);
+                const float dq = g ? e4m3(d / g) * g : 0.0f;
+                err += (double) (dq - d) * (dq - d);
+                ref += (double) d * d;
+                *pd = ggml_fp32_to_fp16(dq);
+            }
+        }
+        std::lock_guard<std::mutex> lk(fakeq_mtx);
+        fakeq_n_tensors++;
+        fakeq_err += err;   // NMSE of the block scales, not of the weights
+        LLAMA_LOG_WARN("%s: scale_e4m3 #%d %s (%s), scale NMSE %.3e\n", __func__, fakeq_n_tensors,
+                ggml_get_name(t), ggml_type_name(t->type), ref > 0 ? err / ref : 0.0);
+        fakeq_ref += ref;
         return;
     }
     if (t->type != GGML_TYPE_BF16 && t->type != GGML_TYPE_F32) {
@@ -255,6 +316,6 @@ ggml_tensor * llama_fakeq_act(ggml_context * ctx, ggml_tensor * cur) {
     if (f == FQ_NONE) {
         return cur;
     }
-    GGML_ASSERT(f != FQ_Q4_0 && f != FQ_MXFP4B);
+    GGML_ASSERT(f == FQ_MXFP4 || f == FQ_NVFP4 || f == FQ_MXFP8);
     return ggml_map_custom1(ctx, cur, fakeq_act_op, GGML_N_TASKS_MAX, (void *) (intptr_t) f);
 }
