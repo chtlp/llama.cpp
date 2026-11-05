@@ -2,6 +2,8 @@
 
 void llama_model_qwen3vl::load_arch_hparams(llama_model_loader & ml) {
     ml.get_key(LLM_KV_NUM_DEEPSTACK_LAYERS, hparams.n_deepstack_layers, false);
+    // GR00T: the GGUF is a feature-extractor header, not a runnable text model.
+    ml.get_key("groot.fused_prefill_only", groot_fused_prefill_only, false);
     ml.get_key_or_arr(LLM_KV_ROPE_DIMENSION_SECTIONS, hparams.rope_sections, 4, true);
     ml.get_key(LLM_KV_ATTENTION_LAYERNORM_RMS_EPS, hparams.f_norm_rms_eps);
 
@@ -34,6 +36,10 @@ void llama_model_qwen3vl::load_arch_tensors(llama_model_loader &) {
 
     // output rerank head
     cls_out = create_tensor(tn(LLM_TENSOR_CLS_OUT, "weight"), {n_embd, hparams.n_cls_out}, TENSOR_NOT_REQUIRED);
+
+    if (groot_fused_prefill_only) {
+        return;
+    }
 
     for (int i = 0; i < n_layer; ++i) {
         auto & layer = layers[i];
@@ -68,6 +74,17 @@ llama_model_qwen3vl::graph::graph(const llama_model & model, const llm_graph_par
 
     ggml_tensor * cur;
     ggml_tensor * inpL;
+
+    if (model.groot_fused_callback) {
+        ggml_tensor * input     = build_inp_embd(model.tok_embd);
+        ggml_tensor * positions = build_inp_pos();
+        ggml_tensor * output    = ggml_map_custom2(ctx0, input, positions,
+                model.groot_fused_callback, 1, model.groot_fused_user);
+        res->t_embd = output;
+        ggml_build_forward_expand(gf, output);
+        return;
+    }
+    GGML_ASSERT(!model.groot_fused_prefill_only);
 
     inpL = build_inp_embd(model.tok_embd);
 

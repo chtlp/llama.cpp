@@ -677,6 +677,12 @@ struct llama_hadamard {
 };
 
 struct llama_model {
+    // GR00T VLA: the GGUF carries only the token table and metadata; the private
+    // prefill kernel owns the 16 transformer layers and is invoked from the graph.
+    bool groot_fused_prefill_only = false;
+    ggml_custom2_op_t groot_fused_callback = nullptr;
+    void * groot_fused_user = nullptr;
+
     llm_type type = LLM_TYPE_UNKNOWN;
     llm_arch arch = LLM_ARCH_UNKNOWN;
 

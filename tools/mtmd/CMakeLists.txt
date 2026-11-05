@@ -170,3 +170,44 @@ if (LLAMA_BUILD_TOOLS)
     target_link_libraries(llama-mtmd-debug PRIVATE llama-common mtmd Threads::Threads)
     target_compile_features(llama-mtmd-debug PRIVATE cxx_std_17)
 endif()
+
+# ---------------------------------------------------------------------------
+# GR00T VLA end-to-end pipeline (llama backbone + external ONNX/EP stages)
+# ---------------------------------------------------------------------------
+option(LLAMA_GROOT_VLA "build the GR00T VLA pipeline tool" OFF)
+set(SPACEMIT_ORT_DIR "" CACHE PATH "ONNX Runtime install used by the GR00T VLA tool")
+
+if (LLAMA_GROOT_VLA)
+    if (NOT SPACEMIT_ORT_DIR)
+        message(FATAL_ERROR "LLAMA_GROOT_VLA requires SPACEMIT_ORT_DIR (an ONNX Runtime install)")
+    endif()
+    if (NOT EXISTS "${SPACEMIT_ORT_DIR}/include/onnxruntime/onnxruntime_cxx_api.h")
+        message(FATAL_ERROR "SPACEMIT_ORT_DIR must contain include/onnxruntime/onnxruntime_cxx_api.h")
+    endif()
+
+    set(TARGET llama-groot-vla)
+    add_executable(${TARGET}
+        groot/groot-vla.cpp
+        groot/groot-preprocess.cpp
+        groot/groot-ep.cpp
+        groot/groot-llm.cpp
+        groot/groot-glue.cpp)
+    set_target_properties(${TARGET} PROPERTIES OUTPUT_NAME llama-groot-vla)
+
+    target_link_libraries(${TARGET} PRIVATE llama mtmd Threads::Threads)
+    target_include_directories(${TARGET} PRIVATE
+        ${CMAKE_SOURCE_DIR}/src
+        ${SPACEMIT_ORT_DIR}/include/onnxruntime)
+    target_link_directories(${TARGET} PRIVATE ${SPACEMIT_ORT_DIR}/lib)
+    target_link_libraries(${TARGET} PRIVATE onnxruntime ${CMAKE_DL_LIBS})
+    target_compile_features(${TARGET} PRIVATE cxx_std_17)
+
+    # The fused prefill kernel is the baseline's RVV/IME code: it needs the IME
+    # extension and a fixed FP contract, like the baseline build.
+    if (CMAKE_SYSTEM_PROCESSOR MATCHES "riscv")
+        set_source_files_properties(groot/groot-llm.cpp PROPERTIES
+            COMPILE_OPTIONS "-march=rv64gcv_zfh_zvfh_zba_xsmtvdotii;-mabi=lp64d;-ffp-contract=off")
+        set_source_files_properties(groot/groot-glue.cpp PROPERTIES
+            COMPILE_OPTIONS "-march=rv64gcv_zfh_zvfh_zba;-mabi=lp64d;-ffp-contract=off")
+    endif()
+endif()
