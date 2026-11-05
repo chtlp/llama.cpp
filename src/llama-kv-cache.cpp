@@ -1,3 +1,4 @@
+#include <cstdlib>
 #include "llama-kv-cache.h"
 
 #include "llama-impl.h"
@@ -215,6 +216,17 @@ llama_kv_cache::llama_kv_cache(
 
         if (offload) {
             auto * dev = model.dev_layer(il);
+            // An ACCEL backend (ggml-spacemit) is not in model.devices, so
+            // dev_layer() reports the CPU for every layer even though the layer
+            // weights live in the accelerator buffer. Keeping the cache on the host
+            // then forces the KV store and its permutes onto the CPU, splitting the
+            // graph once more per layer. Follow the weights instead.
+            if (ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_CPU) {
+                auto * accel = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_ACCEL);
+                if (accel != nullptr) {
+                    dev = accel;
+                }
+            }
             buft = ggml_backend_dev_buffer_type(dev);
 
             dev_name = ggml_backend_dev_name(dev);
