@@ -28,7 +28,7 @@ public:
     GrootLlm & operator=(const GrootLlm &) = delete;
 
     bool load(const std::string & gguf, const std::string & weights_dir, int threads, int capacity,
-              std::string * error);
+              int n_gpu_layers, std::string * error);
     void close();
 
     int n_embd() const { return n_embd_; }

@@ -4,6 +4,7 @@ void llama_model_qwen3vl::load_arch_hparams(llama_model_loader & ml) {
     ml.get_key(LLM_KV_NUM_DEEPSTACK_LAYERS, hparams.n_deepstack_layers, false);
     // GR00T: the GGUF is a feature-extractor header, not a runnable text model.
     ml.get_key("groot.fused_prefill_only", groot_fused_prefill_only, false);
+    ml.get_key("groot.feature_extractor", groot_feature_extractor, false);
     ml.get_key_or_arr(LLM_KV_ROPE_DIMENSION_SECTIONS, hparams.rope_sections, 4, true);
     ml.get_key(LLM_KV_ATTENTION_LAYERNORM_RMS_EPS, hparams.f_norm_rms_eps);
 
@@ -178,6 +179,16 @@ llama_model_qwen3vl::graph::graph(const llama_model & model, const llm_graph_par
     }
 
     cur = inpL;
+
+    // A GR00T feature extractor stops here: the VLA head wants the post-block
+    // hidden state, and running the final norm plus a 152k-row lm_head would cost
+    // more than the whole 16-layer stack.
+    if (model.groot_feature_extractor) {
+        cb(cur, "result_norm", -1);
+        res->t_embd = cur;
+        ggml_build_forward_expand(gf, cur);
+        return;
+    }
 
     cur = build_norm(cur,
             model.output_norm, NULL,

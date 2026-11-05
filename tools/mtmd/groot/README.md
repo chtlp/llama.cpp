@@ -134,6 +134,41 @@ copy the 5 MiB embedding batch through an unreserved vector, which cost ~17 ms
 per decode; reserving it and reading the embedding buffer in bulk brings the
 LLM stage to ~151-154 ms.
 
+## LLM: fused prefill kernel vs llama.cpp's own graph
+
+`--native-llm <complete.gguf>` runs the 16 layers through llama.cpp's ggml
+graph; `scripts/pack_llm_full.py` writes such a GGUF from the LIBERO
+checkpoint. Measured on K3, 156-token prefill, SpacemiT backend where noted
+(`GGML_SPACEMIT=ON`, `GGML_SPACEMIT_BACKEND=1`, `--ngl 99`, 8 workers):
+
+| path | decode |
+|---|---:|
+| fused prefill kernel (production) | **150 ms** (kernel 138 ms) |
+| native ggml, Q4_0 + ggml-spacemit (PR#1 optimisations) | 804 ms |
+| native ggml, Q8_0 + ggml-spacemit | 1116 ms |
+| native ggml, Q8_0 + GGML_CPU_RISCV64_SPACEMIT (IME in ggml-cpu) | 2138-2325 ms |
+| native ggml, Q8_0 + generic CPU | 55438 ms |
+
+Two findings matter for judging PR#1:
+
+* **`--ngl` and the right backend are essential.** The SpacemiT device only
+  takes the weights with `GGML_SPACEMIT=ON` plus `--ngl 99`; without them the
+  tensors land on CPU and the run is 20-60x slower. Its Layer 0-15 weights do
+  end up in the SPACEMIT buffer (1409 MiB) once configured.
+* **The vocabulary head dominates a naive comparison.** The first native run
+  took 4.9 s because it projected all 152k vocabulary rows. GR00T consumes the
+  last hidden state, so `groot.feature_extractor` makes the graph stop before
+  the final RMS norm and lm_head; that single flag takes the run from 4.9 s to
+  1.1 s without changing what the VLA head reads.
+
+Why the fused kernel still wins by 5-7x: `perf` on the native path puts ~33% in
+`spert::detail::barrier_coro` and ~34% in the GEMM inner loop. The fused kernel
+issues ~2 grid barriers per block over the whole layer with weights resident in
+TCM, while the generic path launches every op across the worker pool and
+repacks Q8_0 into 32x32 tiles. PR#1's gains (10-14%% on Qwen2.5-0.5B, 3.7x on
+the MoE 35B) are real but they lift a generic graph from 709 to 807 tok/s; the
+custom kernel is already at ~1040 tok/s equivalent for this model shape.
+
 ## Why DiT gets faster and ViT does not
 
 Both use the same kernel source (the ViT header is byte-identical to the

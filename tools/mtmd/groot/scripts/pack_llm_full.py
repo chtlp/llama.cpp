@@ -39,7 +39,9 @@ def main():
     p.add_argument("--checkpoint", type=Path, required=True)
     p.add_argument("--template", type=Path, required=True, help="GGUF to copy tokenizer/metadata from")
     p.add_argument("--output", type=Path, required=True)
-    p.add_argument("--f16", action="store_true", help="keep weights fp16 instead of Q8_0")
+    quant = p.add_mutually_exclusive_group()
+    quant.add_argument("--f16", action="store_true", help="keep weights fp16 instead of Q8_0")
+    quant.add_argument("--q4", action="store_true", help="quantise to Q4_0 (the format PR#1 optimises)")
     a = p.parse_args()
 
     sys.path.insert(0, str(a.llama / "gguf-py"))
@@ -55,7 +57,10 @@ def main():
         writer.add_key_value(key, field.contents(), field.types[0],
                              field.types[1] if len(field.types) > 1 else None)
     writer.add_name("GR00T-N1.7-LIBERO-16L")
-    writer.add_file_type(gguf.LlamaFileType.MOSTLY_F16 if a.f16 else gguf.LlamaFileType.MOSTLY_Q8_0)
+    # The VLA head consumes the last hidden state, never vocabulary scores.
+    writer.add_bool("groot.feature_extractor", True)
+    writer.add_file_type(gguf.LlamaFileType.MOSTLY_F16 if a.f16 else
+                         gguf.LlamaFileType.MOSTLY_Q4_0 if a.q4 else gguf.LlamaFileType.MOSTLY_Q8_0)
 
     index = json.loads((a.checkpoint / "model.safetensors.index.json").read_text())["weight_map"]
     prefix = "backbone.model.model.language_model."
@@ -73,8 +78,8 @@ def main():
         elif a.f16 or dest == "token_embd.weight":
             writer.add_tensor(dest, w.astype(np.float16))
         else:
-            writer.add_tensor(dest, gguf.quants.quantize(w, gguf.GGMLQuantizationType.Q8_0),
-                              raw_dtype=gguf.GGMLQuantizationType.Q8_0)
+            qtype = gguf.GGMLQuantizationType.Q4_0 if a.q4 else gguf.GGMLQuantizationType.Q8_0
+            writer.add_tensor(dest, gguf.quants.quantize(w, qtype), raw_dtype=qtype)
         print(dest, flush=True)
 
     writer.write_header_to_file()

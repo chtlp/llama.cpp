@@ -680,6 +680,9 @@ struct llama_model {
     // GR00T VLA: the GGUF carries only the token table and metadata; the private
     // prefill kernel owns the 16 transformer layers and is invoked from the graph.
     bool groot_fused_prefill_only = false;
+    // GR00T consumes the last hidden state, not vocabulary scores: skip lm_head and
+    // return the state before the final RMSNorm, exactly what the VLA head expects.
+    bool groot_feature_extractor = false;
     ggml_custom2_op_t groot_fused_callback = nullptr;
     void * groot_fused_user = nullptr;
 

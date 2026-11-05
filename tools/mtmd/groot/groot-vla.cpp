@@ -298,6 +298,7 @@ struct Options {
     bool        dump     = false;
     bool        llm_only = false;
     std::string native_llm;  // complete GGUF: run the layers on llama.cpp's own graph
+    int         n_gpu_layers = 0;
     std::string embeds_dir;
     std::string pixels_file;
 };
@@ -320,6 +321,7 @@ bool parse(int argc, char ** argv, Options * o) {
         else if (a == "--dump") o->dump = true;
         else if (a == "--llm-only") o->llm_only = true;
         else if (a == "--native-llm") o->native_llm = next();
+        else if (a == "--ngl") o->n_gpu_layers = std::atoi(next().c_str());
         else if (a == "--embeds") o->embeds_dir = next();
         else if (a == "--pixels") o->pixels_file = next();
         else {
@@ -464,7 +466,7 @@ int main(int argc, char ** argv) {
     const auto t_llm_load = Clock::now();
     const std::string llm_path = opt.native_llm.empty() ? opt.gguf : opt.native_llm;
     const bool loaded = ai.call([&] {
-        return llm.load(llm_path, opt.llm_weights, opt.threads, 512, &error);
+        return llm.load(llm_path, opt.llm_weights, opt.threads, 512, opt.n_gpu_layers, &error);
     });
     if (!loaded) {
         std::fprintf(stderr, "[groot] LLM: %s\n", error.c_str());

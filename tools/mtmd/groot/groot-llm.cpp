@@ -52,7 +52,7 @@ void GrootLlm::close() {
 }
 
 bool GrootLlm::load(const std::string & gguf, const std::string & weights_dir, int threads,
-                    int capacity, std::string * error) {
+                    int capacity, int n_gpu_layers, std::string * error) {
     auto fail = [&](const std::string & message) {
         error_ = message;
         if (error) {
@@ -67,7 +67,9 @@ bool GrootLlm::load(const std::string & gguf, const std::string & weights_dir, i
     capacity_ = capacity;
 
     auto model_params = llama_model_default_params();
-    model_params.n_gpu_layers = 0;
+    // 0 keeps every layer on the host; a large value offloads to the first
+    // accelerator backend (the SpacemiT device when GGML_SPACEMIT is built in).
+    model_params.n_gpu_layers = n_gpu_layers;
     model_ = llama_model_load_from_file(gguf.c_str(), model_params);
     if (!model_) {
         return fail("llama_model_load_from_file failed: " + gguf);
