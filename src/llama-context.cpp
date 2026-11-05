@@ -2867,14 +2867,45 @@ llm_graph_cb llama_context::graph_get_cb() const {
         // - norm may be automatically assigned to the backend of the previous layer, increasing data transfer between backends
         // - force the last op of the layer on the specified backend to avoid running it on the backend of the next layer due to scheduling
         // FIXME: fix in ggml_backend_sched
+        //
+        // The pin below assumes dev_layer(il) is the device the layer's weights live
+        // on. That holds for GPU backends, but not for an ACCEL backend such as
+        // ggml-spacemit: it is not in `devices`, so load_tensors assigns every layer
+        // to the CPU device while the weights still land in the accelerator buffer.
+        // Pinning to dev_layer() then drags each layer's RMSNorm back to the host --
+        // four times per layer, each one a full round trip between the X100
+        // orchestrator and the A100 worker pool. On a 16-layer model that split the
+        // graph into 160 pieces instead of 36 and cost 16% of the prefill.
+        // Leave the norm where the scheduler puts it when the layer device and the
+        // layer's actual weights disagree.
         const bool full_offload = model.n_gpu_layers() > model.hparams.n_layer_all;
         if (ubatch.n_tokens < 32 || full_offload) {
             if (il != -1 && (strcmp(name, "norm") == 0 || strcmp(name, "l_last") == 0)) {
                 const auto & dev_layer = model.dev_layer(il);
-                for (const auto & backend : backends) {
-                    if (ggml_backend_get_device(backend.get()) == dev_layer) {
-                        if (ggml_backend_supports_op(backend.get(), cur)) {
-                            ggml_backend_sched_set_tensor_backend(sched.get(), cur, backend.get());
+                // The pin is only meaningful when dev_layer(il) is where the layer's
+                // weights actually live. ggml-spacemit is an ACCEL backend, so it is
+                // not in model.devices and load_tensors reports the CPU for every
+                // layer while the weights still land in the accelerator buffer.
+                // Ask the weights rather than the device table.
+                bool layer_on_accel = false;
+                if (ggml_backend_dev_type(dev_layer) == GGML_BACKEND_DEVICE_TYPE_CPU) {
+                    const std::string prefix = "blk." + std::to_string(il) + ".";
+                    for (const auto & t : model.tensors_by_name) {
+                        if (t.second->buffer == nullptr || t.first.rfind(prefix, 0) != 0) {
+                            continue;
+                        }
+                        const char * buft_name =
+                            ggml_backend_buft_name(ggml_backend_buffer_get_type(t.second->buffer));
+                        layer_on_accel = buft_name != nullptr && strstr(buft_name, "SPACEMIT") != nullptr;
+                        break;
+                    }
+                }
+                if (!layer_on_accel) {
+                    for (const auto & backend : backends) {
+                        if (ggml_backend_get_device(backend.get()) == dev_layer) {
+                            if (ggml_backend_supports_op(backend.get(), cur)) {
+                                ggml_backend_sched_set_tensor_backend(sched.get(), cur, backend.get());
+                            }
                         }
                     }
                 }

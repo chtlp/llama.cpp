@@ -1795,11 +1795,9 @@ int repack_q5_0_to_q8_0_32(ggml_tensor * t, const void * data, size_t data_size)
 }
 
 template <> int repack<block_q8_0, 32, 32>(ggml_tensor * t, const void * data, size_t data_size) {
-#if 1
+    // Between the two: the RVV version measured 2.5% slower on K3 for Q8_0
+    // (691 vs 674 ms over 16 layers), so the scalar reference stays the default.
     return repack_q8_0_to_q8_0_32_bl_ref(t, 32, data, data_size);
-#else
-    return repack_q8_0_to_q8_0_32_bl(t, 32, data, data_size);
-#endif
 }
 
 template <> int repack<block_mxfp4, 32, 32>(ggml_tensor * t, const void * data, size_t data_size) {
