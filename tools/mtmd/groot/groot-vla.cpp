@@ -298,6 +298,7 @@ struct Options {
     bool        dump     = false;
     bool        llm_only = false;
     std::string embeds_dir;
+    std::string pixels_file;
 };
 
 bool parse(int argc, char ** argv, Options * o) {
@@ -318,6 +319,7 @@ bool parse(int argc, char ** argv, Options * o) {
         else if (a == "--dump") o->dump = true;
         else if (a == "--llm-only") o->llm_only = true;
         else if (a == "--embeds") o->embeds_dir = next();
+        else if (a == "--pixels") o->pixels_file = next();
         else {
             std::fprintf(stderr, "[groot] unknown argument %s\n", a.c_str());
             return false;
@@ -538,7 +540,11 @@ int main(int argc, char ** argv) {
     std::vector<uint16_t> pixels(groot::kPatchTokens * groot::kPatchWidth);
     std::vector<uint16_t> state_norm(132);
     const auto t_preprocess = Clock::now();
-    groot::images_to_patches(front.data(), wrist.data(), pixels.data());
+    if (opt.pixels_file.empty()) {
+        groot::images_to_patches(front.data(), wrist.data(), pixels.data());
+    } else if (!read_exact(opt.pixels_file, pixels.data(), pixels.size() * 2)) {
+        return 2;
+    }
     groot::normalize_state(state, contract.state_lo, contract.state_hi, state_norm.data());
     const double preprocess_ms = since_ms(t_preprocess);
 
