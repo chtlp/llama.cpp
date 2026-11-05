@@ -297,6 +297,7 @@ struct Options {
     bool        use_ep   = true;
     bool        dump     = false;
     bool        llm_only = false;
+    std::string native_llm;  // complete GGUF: run the layers on llama.cpp's own graph
     std::string embeds_dir;
     std::string pixels_file;
 };
@@ -318,6 +319,7 @@ bool parse(int argc, char ** argv, Options * o) {
         else if (a == "--no-ep") o->use_ep = false;
         else if (a == "--dump") o->dump = true;
         else if (a == "--llm-only") o->llm_only = true;
+        else if (a == "--native-llm") o->native_llm = next();
         else if (a == "--embeds") o->embeds_dir = next();
         else if (a == "--pixels") o->pixels_file = next();
         else {
@@ -460,16 +462,18 @@ int main(int argc, char ** argv) {
     AiThread ai;
     GrootLlm llm;
     const auto t_llm_load = Clock::now();
+    const std::string llm_path = opt.native_llm.empty() ? opt.gguf : opt.native_llm;
     const bool loaded = ai.call([&] {
-        return llm.load(opt.gguf, opt.llm_weights, opt.threads, 512, &error);
+        return llm.load(llm_path, opt.llm_weights, opt.threads, 512, &error);
     });
     if (!loaded) {
         std::fprintf(stderr, "[groot] LLM: %s\n", error.c_str());
         return 2;
     }
     const double llm_load_ms = since_ms(t_llm_load);
-    if (!llm.fused()) {
-        std::fprintf(stderr, "[groot] this GGUF is not a GR00T feature-extractor header\n");
+    if (!llm.fused() && opt.native_llm.empty()) {
+        std::fprintf(stderr, "[groot] this GGUF is not a GR00T feature-extractor header; "
+                             "pass --native-llm for a complete model\n");
         return 2;
     }
 
@@ -528,9 +532,10 @@ int main(int argc, char ** argv) {
                 best_pre = std::min(best_pre, llm.pre_kernel_ms());
             }
         }
-        std::printf("[groot] llm_only sequence=%d wall=%.2f decode=%.2f pre=%.2f kernel=%.2f post=%.2f read=%.2f ms (best of %d)\n",
+        std::printf("[groot] llm_only sequence=%d wall=%.2f decode=%.2f pre=%.2f kernel=%.2f post=%.2f read=%.2f ms (best of %d) fused=%d\n",
                     S, best_wall, best_decode, best_pre, best_kernel,
-                    best_decode - best_pre - best_kernel, best_wall - best_decode, opt.repeats);
+                    best_decode - best_pre - best_kernel, best_wall - best_decode, opt.repeats,
+                    int(llm.fused()));
         llm.close();
         llama_backend_free();
         return 0;
