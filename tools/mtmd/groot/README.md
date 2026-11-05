@@ -117,7 +117,7 @@ Per-stage (mean of the six runs):
 | stage | pipeline | baseline | notes |
 |---|---:|---:|---|
 | ViT | 177 ms | 142.6 ms | QDQ whole-block fusion; known gap |
-| LLM prefill | 158 ms | 140.6 ms | same fused kernel |
+| LLM prefill | 155.9 ms | 141.1 ms | kernel 139-140 ms; ~15 ms is llama.cpp batch/output handling |
 | VLLN | 0.7 ms | 1.3 ms | RVV |
 | VL self-attention | 50 ms | 52.8 ms | EP |
 | Cross-KV | 11.9 ms | 28.5 ms | EP, dynamic sequence length |
@@ -128,11 +128,55 @@ Per-stage (mean of the six runs):
 Session creation costs ~10.5 s per process (ViT and DiT fusion); it is outside
 the steady-state timing, like the baseline's model load.
 
+Steady state (best of three measured passes) is ~626 ms end to end; the table
+above uses the sweep's best-of-one methodology. `llama_batch_compat` used to
+copy the 5 MiB embedding batch through an unreserved vector, which cost ~17 ms
+per decode; reserving it and reading the embedding buffer in bulk brings the
+LLM stage to ~151-154 ms.
+
+## Why DiT gets faster and ViT does not
+
+Both use the same kernel source (the ViT header is byte-identical to the
+baseline's), so the difference is scheduling and codegen:
+
+| | baseline | EP | delta |
+|---|---:|---:|---:|
+| ViT wall | 140 ms | 179 ms | +28% |
+| ViT instructions/run | 754 M | 929 M | +23% |
+| ViT cycles/run | 1.94 G | 2.95 G | +52% |
+| ViT core-time | 1.07 s | 1.62 s | +51% |
+| DiT wall | 72 ms | 54 ms | -25% |
+| DiT instructions/run | 191 M | 198 M | +3.5% |
+| DiT core-time | 0.46 s | 0.47 s | +3.7% |
+
+* DiT: the EP executes the same instruction count but spreads it over ~8.8 CPUs
+  instead of the baseline's ~6.4, so it simply uses more cores and wins on wall
+  time. The 32 DiT blocks are short (41 tokens, ~6 M instructions each), and the
+  baseline's pool leaves cores idle between phases.
+* ViT: the baseline already saturates 7.6 of 8 cores and runs a tight persistent
+  pool. The EP adds ~23% instructions and ~52% cycles per worker. `perf` puts
+  ~15% of EP samples in `spert::detail::sync_impl` +
+  `barrier_coro` (baseline `Pool::run`: ~1.2%), i.e. the per-block spert
+  launch/hand-off, and no futex traffic (the barrier is a userspace coroutine).
+  The ported `mlp_fused` is also 79% larger, so the inlining shape differs.
+* ViT blocks are compute-dense (512 tokens, ~31 M instructions/block); DiT
+  blocks are latency-bound (~6 M/block). A per-block framework cost that is
+  hidden by spare cores on DiT is exposed on ViT.
+
+The realistic ViT target is parity, not a win. The largest lever is folding the
+24 `VitBlock` nodes into one `VitStack` operator so the 24 spert launches/syncs
+disappear and the workers stay resident; the per-block barriers (2) remain. If
+the ~15% sync share is recovered, ViT lands around 150-155 ms.
+
 ## Accuracy: where the gap comes from
 
 Per-stage cosine against the baseline for the same inputs (mean of the six
 cases): ViT 0.968, LLM 0.9996, VLLN 0.965, VL 0.951, DiT step0 0.9992, step3
-0.9973. The VLLN and VL rows amplify the ViT difference because they normalise
+0.9973.
+
+Same-input isolation (feed the same intermediate to both implementations):
+Cross-KV, state_encoder, action_encoder and action_decoder all return cosine
+1.00000000 (bit-exact). ViT is the only model whose own output differs. The VLLN and VL rows amplify the ViT difference because they normalise
 per row; the LLM and DiT chains stay above 0.997.
 
 The ViT gap is the known one from the EP migration: the exported QDQ graph uses

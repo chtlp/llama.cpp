@@ -296,6 +296,8 @@ struct Options {
     int         repeats  = 1;
     bool        use_ep   = true;
     bool        dump     = false;
+    bool        llm_only = false;
+    std::string embeds_dir;
 };
 
 bool parse(int argc, char ** argv, Options * o) {
@@ -314,6 +316,8 @@ bool parse(int argc, char ** argv, Options * o) {
         else if (a == "--repeats") o->repeats = std::atoi(next().c_str());
         else if (a == "--no-ep") o->use_ep = false;
         else if (a == "--dump") o->dump = true;
+        else if (a == "--llm-only") o->llm_only = true;
+        else if (a == "--embeds") o->embeds_dir = next();
         else {
             std::fprintf(stderr, "[groot] unknown argument %s\n", a.c_str());
             return false;
@@ -440,11 +444,14 @@ int main(int argc, char ** argv) {
 
     groot::EpEngine engine;
     const auto t_engine = Clock::now();
-    if (!engine.init(ep_config, &error)) {
-        std::fprintf(stderr, "[groot] EP engine: %s\n", error.c_str());
-        return 2;
+    double engine_ms = 0.0;
+    if (!opt.llm_only) {
+        if (!engine.init(ep_config, &error)) {
+            std::fprintf(stderr, "[groot] EP engine: %s\n", error.c_str());
+            return 2;
+        }
+        engine_ms = since_ms(t_engine);
     }
-    const double engine_ms = since_ms(t_engine);
 
     // ---- llama backbone -----------------------------------------------------
     llama_backend_init();
@@ -473,6 +480,58 @@ int main(int argc, char ** argv) {
     if (S > 512) {
         std::fprintf(stderr, "[groot] sequence %d exceeds the prefill capacity\n", S);
         return 2;
+    }
+
+    if (opt.llm_only) {
+        std::vector<uint16_t> embeds(size_t(S) * 2048);
+        std::vector<uint16_t> deepstack(size_t(3) * groot::kImageTokens * 2048, 0);
+        std::vector<uint16_t> image_embeds(size_t(groot::kImageTokens) * 2048, 0);
+        std::vector<uint16_t> hidden(size_t(S) * 2048);
+        if (!opt.embeds_dir.empty()) {
+            if (!read_exact(opt.embeds_dir + "/image_embeds.f16", image_embeds.data(),
+                            image_embeds.size() * 2) ||
+                !read_exact(opt.embeds_dir + "/deepstack.f16", deepstack.data(),
+                            deepstack.size() * 2)) {
+                return 2;
+            }
+        }
+        if (!llm.embed_tokens(layout.tokens.data(), S, embeds.data())) {
+            std::fprintf(stderr, "[groot] %s\n", llm.error().c_str());
+            return 2;
+        }
+        int vi = 0;
+        for (int i = 0; i < S; ++i) {
+            if (layout.visual[i]) {
+                std::memcpy(embeds.data() + size_t(i) * 2048,
+                            image_embeds.data() + size_t(vi) * 2048, 2048 * 2);
+                ++vi;
+            }
+        }
+        double best_decode = 1e18, best_kernel = 1e18, best_pre = 1e18, best_wall = 1e18;
+        for (int r = 0; r <= opt.repeats; ++r) {
+            const auto wall0 = Clock::now();
+            const bool ok = ai.call([&] {
+                return llm.run(embeds.data(), deepstack.data(), layout.visual.data(),
+                               layout.positions.data(), S, groot::kImageTokens, hidden.data(), nullptr);
+            });
+            if (!ok) {
+                std::fprintf(stderr, "[groot] %s\n", llm.error().c_str());
+                return 2;
+            }
+            const double wall = since_ms(wall0);
+            if (r > 0) {
+                best_wall = std::min(best_wall, wall);
+                best_decode = std::min(best_decode, llm.last_decode_ms());
+                best_kernel = std::min(best_kernel, llm.last_kernel_ms());
+                best_pre = std::min(best_pre, llm.pre_kernel_ms());
+            }
+        }
+        std::printf("[groot] llm_only sequence=%d wall=%.2f decode=%.2f pre=%.2f kernel=%.2f post=%.2f read=%.2f ms (best of %d)\n",
+                    S, best_wall, best_decode, best_pre, best_kernel,
+                    best_decode - best_pre - best_kernel, best_wall - best_decode, opt.repeats);
+        llm.close();
+        llama_backend_free();
+        return 0;
     }
 
     // ---- preprocessing ------------------------------------------------------
@@ -586,6 +645,11 @@ int main(int argc, char ** argv) {
                 return 2;
             }
             t["step" + suffix + "_encoder"] = std::max(ms, 0.0);
+            if (record && opt.dump) {
+                char name[64];
+                snprintf(name, sizeof(name), "/step%d_action_encoder.f16", step);
+                write_f16(opt.out_dir + name, action_feature);
+            }
             groot_add_fp16(action_feature.data(), contract.position_embedding.data(),
                            action_feature.data(), size_t(40) * 1536);
             std::memcpy(sa.data(), state_feature.data(), 1536 * 2);

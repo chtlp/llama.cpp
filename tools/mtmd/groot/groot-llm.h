@@ -9,6 +9,7 @@
 #pragma once
 
 #include <cstdint>
+#include <chrono>
 #include <memory>
 #include <string>
 
@@ -35,6 +36,15 @@ public:
     bool fused() const { return fused_ != nullptr; }
 
     const std::string & error() const { return error_; }
+    // Split of the last call: llama_decode wall time and the fused kernel's own
+    // time (measured inside the graph callback).
+    double last_decode_ms() const { return last_decode_ms_; }
+    double last_kernel_ms() const { return last_kernel_ms_; }
+    groot_fused::Decoder * fused_decoder() const { return fused_.get(); }
+    void add_kernel_ms(double ms) { kernel_ms_ += ms; }
+    void mark_callback_start(double ms) { pre_kernel_ms_ = ms; }
+    std::chrono::steady_clock::time_point decode_start() const { return decode_start_; }
+    double pre_kernel_ms() const { return pre_kernel_ms_; }
 
     // Tokenizer surface, no vocabulary projection anywhere in this path.
     int tokenize(const std::string & text, int32_t * out, int capacity) const;
@@ -53,6 +63,11 @@ private:
     const llama_vocab * vocab_ = nullptr;
     std::unique_ptr<groot_fused::Decoder> fused_;
     std::string error_;
+    double last_decode_ms_ = 0.0;
+    double last_kernel_ms_ = 0.0;
+    double kernel_ms_ = 0.0;
+    double pre_kernel_ms_ = 0.0;
+    std::chrono::steady_clock::time_point decode_start_;
     int n_embd_ = 0;
     int capacity_ = 0;
 };

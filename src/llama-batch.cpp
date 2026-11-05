@@ -1417,6 +1417,13 @@ void llama_batch_compat::init(llama_batch_ext & dst, const llama_batch & batch_i
     static const llama_seq_id default_seq_id    = 0;
     static const int32_t      default_n_seq_id  = 1;
 
+    // A full-batch embedding input is copied row by row below. Without a reserve
+    // the vector reallocates log2(n_tokens) times and copies the whole 5 MiB
+    // payload each time; that alone cost ~15 ms on K3 for a 156-token prefill.
+    if (has_embd) {
+        batch_ext->embd.reserve(size_t(batch_inp.n_tokens) * n_embd_row);
+    }
+
     // auto-generates positions locally when batch_inp.pos is null, continuing from memory
     std::vector<llama_pos> pos_next(batch_ext->n_seq_max);
     for (llama_seq_id s = 0; s < (llama_seq_id) batch_ext->n_seq_max; ++s) {

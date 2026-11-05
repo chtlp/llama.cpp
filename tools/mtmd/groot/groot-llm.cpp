@@ -16,6 +16,22 @@
 
 using Half = _Float16;
 
+namespace {
+// The model stores this as the callback user pointer; it times the fused prefill
+// kernel and then delegates to the baseline's callback.
+void timed_callback(ggml_tensor * dst, const ggml_tensor * input, const ggml_tensor * pos, int ith,
+                    int nth, void * opaque) {
+    auto * self = static_cast<GrootLlm *>(opaque);
+    const auto t0 = std::chrono::steady_clock::now();
+    groot_fused::Decoder::callback(dst, input, pos, ith, nth, self->fused_decoder());
+    const double ms =
+        std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+    if (ith == 0) {
+        self->add_kernel_ms(ms);
+    }
+}
+}  // namespace
+
 GrootLlm::GrootLlm() = default;
 
 GrootLlm::~GrootLlm() {
@@ -70,8 +86,8 @@ bool GrootLlm::load(const std::string & gguf, const std::string & weights_dir, i
         } catch (const std::exception & e) {
             return fail(std::string("fused prefill init: ") + e.what());
         }
-        model_->groot_fused_callback = groot_fused::Decoder::callback;
-        model_->groot_fused_user = fused_.get();
+        model_->groot_fused_callback = timed_callback;
+        model_->groot_fused_user = this;
     }
 
     auto ctx_params = llama_context_default_params();
@@ -174,10 +190,13 @@ bool GrootLlm::run(const uint16_t * emb, const uint16_t * deepstack, const uint8
     batch.embd     = input.data();
     batch.pos      = pos4.data();
 
+    kernel_ms_ = 0.0;
     const auto start = std::chrono::steady_clock::now();
     const int rc = llama_decode(context_, batch);
     const double ms =
         std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
+    last_decode_ms_ = ms;
+    last_kernel_ms_ = kernel_ms_;
 
     if (rc != 0) {
         error_ = "llama_decode failed: " + std::to_string(rc);
