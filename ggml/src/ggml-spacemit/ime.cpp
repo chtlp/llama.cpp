@@ -1453,6 +1453,477 @@ class tensor_traits_common : public ggml::spacemit::tensor_traits_base {
     }
 };
 
+#if defined(RISCV64_SPACEMIT_IME2)
+// Per-row INT8 GEMM for Q8_0 weights whose 32-blocks share one scale per row.
+//
+// Such a tensor is per-output-channel INT8 stored in the Q8_0 container. The
+// int32 accumulator can then run through the whole of k: a 16x32 output tile
+// lives in 16 accumulator registers with no float conversion in the k loop.
+// The GEMM is split by output columns, so every worker streams only its own
+// weight columns from DRAM, once, and reuses them across all M tiles from TCM.
+//
+// Repacked weight layout (t->data), N32 = ceil(N / 32):
+//   strips[N32][K/16][32 cols][16 B]  int8; one 512 B block per 16 k is four
+//                                      vregs of 8 columns x 16 k each
+//   scales[N32 * 32]                  f32, one per output row of the weight
+// A workspace, M16 = ceil(M / 16) * 16:
+//   groups[M16/16][K/16][16 rows][16 B] int8, then scales[M16] f32
+namespace perrow_q8 {
+
+static bool enabled() {
+    static const bool on = [] {
+        const char * env = std::getenv("GGML_SPACEMIT_PERROW");
+        return env == nullptr || std::atoi(env) != 0;
+    }();
+    return on;
+}
+
+static float half_to_float(ggml_half h) {
+    _Float16 f;
+    memcpy(&f, &h, sizeof(f));
+    return (float) f;
+}
+
+static bool eligible(const ggml_tensor * t, const void * data, size_t data_size) {
+    if (!enabled() || t->type != GGML_TYPE_Q8_0 || t->ne[2] != 1 || t->ne[3] != 1 || t->ne[0] < 64 ||
+        t->ne[0] % 64 != 0) {
+        return false;
+    }
+    const int64_t nblk = t->ne[0] / QK8_0;
+    const int64_t nrow = t->ne[1];
+    if (data_size != (size_t) (nrow * nblk) * sizeof(block_q8_0)) {
+        return false;
+    }
+    const auto * src = static_cast<const block_q8_0 *>(data);
+    for (int64_t r = 0; r < nrow; ++r) {
+        const block_q8_0 * row = src + r * nblk;
+        for (int64_t b = 1; b < nblk; ++b) {
+            if (row[b].d != row[0].d) {
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
+static void repack(ggml_tensor * t, const block_q8_0 * src) {
+    const int64_t K      = t->ne[0];
+    const int64_t N      = t->ne[1];
+    const int64_t nblk   = K / QK8_0;
+    const int64_t nstrip = (N + 31) / 32;
+    auto *        dst    = static_cast<int8_t *>(t->data);
+    // Each strip is assembled in host memory and written to the tensor buffer in
+    // one sequential copy: scattered 16 B stores straight into the backend buffer
+    // ran at ~10 MB/s on K3.
+    std::vector<int8_t> strip(32 * K);
+    std::vector<float>  scales(nstrip * 32, 0.0f);
+    for (int64_t s = 0; s < nstrip; ++s) {
+        for (int64_t c = 0; c < 32; ++c) {
+            const int64_t n = s * 32 + c;
+            if (n >= N) {
+                for (int64_t kb = 0; kb < K / 16; ++kb) {
+                    memset(strip.data() + kb * 512 + c * 16, 0, 16);
+                }
+                continue;
+            }
+            const block_q8_0 * row = src + n * nblk;
+            scales[n]              = half_to_float(row[0].d);
+            for (int64_t kb = 0; kb < K / 16; ++kb) {
+                memcpy(strip.data() + kb * 512 + c * 16, row[kb / 2].qs + (kb % 2) * 16, 16);
+            }
+        }
+        memcpy(dst + s * 32 * K, strip.data(), strip.size());
+    }
+    memcpy(dst + nstrip * 32 * K, scales.data(), scales.size() * sizeof(float));
+}
+
+// 16x32 int32 tile over `blocks` 16-k blocks: a is 16 rows x 16 B per block,
+// b is 32 columns x 16 B per block; tmp receives 16 rows x 32 int32, row-major.
+// Two A and two B register sets are software-pipelined so each load overlaps
+// the eight vmadot of the previous block.
+__attribute__((noinline)) static void tile_m16n32(const int8_t * a, const int8_t * b, int64_t blocks,
+                                                  int32_t * tmp) {
+    asm volatile(
+        "vsetvli t0, zero, e32, m8, ta, ma\n\t"
+        "vmv.v.i v16, 0\n\t"
+        "vmv.v.i v24, 0\n\t"
+        "vsetvli t0, zero, e8, m1, ta, ma\n\t"
+        "vl2re8.v v0, (%[a])\n\t"
+        "vl4re8.v v4, (%[b])\n\t"
+        "addi %[a], %[a], 256\n\t"
+        "addi %[b], %[b], 512\n\t"
+        "1:\n\t"
+        "li t0, 1\n\t"
+        "beq %[blocks], t0, 3f\n\t"
+        "vl2re8.v v2, (%[a])\n\t"
+        "addi %[a], %[a], 256\n\t"
+        "vmadot v16, v0, v4, i8\n\t"
+        "vmadot v24, v1, v4, i8\n\t"
+        "vl4re8.v v8, (%[b])\n\t"
+        "addi %[b], %[b], 512\n\t"
+        "vmadot v18, v0, v5, i8\n\t"
+        "vmadot v26, v1, v5, i8\n\t"
+        "vmadot v20, v0, v6, i8\n\t"
+        "vmadot v28, v1, v6, i8\n\t"
+        "vmadot v22, v0, v7, i8\n\t"
+        "vmadot v30, v1, v7, i8\n\t"
+        "addi %[blocks], %[blocks], -1\n\t"
+        "beq %[blocks], t0, 2f\n\t"
+        "vl2re8.v v0, (%[a])\n\t"
+        "addi %[a], %[a], 256\n\t"
+        "vmadot v16, v2, v8, i8\n\t"
+        "vmadot v24, v3, v8, i8\n\t"
+        "vl4re8.v v4, (%[b])\n\t"
+        "addi %[b], %[b], 512\n\t"
+        "vmadot v18, v2, v9, i8\n\t"
+        "vmadot v26, v3, v9, i8\n\t"
+        "vmadot v20, v2, v10, i8\n\t"
+        "vmadot v28, v3, v10, i8\n\t"
+        "vmadot v22, v2, v11, i8\n\t"
+        "vmadot v30, v3, v11, i8\n\t"
+        "addi %[blocks], %[blocks], -1\n\t"
+        "j 1b\n\t"
+        "2:\n\t"
+        "vmadot v16, v2, v8, i8\n\t"
+        "vmadot v24, v3, v8, i8\n\t"
+        "vmadot v18, v2, v9, i8\n\t"
+        "vmadot v26, v3, v9, i8\n\t"
+        "vmadot v20, v2, v10, i8\n\t"
+        "vmadot v28, v3, v10, i8\n\t"
+        "vmadot v22, v2, v11, i8\n\t"
+        "vmadot v30, v3, v11, i8\n\t"
+        "j 4f\n\t"
+        "3:\n\t"
+        "vmadot v16, v0, v4, i8\n\t"
+        "vmadot v24, v1, v4, i8\n\t"
+        "vmadot v18, v0, v5, i8\n\t"
+        "vmadot v26, v1, v5, i8\n\t"
+        "vmadot v20, v0, v6, i8\n\t"
+        "vmadot v28, v1, v6, i8\n\t"
+        "vmadot v22, v0, v7, i8\n\t"
+        "vmadot v30, v1, v7, i8\n\t"
+        "4:\n\t"
+        "vsetvli t0, zero, e32, m1, ta, ma\n\t"
+        "vpack.vv v0, v16, v18, 2\n\t"
+        "vpack.vv v2, v20, v22, 2\n\t"
+        "vpack.vv v4, v17, v19, 2\n\t"
+        "vpack.vv v6, v21, v23, 2\n\t"
+        "vpack.vv v8, v24, v26, 2\n\t"
+        "vpack.vv v10, v28, v30, 2\n\t"
+        "vpack.vv v12, v25, v27, 2\n\t"
+        "vpack.vv v14, v29, v31, 2\n\t"
+        "vpack.vv v16, v0, v2, 3\n\t"
+        "vpack.vv v18, v1, v3, 3\n\t"
+        "vpack.vv v20, v4, v6, 3\n\t"
+        "vpack.vv v22, v5, v7, 3\n\t"
+        "vpack.vv v24, v8, v10, 3\n\t"
+        "vpack.vv v26, v9, v11, 3\n\t"
+        "vpack.vv v28, v12, v14, 3\n\t"
+        "vpack.vv v30, v13, v15, 3\n\t"
+        "vs8r.v v16, (%[tmp])\n\t"
+        "addi %[tmp], %[tmp], 1024\n\t"
+        "vs8r.v v24, (%[tmp])\n\t"
+        : [a] "+&r"(a), [b] "+&r"(b), [blocks] "+&r"(blocks), [tmp] "+&r"(tmp)
+        :
+        : "t0", "memory", "v0", "v1", "v2", "v3", "v4", "v5", "v6", "v7", "v8", "v9", "v10", "v11", "v12", "v13",
+          "v14", "v15", "v16", "v17", "v18", "v19", "v20", "v21", "v22", "v23", "v24", "v25", "v26", "v27", "v28",
+          "v29", "v30", "v31");
+}
+
+// Quantize one activation row to symmetric INT8 with a single scale and scatter
+// its 16 B k-chunks into row `rr` of a 16-row A group. `line` is K bytes scratch.
+static void quantize_row(const float * x, int64_t K, int8_t * group, int64_t rr, float * scale, int8_t * line) {
+    const size_t vlmax = __riscv_vsetvlmax_e32m8();
+    vfloat32m8_t mx    = __riscv_vfmv_v_f_f32m8(0.0f, vlmax);
+    for (int64_t c = 0; c < K;) {
+        const size_t vl = __riscv_vsetvl_e32m8(K - c);
+        mx = __riscv_vfmax_vv_f32m8_tu(mx, mx, __riscv_vfabs_v_f32m8(__riscv_vle32_v_f32m8(x + c, vl), vl), vl);
+        c += vl;
+    }
+    const float amax =
+        __riscv_vfmv_f_s_f32m1_f32(__riscv_vfredmax_vs_f32m8_f32m1(mx, __riscv_vfmv_v_f_f32m1(0.0f, 1), vlmax));
+    const float d  = amax / 127.0f;
+    const float id = d != 0.0f ? 1.0f / d : 0.0f;
+    *scale         = d;
+    for (int64_t c = 0; c < K;) {
+        const size_t vl = __riscv_vsetvl_e32m8(K - c);
+        auto         q  = __riscv_vfcvt_x_f_v_i32m8(__riscv_vfmul_vf_f32m8(__riscv_vle32_v_f32m8(x + c, vl), id, vl), vl);
+        q               = __riscv_vmin_vx_i32m8(__riscv_vmax_vx_i32m8(q, -127, vl), 127, vl);
+        __riscv_vse8_v_i8m2(line + c, __riscv_vncvt_x_x_w_i8m2(__riscv_vncvt_x_x_w_i16m4(q, vl), vl), vl);
+        c += vl;
+    }
+    // One 16 B store per k-chunk: strided vlse64/vsse64 measured 2x slower here
+    // (4.0 vs 1.9 us per 2048-wide row on one A100 core).
+    for (int64_t j = 0; j < K / 16; ++j) {
+        __riscv_vse8_v_i8m1(group + j * 256 + rr * 16, __riscv_vle8_v_i8m1(line + j * 16, 16), 16);
+    }
+}
+
+static int64_t pad16(int64_t m) {
+    return (m + 15) / 16 * 16;
+}
+
+// GGML_SPACEMIT_PERROW_PROF=1: per-worker phase times, printed at exit.
+struct prof_slot {
+    uint64_t ns[6];
+    uint64_t calls;
+    char     pad[8];
+};
+static prof_slot g_prof[64];
+static const char * const g_prof_names[6] = { "quant", "sync", "a_copy", "b_copy", "tile", "epilogue" };
+
+static bool prof_on() {
+    static const bool on = [] {
+        const char * env = std::getenv("GGML_SPACEMIT_PERROW_PROF");
+        const bool   v   = env != nullptr && std::atoi(env) != 0;
+        if (v) {
+            std::atexit([] {
+                prof_slot total = {};
+                int       nw    = 0;
+                for (const auto & p : g_prof) {
+                    if (p.calls == 0) {
+                        continue;
+                    }
+                    ++nw;
+                    total.calls += p.calls;
+                    for (int i = 0; i < 6; ++i) total.ns[i] += p.ns[i];
+                }
+                if (nw == 0) return;
+                fprintf(stderr, "perrow prof: %d workers, %llu calls/worker, mean ms per worker:", nw,
+                        (unsigned long long) (total.calls / nw));
+                for (int i = 0; i < 6; ++i) fprintf(stderr, " %s=%.2f", g_prof_names[i], total.ns[i] / 1e6 / nw);
+                fprintf(stderr, "\n");
+            });
+        }
+        return v;
+    }();
+    return on;
+}
+
+static inline uint64_t prof_now() {
+    timespec t;
+    clock_gettime(CLOCK_MONOTONIC, &t);
+    return (uint64_t) t.tv_sec * 1000000000ull + (uint64_t) t.tv_nsec;
+}
+
+static size_t a_size(int64_t M, int64_t K) {
+    return GGML_PAD((size_t) (pad16(M) * K + pad16(M) * (int64_t) sizeof(float)), 64);
+}
+
+// Quantized A lives in its own buffer rather than the shared workspace, so it
+// survives the ops between two matmuls that read the same activation (Q/K/V
+// after attn_norm, gate/up after ffn_norm; ROPE and others reuse the
+// workspace). The second and later matmuls skip quantization and its barrier.
+// The buffer is sized and the cache invalidated from work_size(), which the
+// graph compute calls on the host thread before it launches the workers.
+struct a_cache {
+    int8_t *            buf  = nullptr;
+    size_t              size = 0;
+    const ggml_tensor * src  = nullptr;  // tensor whose quantized rows are in buf
+    const void *        data = nullptr;
+};
+static a_cache g_a;
+
+static void a_reserve(int64_t M, int64_t K) {
+    const size_t need = a_size(M, K);
+    if (need > g_a.size) {
+        free(g_a.buf);
+        g_a.buf  = static_cast<int8_t *>(aligned_alloc(64, need));
+        g_a.size = g_a.buf ? need : 0;
+        GGML_ASSERT(g_a.buf != nullptr);
+    }
+    g_a.src  = nullptr;
+    g_a.data = nullptr;
+}
+
+static bool forward_mul_mat(ggml::spacemit::context & ctx, ggml_tensor * op) {
+    const ggml_tensor * src0 = op->src[0];
+    const ggml_tensor * src1 = op->src[1];
+
+    const int64_t K      = src0->ne[0];
+    const int64_t N      = src0->ne[1];
+    const int64_t M      = src1->ne[1] * src1->ne[2] * src1->ne[3];
+    const int64_t M16    = pad16(M);
+    const int64_t nstrip = (N + 31) / 32;
+    const int     ith    = ctx.ith;
+    const int     nth    = ctx.nth;
+
+    GGML_ASSERT(src1->type == GGML_TYPE_F32 && src1->nb[0] == sizeof(float) && ggml_is_contiguous(op));
+    GGML_ASSERT(g_a.size >= a_size(M, K));
+
+    auto * tcm      = static_cast<uint8_t *>(ctx.shared.data);
+    const size_t ts = ctx.shared.size;
+    GGML_ASSERT(tcm != nullptr && ts >= (size_t) K && ts >= 48 * 64);
+
+    const auto * w  = static_cast<const int8_t *>(src0->data);
+    const auto * ws = reinterpret_cast<const float *>(w + nstrip * 32 * K);
+    auto *       ap = g_a.buf;
+    auto *       as = reinterpret_cast<float *>(ap + M16 * K);
+    auto *       y  = static_cast<float *>(op->data);
+    const auto   x_row = [src1](int64_t r) {
+        const int64_t i11 = r % src1->ne[1];
+        const int64_t i12 = (r / src1->ne[1]) % src1->ne[2];
+        const int64_t i13 = r / (src1->ne[1] * src1->ne[2]);
+        return reinterpret_cast<const float *>(static_cast<const char *>(src1->data) + i11 * src1->nb[1] +
+                                               i12 * src1->nb[2] + i13 * src1->nb[3]);
+    };
+
+    const bool prof = prof_on();
+    uint64_t   tp   = prof ? prof_now() : 0;
+    auto       mark = [&](int i) {
+        if (prof) {
+            const uint64_t t = prof_now();
+            g_prof[ith].ns[i] += t - tp;
+            tp = t;
+        }
+    };
+    if (prof) {
+        g_prof[ith].calls++;
+    }
+
+    if (!(g_a.src == src1 && g_a.data == src1->data)) {
+        // Phase 1: quantize A, four rows (one 64 B line per k-chunk) per unit,
+        // unless the previous matmul already did it for this same activation.
+        // All workers read the cache key here; it is only written below, after
+        // every worker has passed this point (the barrier), and becomes visible
+        // to the next op through the barrier that ends this one.
+        const int64_t nunit = (M + 3) / 4;
+        const int64_t u0    = nunit * ith / nth;
+        const int64_t u1    = nunit * (ith + 1) / nth;
+        for (int64_t r = u0 * 4; r < std::min(M, u1 * 4); ++r) {
+            quantize_row(x_row(r), K, ap + (r / 16) * 16 * K, r % 16, as + r, reinterpret_cast<int8_t *>(tcm));
+        }
+        mark(0);
+        ctx.sync();
+        mark(1);
+        if (ith == 0) {
+            g_a.src  = src1;
+            g_a.data = src1->data;
+        }
+    }
+
+    // Phase 2: units are (column strip, 16-row tile) in strip-major order, split
+    // evenly; a worker copies each of its weight strips into TCM once per k chunk
+    // and runs every M tile it owns against it.
+    alignas(128) int32_t tmp[16 * 32];
+    int8_t *     tcmd  = reinterpret_cast<int8_t *>(tcm);
+    const size_t avail = ts;
+
+    const auto kc_for = [&](int64_t rows) { return std::min<int64_t>(K, (int64_t) (avail / (rows + 32)) / 64 * 64); };
+    int64_t mpan = M16;
+    while (mpan > 16 && kc_for(mpan) < std::min<int64_t>(K, 256)) {
+        mpan = std::max<int64_t>(16, pad16(mpan / 2));
+    }
+    const int64_t kc = kc_for(mpan);
+    GGML_ASSERT(kc >= 64);
+
+    for (int64_t m0 = 0; m0 < M16; m0 += mpan) {
+        const int64_t nmt = std::min(mpan, M16 - m0) / 16;
+        const int64_t U   = nstrip * nmt;
+        const int64_t u0  = U * ith / nth;
+        const int64_t u1  = U * (ith + 1) / nth;
+        if (u0 >= u1) {
+            continue;
+        }
+        const int64_t s_first = u0 / nmt;
+        const int64_t s_last  = (u1 - 1) / nmt;
+        const int64_t t_lo    = s_first == s_last ? u0 % nmt : 0;
+        const int64_t t_hi    = s_first == s_last ? (u1 - 1) % nmt + 1 : nmt;
+
+        for (int64_t k0 = 0; k0 < K; k0 += kc) {
+            const int64_t count = std::min(kc, K - k0);
+            const bool    first = k0 == 0;
+            const bool    last  = k0 + count == K;
+            int8_t *      a     = tcmd;
+            int8_t *      b     = tcmd + mpan * count;
+            for (int64_t t = t_lo; t < t_hi; ++t) {
+                spacemit_kernels::rvv::memcpy1d(a + t * 16 * count, ap + ((m0 / 16 + t) * 16 * K) + k0 * 16,
+                                                count * 16);
+            }
+            mark(2);
+            for (int64_t s = s_first; s <= s_last; ++s) {
+                const int64_t ts0 = s == s_first ? u0 % nmt : 0;
+                const int64_t ts1 = s == s_last ? (u1 - 1) % nmt + 1 : nmt;
+                // Running the tile on the strip in DRAM instead was slower both at
+                // M = 156 (-20%) and for decode (-7%).
+                spacemit_kernels::rvv::memcpy1d(b, w + (s * K + k0) * 32, count * 32);
+                mark(3);
+                const int64_t n  = s * 32;
+                const size_t  vl = (size_t) std::min<int64_t>(32, N - n);
+                const auto    wsv = __riscv_vle32_v_f32m1(ws + n, vl);
+                for (int64_t t = ts0; t < ts1; ++t) {
+                    tile_m16n32(a + t * 16 * count, b, count / 16, tmp);
+                    mark(4);
+                    const int64_t r0 = m0 + t * 16;
+                    for (int64_t rr = 0; rr < 16 && r0 + rr < M; ++rr) {
+                        float * dst = y + (r0 + rr) * N + n;
+                        auto    q   = __riscv_vle32_v_i32m1(tmp + rr * 32, vl);
+                        if (!first) {
+                            q = __riscv_vadd_vv_i32m1(
+                                q, __riscv_vreinterpret_v_f32m1_i32m1(__riscv_vle32_v_f32m1(dst, vl)), vl);
+                        }
+                        if (last) {
+                            auto sc = __riscv_vfmul_vf_f32m1(wsv, as[r0 + rr], vl);
+                            __riscv_vse32_v_f32m1(dst, __riscv_vfmul_vv_f32m1(__riscv_vfcvt_f_x_v_f32m1(q, vl), sc, vl),
+                                                  vl);
+                        } else {
+                            __riscv_vse32_v_f32m1(dst, __riscv_vreinterpret_v_i32m1_f32m1(q), vl);
+                        }
+                    }
+                    mark(5);
+                }
+            }
+        }
+    }
+    return true;
+}
+
+}  // namespace perrow_q8
+
+class tensor_traits_q8_0_perrow : public ggml::spacemit::tensor_traits_base {
+    bool work_size(int /* n_threads */, const ggml_tensor * op, size_t & size) const override {
+        if (op->op != GGML_OP_MUL_MAT) {
+            return false;
+        }
+        perrow_q8::a_reserve(op->src[1]->ne[1] * op->src[1]->ne[2] * op->src[1]->ne[3], op->src[0]->ne[0]);
+        size = 0;
+        return true;
+    }
+
+    bool compute_forward(ggml::spacemit::context & ctx, ggml_tensor * op) const override {
+        if (op->op != GGML_OP_MUL_MAT) {
+            return false;
+        }
+        return perrow_q8::forward_mul_mat(ctx, op);
+    }
+
+    int repack(ggml_tensor * t, const void * data, size_t data_size) const override {
+        GGML_UNUSED(t);
+        GGML_UNUSED(data);
+        GGML_UNUSED(data_size);
+        return -1;
+    }
+};
+
+static const tensor_traits_q8_0_perrow q8_0_perrow;
+
+// Q8_0 weights: per-row tensors are detected from their own scales at load time
+// and moved to the per-row traits above; all others keep the 32x32 layout.
+class tensor_traits_q8_0 : public tensor_traits<block_q8_0, 32, 32> {
+    int repack(ggml_tensor * t, const void * data, size_t data_size) const override {
+        if (perrow_q8::eligible(t, data, data_size)) {
+            perrow_q8::repack(t, static_cast<const block_q8_0 *>(data));
+            t->extra = (void *) static_cast<const ggml::spacemit::tensor_traits_base *>(&q8_0_perrow);
+            GGML_LOG_DEBUG("%s: repack tensor %s as per-row INT8\n", __func__, t->name);
+            return 0;
+        }
+        return ggml::cpu::riscv64_spacemit::repack<block_q8_0, 32, 32>(t, data, data_size);
+    }
+};
+
+static const tensor_traits_q8_0 q8_0_32x32_q8_0_or_perrow;
+#endif
+
 // Impl By IME1
 static const tensor_traits<block_q4_0, 32, 16>  q4_0_16x32_q8_0;
 static const tensor_traits<block_q4_1, 32, 16>  q4_1_16x32_q8_0;
@@ -1573,7 +2044,7 @@ const ggml::spacemit::tensor_traits_base * ggml_spacemit_get_optimal_repack_type
             {
 #if defined(RISCV64_SPACEMIT_IME2)
                 if ((ggml::cpu::riscv64_spacemit::global_spine_env_info.use_ime2)) {
-                    return &ggml::cpu::riscv64_spacemit::q8_0_32x32_q8_0;
+                    return &ggml::cpu::riscv64_spacemit::q8_0_32x32_q8_0_or_perrow;
                 }
 #endif
             }
