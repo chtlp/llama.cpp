@@ -11,8 +11,8 @@ void ggml_profile_init_trace_file(void) {}
 void ggml_profile_flush_trace(void) {}
 void ggml_trace_log_begin(const char * n, const char * c, const char * a) { (void)n;(void)c;(void)a; }
 void ggml_trace_log_end(const char * n, const char * c, const char * a) { (void)n;(void)c;(void)a; }
-void ggml_profile_log_op_begin(struct ggml_tensor * t, int i, int n) { (void)t;(void)i;(void)n; }
-void ggml_profile_log_op_end(struct ggml_tensor * t, int i, int n) { (void)t;(void)i;(void)n; }
+GGML_API void ggml_profile_log_op_begin(struct ggml_tensor * t, int i, int n) { (void)t;(void)i;(void)n; }
+GGML_API void ggml_profile_log_op_end(struct ggml_tensor * t, int i, int n) { (void)t;(void)i;(void)n; }
 void ggml_profile_flush_tls(void) {}
 #else
 #include <pthread.h>
@@ -49,8 +49,8 @@ static void op_args(struct ggml_tensor * t, char * b,size_t z) { char o[256],a[2
 static void lane_event(const char * name,const char * cat,char ph,const char * args,int pid,int tid) { char b[1400]; snprintf(b,sizeof(b),"{\"name\":\"%s\",\"cat\":\"%s\",\"ph\":\"%c\",\"ts\":%lld,\"pid\":%d,\"tid\":%d,\"args\":{%s}},\n",name,cat,ph,now_us(),pid,tid,args?args:"");trace_write(b); }
 void ggml_trace_log_begin(const char * n,const char * c,const char * a) { if(TRACE_ENABLED()) lane_event(n,c,'B',a,1,0); }
 void ggml_trace_log_end(const char * n,const char * c,const char * a) { if(TRACE_ENABLED()) lane_event(n,c,'E',a,1,0); }
-void ggml_profile_log_op_begin(struct ggml_tensor * t,int ith,int nth) { if(!TRACE_ENABLED())return; if(!g_trace_worker_named){char b[160];snprintf(b,sizeof(b),"{\"name\":\"thread_name\",\"ph\":\"M\",\"pid\":2,\"tid\":%d,\"args\":{\"name\":\"ggml-worker-%d\"}},\n",ith,ith);trace_write(b);g_trace_worker_named=1;} char a[1100],n[128],tn[64];op_args(t,a,sizeof(a));size_t l=strlen(a);snprintf(a+l,sizeof(a)-l,",\"ith\":%d,\"nth\":%d",ith,nth);esc(tname(t),tn,sizeof(tn));snprintf(n,sizeof(n),"%s (%s)",ggml_op_name(t->op),tn);lane_event(n,"Operator",'B',a,2,ith); }
-void ggml_profile_log_op_end(struct ggml_tensor * t,int ith,int nth) { (void)nth; if(!TRACE_ENABLED())return; char n[128],tn[64];esc(tname(t),tn,sizeof(tn));snprintf(n,sizeof(n),"%s (%s)",ggml_op_name(t->op),tn);lane_event(n,"Operator",'E',NULL,2,ith); }
+GGML_API void ggml_profile_log_op_begin(struct ggml_tensor * t,int ith,int nth) { if(!TRACE_ENABLED())return; if(!g_trace_worker_named){char b[160];snprintf(b,sizeof(b),"{\"name\":\"thread_name\",\"ph\":\"M\",\"pid\":2,\"tid\":%d,\"args\":{\"name\":\"ggml-worker-%d\"}},\n",ith,ith);trace_write(b);g_trace_worker_named=1;} char a[1100],n[128],tn[64];op_args(t,a,sizeof(a));size_t l=strlen(a);snprintf(a+l,sizeof(a)-l,",\"ith\":%d,\"nth\":%d",ith,nth);esc(tname(t),tn,sizeof(tn));snprintf(n,sizeof(n),"%s (%s)",ggml_op_name(t->op),tn);lane_event(n,"Operator",'B',a,2,ith); }
+GGML_API void ggml_profile_log_op_end(struct ggml_tensor * t,int ith,int nth) { (void)nth; if(!TRACE_ENABLED())return; char n[128],tn[64];esc(tname(t),tn,sizeof(tn));snprintf(n,sizeof(n),"%s (%s)",ggml_op_name(t->op),tn);lane_event(n,"Operator",'E',NULL,2,ith); }
 static void ggml_profile_log_backend_op(struct ggml_tensor * t,int ith,int nth,char ph) {
     if (!TRACE_ENABLED()) return;
     char n[128], tn[64], a[1100];
