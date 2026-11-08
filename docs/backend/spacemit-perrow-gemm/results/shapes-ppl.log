@@ -1,0 +1,9 @@
+PERROW=1 | qwen3 ?B Q8_0                  |   1.11 GiB |     1.12 B | SPACEMIT   |  -1 |   1 | SPACEMIT0    |           pp156 |       976.21 ± 55.48 |
+PERROW=1 | qwen3 ?B Q8_0                  |   1.11 GiB |     1.12 B | SPACEMIT   |  -1 |   1 | SPACEMIT0    |           pp512 |        541.03 ± 5.24 |
+PERROW=1 | qwen3 ?B Q8_0                  |   1.11 GiB |     1.12 B | SPACEMIT   |  -1 |   1 | SPACEMIT0    |            tg32 |         16.31 ± 0.17 |
+PERROW=0 | qwen3 ?B Q8_0                  |   1.11 GiB |     1.12 B | SPACEMIT   |  -1 |   1 | SPACEMIT0    |           pp156 |        270.18 ± 3.88 |
+PERROW=0 | qwen3 ?B Q8_0                  |   1.11 GiB |     1.12 B | SPACEMIT   |  -1 |   1 | SPACEMIT0    |           pp512 |        261.85 ± 1.19 |
+PERROW=0 | qwen3 ?B Q8_0                  |   1.11 GiB |     1.12 B | SPACEMIT   |  -1 |   1 | SPACEMIT0    |            tg32 |         17.92 ± 0.33 |
+PPL PERROW=1 0.24.855.884 I Final estimate: PPL = 16.5314 +/- 1.30435
+PPL PERROW=0 0.39.688.703 I Final estimate: PPL = 16.6618 +/- 1.33523
+PPL original-Q8_0 0.39.172.142 I Final estimate: PPL = 16.8384 +/- 1.35546

@@ -1,0 +1,61 @@
+##### round 1 00:53:50
+fused 16L prefill s=156 threads=8: best 147.55 median 153.50 mean 155.61 ms (10 runs)
+=== ours model=pr_L2 env=
+| qwen3 ?B Q8_0                  | 417.34 MiB |   411.84 M | SPACEMIT   |  -1 |   1 | SPACEMIT0    |           pp156 |     5387.66 ± 171.85 |
+=== zh-generic model=pr_L2 env=
+| qwen3 ?B Q8_0                  | 417.34 MiB |   411.84 M | SPACEMIT   |  -1 |   1 | SPACEMIT0    |           pp156 |     3509.64 ± 405.22 |
+=== mainline model=pr_L2 env=
+| qwen3 ?B Q8_0                  | 417.34 MiB |   411.84 M | SPACEMIT   |  -1 |   1 | SPACEMIT0    |           pp156 |     2292.98 ± 278.26 |
+=== ours model=pr_L4 env=
+| qwen3 ?B Q8_0                  | 519.37 MiB |   512.51 M | SPACEMIT   |  -1 |   1 | SPACEMIT0    |           pp156 |     3030.04 ± 464.71 |
+=== zh-generic model=pr_L4 env=
+| qwen3 ?B Q8_0                  | 519.37 MiB |   512.51 M | SPACEMIT   |  -1 |   1 | SPACEMIT0    |           pp156 |     1983.98 ± 146.67 |
+=== mainline model=pr_L4 env=
+| qwen3 ?B Q8_0                  | 519.37 MiB |   512.51 M | SPACEMIT   |  -1 |   1 | SPACEMIT0    |           pp156 |      1148.67 ± 61.99 |
+=== ours model=pr_L8 env=
+| qwen3 ?B Q8_0                  | 723.44 MiB |   713.85 M | SPACEMIT   |  -1 |   1 | SPACEMIT0    |           pp156 |      1853.44 ± 71.41 |
+=== zh-generic model=pr_L8 env=
+| qwen3 ?B Q8_0                  | 723.44 MiB |   713.85 M | SPACEMIT   |  -1 |   1 | SPACEMIT0    |           pp156 |      1017.16 ± 69.64 |
+=== mainline model=pr_L8 env=
+| qwen3 ?B Q8_0                  | 723.44 MiB |   713.85 M | SPACEMIT   |  -1 |   1 | SPACEMIT0    |           pp156 |       547.72 ± 28.26 |
+=== ours model=pr_L12 env=
+| qwen3 ?B Q8_0                  | 927.50 MiB |   915.20 M | SPACEMIT   |  -1 |   1 | SPACEMIT0    |           pp156 |      1284.47 ± 89.88 |
+=== zh-generic model=pr_L12 env=
+| qwen3 ?B Q8_0                  | 927.50 MiB |   915.20 M | SPACEMIT   |  -1 |   1 | SPACEMIT0    |           pp156 |       698.18 ± 32.39 |
+=== mainline model=pr_L12 env=
+| qwen3 ?B Q8_0                  | 927.50 MiB |   915.20 M | SPACEMIT   |  -1 |   1 | SPACEMIT0    |           pp156 |       361.15 ± 17.02 |
+=== ours model=pr_L16 env=
+| qwen3 ?B Q8_0                  |   1.11 GiB |     1.12 B | SPACEMIT   |  -1 |   1 | SPACEMIT0    |           pp156 |       997.09 ± 46.14 |
+=== mainline model=pr_L16 env=
+| qwen3 ?B Q8_0                  |   1.11 GiB |     1.12 B | SPACEMIT   |  -1 |   1 | SPACEMIT0    |           pp156 |        270.54 ± 9.71 |
+##### round 2 00:55:52
+fused 16L prefill s=156 threads=8: best 149.68 median 156.61 mean 160.15 ms (10 runs)
+=== ours model=pr_L2 env=
+| qwen3 ?B Q8_0                  | 417.34 MiB |   411.84 M | SPACEMIT   |  -1 |   1 | SPACEMIT0    |           pp156 |     4678.12 ± 267.01 |
+=== zh-generic model=pr_L2 env=
+| qwen3 ?B Q8_0                  | 417.34 MiB |   411.84 M | SPACEMIT   |  -1 |   1 | SPACEMIT0    |           pp156 |     3624.79 ± 247.99 |
+=== mainline model=pr_L2 env=
+| qwen3 ?B Q8_0                  | 417.34 MiB |   411.84 M | SPACEMIT   |  -1 |   1 | SPACEMIT0    |           pp156 |     2441.82 ± 127.50 |
+=== ours model=pr_L4 env=
+| qwen3 ?B Q8_0                  | 519.37 MiB |   512.51 M | SPACEMIT   |  -1 |   1 | SPACEMIT0    |           pp156 |     3111.89 ± 262.35 |
+=== zh-generic model=pr_L4 env=
+| qwen3 ?B Q8_0                  | 519.37 MiB |   512.51 M | SPACEMIT   |  -1 |   1 | SPACEMIT0    |           pp156 |     1949.90 ± 142.77 |
+=== mainline model=pr_L4 env=
+| qwen3 ?B Q8_0                  | 519.37 MiB |   512.51 M | SPACEMIT   |  -1 |   1 | SPACEMIT0    |           pp156 |      1118.30 ± 69.42 |
+=== ours model=pr_L8 env=
+| qwen3 ?B Q8_0                  | 723.44 MiB |   713.85 M | SPACEMIT   |  -1 |   1 | SPACEMIT0    |           pp156 |     1798.45 ± 170.49 |
+=== zh-generic model=pr_L8 env=
+| qwen3 ?B Q8_0                  | 723.44 MiB |   713.85 M | SPACEMIT   |  -1 |   1 | SPACEMIT0    |           pp156 |      1026.02 ± 58.50 |
+=== mainline model=pr_L8 env=
+| qwen3 ?B Q8_0                  | 723.44 MiB |   713.85 M | SPACEMIT   |  -1 |   1 | SPACEMIT0    |           pp156 |       544.42 ± 25.66 |
+=== ours model=pr_L12 env=
+| qwen3 ?B Q8_0                  | 927.50 MiB |   915.20 M | SPACEMIT   |  -1 |   1 | SPACEMIT0    |           pp156 |      1279.76 ± 97.59 |
+=== zh-generic model=pr_L12 env=
+| qwen3 ?B Q8_0                  | 927.50 MiB |   915.20 M | SPACEMIT   |  -1 |   1 | SPACEMIT0    |           pp156 |       693.63 ± 43.21 |
+=== mainline model=pr_L12 env=
+| qwen3 ?B Q8_0                  | 927.50 MiB |   915.20 M | SPACEMIT   |  -1 |   1 | SPACEMIT0    |           pp156 |       363.22 ± 14.78 |
+=== ours model=pr_L16 env=
+| qwen3 ?B Q8_0                  |   1.11 GiB |     1.12 B | SPACEMIT   |  -1 |   1 | SPACEMIT0    |           pp156 |       980.79 ± 78.88 |
+=== mainline model=pr_L16 env=
+| qwen3 ?B Q8_0                  |   1.11 GiB |     1.12 B | SPACEMIT   |  -1 |   1 | SPACEMIT0    |           pp156 |        268.15 ± 9.97 |
+FINAL_DONE
