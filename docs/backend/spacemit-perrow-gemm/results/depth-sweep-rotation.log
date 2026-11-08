@@ -1,0 +1,47 @@
+##### round 1 15:35:11
+fused 16L prefill s=156 threads=8: best 147.39 median 158.89 mean 160.20 ms (10 runs)
+=== rot0 model=pr_L2
+| qwen3 ?B Q8_0                  | 417.34 MiB |   411.84 M | SPACEMIT   |  -1 |   1 | SPACEMIT0    |           pp156 |     5290.95 ± 288.82 |
+=== rot2 model=pr_L2
+| qwen3 ?B Q8_0                  | 417.34 MiB |   411.84 M | SPACEMIT   |  -1 |   1 | SPACEMIT0    |           pp156 |     5268.42 ± 209.86 |
+=== rot0 model=pr_L4
+| qwen3 ?B Q8_0                  | 519.37 MiB |   512.51 M | SPACEMIT   |  -1 |   1 | SPACEMIT0    |           pp156 |     3146.21 ± 288.40 |
+=== rot2 model=pr_L4
+| qwen3 ?B Q8_0                  | 519.37 MiB |   512.51 M | SPACEMIT   |  -1 |   1 | SPACEMIT0    |           pp156 |     2954.53 ± 344.30 |
+=== rot0 model=pr_L8
+| qwen3 ?B Q8_0                  | 723.44 MiB |   713.85 M | SPACEMIT   |  -1 |   1 | SPACEMIT0    |           pp156 |     1803.41 ± 142.24 |
+=== rot2 model=pr_L8
+| qwen3 ?B Q8_0                  | 723.44 MiB |   713.85 M | SPACEMIT   |  -1 |   1 | SPACEMIT0    |           pp156 |     1757.27 ± 116.67 |
+=== rot0 model=pr_L12
+| qwen3 ?B Q8_0                  | 927.50 MiB |   915.20 M | SPACEMIT   |  -1 |   1 | SPACEMIT0    |           pp156 |      1273.53 ± 74.48 |
+=== rot2 model=pr_L12
+| qwen3 ?B Q8_0                  | 927.50 MiB |   915.20 M | SPACEMIT   |  -1 |   1 | SPACEMIT0    |           pp156 |      1219.27 ± 62.52 |
+=== rot0 model=pr_L16
+| qwen3 ?B Q8_0                  |   1.11 GiB |     1.12 B | SPACEMIT   |  -1 |   1 | SPACEMIT0    |           pp156 |       968.83 ± 42.22 |
+=== rot2 model=pr_L16
+| qwen3 ?B Q8_0                  |   1.11 GiB |     1.12 B | SPACEMIT   |  -1 |   1 | SPACEMIT0    |           pp156 |       951.11 ± 35.47 |
+##### round 2 15:36:22
+fused 16L prefill s=156 threads=8: best 146.55 median 155.08 mean 153.81 ms (10 runs)
+=== rot0 model=pr_L2
+| qwen3 ?B Q8_0                  | 417.34 MiB |   411.84 M | SPACEMIT   |  -1 |   1 | SPACEMIT0    |           pp156 |     5108.40 ± 360.33 |
+=== rot2 model=pr_L2
+| qwen3 ?B Q8_0                  | 417.34 MiB |   411.84 M | SPACEMIT   |  -1 |   1 | SPACEMIT0    |           pp156 |     4937.75 ± 400.37 |
+=== rot0 model=pr_L4
+| qwen3 ?B Q8_0                  | 519.37 MiB |   512.51 M | SPACEMIT   |  -1 |   1 | SPACEMIT0    |           pp156 |     3227.82 ± 262.54 |
+=== rot2 model=pr_L4
+| qwen3 ?B Q8_0                  | 519.37 MiB |   512.51 M | SPACEMIT   |  -1 |   1 | SPACEMIT0    |           pp156 |     3116.89 ± 251.05 |
+=== rot0 model=pr_L8
+| qwen3 ?B Q8_0                  | 723.44 MiB |   713.85 M | SPACEMIT   |  -1 |   1 | SPACEMIT0    |           pp156 |     1822.82 ± 106.69 |
+=== rot2 model=pr_L8
+| qwen3 ?B Q8_0                  | 723.44 MiB |   713.85 M | SPACEMIT   |  -1 |   1 | SPACEMIT0    |           pp156 |     1803.89 ± 106.53 |
+=== rot0 model=pr_L12
+| qwen3 ?B Q8_0                  | 927.50 MiB |   915.20 M | SPACEMIT   |  -1 |   1 | SPACEMIT0    |           pp156 |      1277.10 ± 64.28 |
+=== rot2 model=pr_L12
+| qwen3 ?B Q8_0                  | 927.50 MiB |   915.20 M | SPACEMIT   |  -1 |   1 | SPACEMIT0    |           pp156 |      1238.82 ± 67.17 |
+=== rot0 model=pr_L16
+| qwen3 ?B Q8_0                  |   1.11 GiB |     1.12 B | SPACEMIT   |  -1 |   1 | SPACEMIT0    |           pp156 |       982.60 ± 42.18 |
+=== rot2 model=pr_L16
+| qwen3 ?B Q8_0                  |   1.11 GiB |     1.12 B | SPACEMIT   |  -1 |   1 | SPACEMIT0    |           pp156 |       949.51 ± 39.28 |
+DEPTH_ROT_DONE
+
+[exited with code 0]

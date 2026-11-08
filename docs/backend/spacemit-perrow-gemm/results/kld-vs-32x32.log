@@ -1,0 +1,53 @@
+=== base-pr32x32 12:14:41
+2.20.519.057 I Final estimate: PPL = 14.6270 +/- 0.57295
+=== perrow-vs-pr32x32 12:17:02
+chunk             PPL               ln(PPL(Q)/PPL(base))          KL Divergence              Δp RMS            Same top p
+Mean PPL(Q)                   :  14.653004 ±   0.569495
+Mean PPL(base)                :  14.319502 ±   0.544718
+Cor(ln(PPL(Q)), ln(PPL(base))):  98.69%
+Mean ln(PPL(Q)/PPL(base))     :   0.023023 ±   0.006279
+Mean PPL(Q)/PPL(base)         :   1.023290 ±   0.006425
+Mean PPL(Q)-PPL(base)         :   0.333502 ±   0.093507
+Mean    KLD:   0.045524 ±   0.001715
+Maximum KLD:   6.703364
+99.9%   KLD:   1.909903
+99.0%   KLD:   0.497444
+Median  KLD:   0.015092
+Mean    Δp: -0.491 ± 0.072 %
+RMS Δp    :  6.541 ± 0.227 %
+Same top p: 91.311 ± 0.312 %
+=== base-orig 12:18:33
+2.19.091.733 I Final estimate: PPL = 14.6257 +/- 0.57326
+=== pr32x32-vs-orig 12:20:52
+chunk             PPL               ln(PPL(Q)/PPL(base))          KL Divergence              Δp RMS            Same top p
+Mean PPL(Q)                   :  14.627024 ±   0.572953
+Mean PPL(base)                :  14.322683 ±   0.545493
+Cor(ln(PPL(Q)), ln(PPL(base))):  99.34%
+Mean ln(PPL(Q)/PPL(base))     :   0.021026 ±   0.004566
+Mean PPL(Q)/PPL(base)         :   1.021249 ±   0.004663
+Mean PPL(Q)-PPL(base)         :   0.304342 ±   0.069828
+Mean    KLD:   0.005814 ±   0.000181
+Maximum KLD:   0.510432
+99.9%   KLD:   0.217789
+99.0%   KLD:   0.059760
+Median  KLD:   0.002105
+Mean    Δp: -0.044 ± 0.025 %
+RMS Δp    :  2.286 ± 0.081 %
+Same top p: 96.973 ± 0.190 %
+=== perrow-vs-orig 12:23:32
+chunk             PPL               ln(PPL(Q)/PPL(base))          KL Divergence              Δp RMS            Same top p
+Mean PPL(Q)                   :  14.653004 ±   0.569495
+Mean PPL(base)                :  14.322683 ±   0.545493
+Cor(ln(PPL(Q)), ln(PPL(base))):  98.64%
+Mean ln(PPL(Q)/PPL(base))     :   0.022801 ±   0.006384
+Mean PPL(Q)/PPL(base)         :   1.023063 ±   0.006532
+Mean PPL(Q)-PPL(base)         :   0.330322 ±   0.094884
+Mean    KLD:   0.045929 ±   0.001553
+Maximum KLD:   3.768436
+99.9%   KLD:   2.018286
+99.0%   KLD:   0.482425
+Median  KLD:   0.015928
+Mean    Δp: -0.535 ± 0.072 %
+RMS Δp    :  6.508 ± 0.217 %
+Same top p: 91.360 ± 0.311 %
+KLD_DONE

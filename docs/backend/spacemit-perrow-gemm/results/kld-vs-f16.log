@@ -1,0 +1,89 @@
+=== q8-32x32 14:48:21
+chunk             PPL               ln(PPL(Q)/PPL(base))          KL Divergence              Δp RMS            Same top p
+Mean PPL(Q)                   :  14.625749 ±   0.573260
+Mean PPL(Q)/PPL(base)         :   1.027780 ±   0.004442
+Mean PPL(Q)-PPL(base)         :   0.395320 ±   0.068150
+Mean    KLD:   0.003948 ±   0.000175
+99.9%   KLD:   0.170772
+99.0%   KLD:   0.036834
+Median  KLD:   0.001430
+RMS Δp    :  1.867 ± 0.061 %
+Same top p: 97.402 ± 0.176 %
+=== pr-rot0 14:50:35
+chunk             PPL               ln(PPL(Q)/PPL(base))          KL Divergence              Δp RMS            Same top p
+Mean PPL(Q)                   :  14.653004 ±   0.569495
+Mean PPL(Q)/PPL(base)         :   1.029695 ±   0.006607
+Mean PPL(Q)-PPL(base)         :   0.422575 ±   0.096189
+Mean    KLD:   0.046744 ±   0.001552
+99.9%   KLD:   1.944112
+99.0%   KLD:   0.468464
+Median  KLD:   0.016219
+RMS Δp    :  6.559 ± 0.209 %
+Same top p: 91.078 ± 0.316 %
+=== pr-rot1 14:51:58
+chunk             PPL               ln(PPL(Q)/PPL(base))          KL Divergence              Δp RMS            Same top p
+Mean PPL(Q)                   :  14.621755 ±   0.571656
+Mean PPL(Q)/PPL(base)         :   1.027499 ±   0.004941
+Mean PPL(Q)-PPL(base)         :   0.391326 ±   0.074252
+Mean    KLD:   0.011912 ±   0.000663
+99.9%   KLD:   0.462127
+99.0%   KLD:   0.109395
+Median  KLD:   0.004223
+RMS Δp    :  2.986 ± 0.080 %
+Same top p: 95.600 ± 0.227 %
+=== pr-rot2 14:53:24
+chunk             PPL               ln(PPL(Q)/PPL(base))          KL Divergence              Δp RMS            Same top p
+Mean PPL(Q)                   :  14.645773 ±   0.573669
+Mean PPL(Q)/PPL(base)         :   1.029187 ±   0.004991
+Mean PPL(Q)-PPL(base)         :   0.415344 ±   0.075484
+Mean    KLD:   0.010677 ±   0.000372
+99.9%   KLD:   0.532763
+99.0%   KLD:   0.122902
+Median  KLD:   0.003499
+RMS Δp    :  3.018 ± 0.115 %
+Same top p: 95.564 ± 0.228 %
+=== q8-perrow-rot2 14:54:50
+chunk             PPL               ln(PPL(Q)/PPL(base))          KL Divergence              Δp RMS            Same top p
+Mean PPL(Q)                   :  14.701324 ±   0.577965
+Mean PPL(Q)/PPL(base)         :   1.033091 ±   0.004693
+Mean PPL(Q)-PPL(base)         :   0.470895 ±   0.073055
+Mean    KLD:   0.007114 ±   0.000271
+99.9%   KLD:   0.242594
+99.0%   KLD:   0.072972
+Median  KLD:   0.002522
+RMS Δp    :  2.639 ± 0.144 %
+Same top p: 96.458 ± 0.205 %
+=== f16-perrow-rot2 14:56:17
+chunk             PPL               ln(PPL(Q)/PPL(base))          KL Divergence              Δp RMS            Same top p
+Mean PPL(Q)                   :  14.497433 ±   0.565740
+Mean PPL(Q)/PPL(base)         :   1.018763 ±   0.004370
+Mean PPL(Q)-PPL(base)         :   0.267004 ±   0.064826
+Mean    KLD:   0.004486 ±   0.000175
+99.9%   KLD:   0.243158
+99.0%   KLD:   0.046790
+Median  KLD:   0.001441
+RMS Δp    :  2.076 ± 0.097 %
+Same top p: 97.181 ± 0.183 %
+=== f16-perrow-rot1 15:07:25
+chunk             PPL               ln(PPL(Q)/PPL(base))          KL Divergence              Δp RMS            Same top p
+Mean PPL(Q)                   :  14.472124 ±   0.563437
+Mean PPL(Q)/PPL(base)         :   1.016984 ±   0.004356
+Mean PPL(Q)-PPL(base)         :   0.241695 ±   0.064123
+Mean    KLD:   0.005314 ±   0.000203
+99.9%   KLD:   0.165921
+99.0%   KLD:   0.055634
+Median  KLD:   0.001858
+RMS Δp    :  2.070 ± 0.061 %
+Same top p: 97.034 ± 0.188 %
+=== f16-perrow-rot0 15:12:33
+chunk             PPL               ln(PPL(Q)/PPL(base))          KL Divergence              Δp RMS            Same top p
+Mean PPL(Q)                   :  14.462847 ±   0.556158
+Mean PPL(Q)/PPL(base)         :   1.016332 ±   0.006255
+Mean PPL(Q)-PPL(base)         :   0.232418 ±   0.089375
+Mean    KLD:   0.043567 ±   0.001620
+99.9%   KLD:   1.681692
+99.0%   KLD:   0.440696
+Median  KLD:   0.015137
+RMS Δp    :  6.217 ± 0.197 %
+Same top p: 91.569 ± 0.308 %
+KLD2_DONE
