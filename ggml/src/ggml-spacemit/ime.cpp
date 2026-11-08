@@ -1470,12 +1470,69 @@ class tensor_traits_common : public ggml::spacemit::tensor_traits_base {
 //   groups[M16/16][K/16][16 rows][16 B] int8, then scales[M16] f32
 namespace perrow_q8 {
 
-static bool enabled() {
-    static const bool on = [] {
+// GGML_SPACEMIT_PERROW: 0 off; 1 (default) Q8_0 weights whose 32-blocks share one
+// scale per row; 2 every Q8_0 or F16 2D weight under blk.* (requantized per row).
+static int mode() {
+    static const int m = [] {
         const char * env = std::getenv("GGML_SPACEMIT_PERROW");
-        return env == nullptr || std::atoi(env) != 0;
+        return env ? std::atoi(env) : 1;
     }();
-    return on;
+    return m;
+}
+
+static bool enabled() {
+    return mode() != 0;
+}
+
+// GGML_SPACEMIT_PERROW_ROT: orthogonal rotation along k applied to both weights
+// (at load) and activations (before quantization), so outlier channels are
+// spread over the whole row and one INT8 scale per row fits. 0 none; 1 Hadamard
+// across 32-wide rows only (H_R x I_32); 2 (default) full Walsh-Hadamard over
+// blocks of B = the largest power of two dividing K, at most 2048.
+static int rot_mode() {
+    static const int m = [] {
+        const char * env = std::getenv("GGML_SPACEMIT_PERROW_ROT");
+        return env ? std::atoi(env) : 2;
+    }();
+    return m;
+}
+
+static int64_t rot_block(int64_t K) {
+    int64_t b = 1;
+    while (K % (b * 2) == 0 && b * 2 <= 2048) {
+        b *= 2;
+    }
+    return rot_mode() != 0 && b >= 64 ? b : 0;
+}
+
+// Butterflies with distance >= this are applied; 1 for the full transform.
+static int64_t rot_h0() {
+    return rot_mode() == 1 ? 32 : 1;
+}
+
+// Scalar reference rotation, orthonormal. Used for the weights at load time.
+static void rotate_ref(float * x, int64_t K) {
+    const int64_t B = rot_block(K);
+    if (B == 0) {
+        return;
+    }
+    const int64_t h0 = rot_h0();
+    const float   sc = 1.0f / std::sqrt((float) (B / h0));
+    for (int64_t b = 0; b < K; b += B) {
+        float * v = x + b;
+        for (int64_t h = h0; h < B; h *= 2) {
+            for (int64_t i = 0; i < B; i += 2 * h) {
+                for (int64_t j = i; j < i + h; ++j) {
+                    const float a = v[j], c = v[j + h];
+                    v[j]          = a + c;
+                    v[j + h]      = a - c;
+                }
+            }
+        }
+        for (int64_t j = 0; j < B; ++j) {
+            v[j] *= sc;
+        }
+    }
 }
 
 static float half_to_float(ggml_half h) {
@@ -1484,15 +1541,25 @@ static float half_to_float(ggml_half h) {
     return (float) f;
 }
 
+static bool weight_name(const ggml_tensor * t) {
+    return strncmp(t->name, "blk.", 4) == 0;
+}
+
+static bool shape_ok(const ggml_tensor * t) {
+    return t->ne[2] == 1 && t->ne[3] == 1 && t->ne[0] >= 64 && t->ne[0] % 64 == 0;
+}
+
 static bool eligible(const ggml_tensor * t, const void * data, size_t data_size) {
-    if (!enabled() || t->type != GGML_TYPE_Q8_0 || t->ne[2] != 1 || t->ne[3] != 1 || t->ne[0] < 64 ||
-        t->ne[0] % 64 != 0) {
+    if (!enabled() || t->type != GGML_TYPE_Q8_0 || !shape_ok(t)) {
         return false;
     }
     const int64_t nblk = t->ne[0] / QK8_0;
     const int64_t nrow = t->ne[1];
     if (data_size != (size_t) (nrow * nblk) * sizeof(block_q8_0)) {
         return false;
+    }
+    if (mode() == 2) {
+        return weight_name(t);
     }
     const auto * src = static_cast<const block_q8_0 *>(data);
     for (int64_t r = 0; r < nrow; ++r) {
@@ -1506,35 +1573,104 @@ static bool eligible(const ggml_tensor * t, const void * data, size_t data_size)
     return true;
 }
 
-static void repack(ggml_tensor * t, const block_q8_0 * src) {
+// F16 weights are taken on metadata alone (the traits are chosen before the data arrives).
+static bool eligible_f16(const ggml_tensor * t) {
+    return mode() == 2 && t->type == GGML_TYPE_F16 && shape_ok(t) && weight_name(t) && ggml_n_dims(t) == 2;
+}
+
+// Weights as N32 strips of [K/16][32 cols][16 B] followed by one f32 scale per row.
+// row(n, out) writes row n of the source as K floats. Rows are rotated, then
+// quantized to symmetric INT8 with one scale each. A uniform-scale Q8_0 source
+// with rotation off is copied bit-exactly instead.
+template <typename Row>
+static void repack_rows(ggml_tensor * t, const Row & row) {
     const int64_t K      = t->ne[0];
     const int64_t N      = t->ne[1];
-    const int64_t nblk   = K / QK8_0;
     const int64_t nstrip = (N + 31) / 32;
     auto *        dst    = static_cast<int8_t *>(t->data);
+    std::vector<float> scales(nstrip * 32, 0.0f);
     // Each strip is assembled in host memory and written to the tensor buffer in
     // one sequential copy: scattered 16 B stores straight into the backend buffer
-    // ran at ~10 MB/s on K3.
-    std::vector<int8_t> strip(32 * K);
-    std::vector<float>  scales(nstrip * 32, 0.0f);
-    for (int64_t s = 0; s < nstrip; ++s) {
-        for (int64_t c = 0; c < 32; ++c) {
-            const int64_t n = s * 32 + c;
-            if (n >= N) {
-                for (int64_t kb = 0; kb < K / 16; ++kb) {
-                    memset(strip.data() + kb * 512 + c * 16, 0, 16);
+    // ran at ~10 MB/s on K3. Strips are split across threads (the load runs on
+    // the X100 cores; the rotation is ~11 butterfly passes per weight).
+    const int nth = (int) std::max(1u, std::min(8u, std::thread::hardware_concurrency()));
+    auto      work = [&](int ith) {
+        std::vector<int8_t> strip(32 * K);
+        std::vector<float>  f(K);
+        std::vector<int8_t> q(K);
+        for (int64_t s = ith; s < nstrip; s += nth) {
+            for (int64_t c = 0; c < 32; ++c) {
+                const int64_t n = s * 32 + c;
+                if (n >= N) {
+                    for (int64_t kb = 0; kb < K / 16; ++kb) {
+                        memset(strip.data() + kb * 512 + c * 16, 0, 16);
+                    }
+                    continue;
                 }
-                continue;
+                scales[n] = row(n, f.data(), q.data());
+                for (int64_t kb = 0; kb < K / 16; ++kb) {
+                    memcpy(strip.data() + kb * 512 + c * 16, q.data() + kb * 16, 16);
+                }
             }
-            const block_q8_0 * row = src + n * nblk;
-            scales[n]              = half_to_float(row[0].d);
-            for (int64_t kb = 0; kb < K / 16; ++kb) {
-                memcpy(strip.data() + kb * 512 + c * 16, row[kb / 2].qs + (kb % 2) * 16, 16);
-            }
+            memcpy(dst + s * 32 * K, strip.data(), strip.size());
         }
-        memcpy(dst + s * 32 * K, strip.data(), strip.size());
+    };
+    std::vector<std::thread> pool;
+    for (int i = 1; i < nth; ++i) {
+        pool.emplace_back(work, i);
+    }
+    work(0);
+    for (auto & th : pool) {
+        th.join();
     }
     memcpy(dst + nstrip * 32 * K, scales.data(), scales.size() * sizeof(float));
+}
+
+// Rotate f (K floats) and quantize it per row into q; returns the scale.
+static float rotate_quantize(float * f, int64_t K, int8_t * q) {
+    rotate_ref(f, K);
+    float amax = 0.0f;
+    for (int64_t k = 0; k < K; ++k) {
+        amax = std::max(amax, std::fabs(f[k]));
+    }
+    const float d  = amax / 127.0f;
+    const float id = d != 0.0f ? 1.0f / d : 0.0f;
+    for (int64_t k = 0; k < K; ++k) {
+        q[k] = (int8_t) std::max(-127.0f, std::min(127.0f, std::nearbyint(f[k] * id)));
+    }
+    return d;
+}
+
+static void repack(ggml_tensor * t, const block_q8_0 * src) {
+    const int64_t K    = t->ne[0];
+    const int64_t nblk = K / QK8_0;
+    const bool    copy = rot_block(K) == 0 && mode() == 1;
+    repack_rows(t, [&](int64_t n, float * f, int8_t * q) {
+        const block_q8_0 * row = src + n * nblk;
+        if (copy) {
+            for (int64_t b = 0; b < nblk; ++b) {
+                memcpy(q + b * QK8_0, row[b].qs, QK8_0);
+            }
+            return half_to_float(row[0].d);
+        }
+        for (int64_t b = 0; b < nblk; ++b) {
+            const float d = half_to_float(row[b].d);
+            for (int j = 0; j < QK8_0; ++j) {
+                f[b * QK8_0 + j] = d * row[b].qs[j];
+            }
+        }
+        return rotate_quantize(f, K, q);
+    });
+}
+
+static void repack_f16(ggml_tensor * t, const ggml_half * src) {
+    const int64_t K = t->ne[0];
+    repack_rows(t, [&](int64_t n, float * f, int8_t * q) {
+        for (int64_t k = 0; k < K; ++k) {
+            f[k] = half_to_float(src[n * K + k]);
+        }
+        return rotate_quantize(f, K, q);
+    });
 }
 
 // 16x32 int32 tile over `blocks` 16-k blocks: a is 16 rows x 16 B per block,
@@ -1630,9 +1766,134 @@ __attribute__((noinline)) static void tile_m16n32(const int8_t * a, const int8_t
           "v29", "v30", "v31");
 }
 
+// rotate_ref without the normalization (folded into the row scale), on the A100
+// (VLEN 1024). Distances >= 32 are butterflies between contiguous runs;
+// distances 1..16 stay inside 128-element register groups and use slides.
+static void rotate_vec_generic(float * v, int64_t K) {
+    const int64_t B  = rot_block(K);
+    const int64_t h0 = rot_h0();
+    for (int64_t b0 = 0; b0 < K; b0 += B) {
+        float * x = v + b0;
+        for (int64_t h = std::max<int64_t>(h0, 32); h < B; h *= 2) {
+            for (int64_t i = 0; i < B; i += 2 * h) {
+                for (int64_t j = 0; j < h;) {
+                    const size_t vl = __riscv_vsetvl_e32m8(h - j);
+                    const auto   a  = __riscv_vle32_v_f32m8(x + i + j, vl);
+                    const auto   c  = __riscv_vle32_v_f32m8(x + i + j + h, vl);
+                    __riscv_vse32_v_f32m8(x + i + j, __riscv_vfadd_vv_f32m8(a, c, vl), vl);
+                    __riscv_vse32_v_f32m8(x + i + j + h, __riscv_vfsub_vv_f32m8(a, c, vl), vl);
+                    j += vl;
+                }
+            }
+        }
+        if (h0 < 32) {
+            const size_t vl = __riscv_vsetvl_e32m4((size_t) std::min<int64_t>(B, 128));
+            const auto   id = __riscv_vid_v_u32m4(vl);
+            const auto   hi = [&](unsigned h) { return __riscv_vmsne_vx_u32m4_b8(__riscv_vand_vx_u32m4(id, h, vl), 0, vl); };
+            const auto   m1 = hi(1), m2 = hi(2), m4 = hi(4), m8 = hi(8), m16 = hi(16);
+            const auto   stage = [&](vfloat32m4_t xv, size_t h, vbool8_t m) {
+                const auto dn = __riscv_vslidedown_vx_f32m4(xv, h, vl);    // x[i + h]
+                const auto up = __riscv_vslideup_vx_f32m4(xv, xv, h, vl);  // x[i - h]
+                return __riscv_vmerge_vvm_f32m4(__riscv_vfadd_vv_f32m4(xv, dn, vl), __riscv_vfsub_vv_f32m4(up, xv, vl),
+                                                m, vl);
+            };
+            for (int64_t c0 = 0; c0 < B; c0 += vl) {
+                auto xv = __riscv_vle32_v_f32m4(x + c0, vl);
+                xv      = stage(xv, 1, m1);
+                xv      = stage(xv, 2, m2);
+                xv      = stage(xv, 4, m4);
+                xv      = stage(xv, 8, m8);
+                xv      = stage(xv, 16, m16);
+                __riscv_vse32_v_f32m4(x + c0, xv, vl);
+            }
+        }
+    }
+}
+
+// Fast path for B >= 256 on VLEN 1024 (256 floats per e32m8 group): each
+// 256-float chunk is read from src once and gets every butterfly with distance
+// < 256 in registers (1..16 by slides, 32/64/128 between its eight vregs); the
+// distances 256..B/2 then run on x in memory. src and x may be the same.
+static void rotate_vec(const float * src, float * x, int64_t K) {
+    const int64_t B = rot_block(K);
+    if (B < 256 || __riscv_vsetvlmax_e32m8() != 256) {
+        if (src != x) {
+            memcpy(x, src, K * sizeof(float));
+        }
+        rotate_vec_generic(x, K);
+        return;
+    }
+    const bool   full = rot_h0() == 1;
+    const size_t vl   = 256;
+    const auto   id   = __riscv_vid_v_u32m8(vl);
+    const auto   hi   = [&](unsigned h) { return __riscv_vmsne_vx_u32m8_b4(__riscv_vand_vx_u32m8(id, h, vl), 0, vl); };
+    const auto   m1 = hi(1), m2 = hi(2), m4 = hi(4), m8 = hi(8), m16 = hi(16);
+    const auto   stage = [&](vfloat32m8_t xv, size_t h, vbool4_t m) {
+        const auto dn = __riscv_vslidedown_vx_f32m8(xv, h, vl);    // x[i + h]
+        const auto up = __riscv_vslideup_vx_f32m8(xv, xv, h, vl);  // x[i - h]
+        return __riscv_vmerge_vvm_f32m8(__riscv_vfadd_vv_f32m8(xv, dn, vl), __riscv_vfsub_vv_f32m8(up, xv, vl), m,
+                                        vl);
+    };
+    const size_t v1 = 32;
+    const auto   bf = [&](vfloat32m1_t & a, vfloat32m1_t & c) {
+        const auto t = __riscv_vfadd_vv_f32m1(a, c, v1);
+        c            = __riscv_vfsub_vv_f32m1(a, c, v1);
+        a            = t;
+    };
+    for (int64_t c0 = 0; c0 < K; c0 += 256) {
+        auto xv = __riscv_vle32_v_f32m8(src + c0, vl);
+        if (full) {
+            xv = stage(xv, 1, m1);
+            xv = stage(xv, 2, m2);
+            xv = stage(xv, 4, m4);
+            xv = stage(xv, 8, m8);
+            xv = stage(xv, 16, m16);
+        }
+        auto r0 = __riscv_vget_v_f32m8_f32m1(xv, 0), r1 = __riscv_vget_v_f32m8_f32m1(xv, 1);
+        auto r2 = __riscv_vget_v_f32m8_f32m1(xv, 2), r3 = __riscv_vget_v_f32m8_f32m1(xv, 3);
+        auto r4 = __riscv_vget_v_f32m8_f32m1(xv, 4), r5 = __riscv_vget_v_f32m8_f32m1(xv, 5);
+        auto r6 = __riscv_vget_v_f32m8_f32m1(xv, 6), r7 = __riscv_vget_v_f32m8_f32m1(xv, 7);
+        bf(r0, r1), bf(r2, r3), bf(r4, r5), bf(r6, r7);
+        bf(r0, r2), bf(r1, r3), bf(r4, r6), bf(r5, r7);
+        bf(r0, r4), bf(r1, r5), bf(r2, r6), bf(r3, r7);
+        xv = __riscv_vset_v_f32m1_f32m8(xv, 0, r0);
+        xv = __riscv_vset_v_f32m1_f32m8(xv, 1, r1);
+        xv = __riscv_vset_v_f32m1_f32m8(xv, 2, r2);
+        xv = __riscv_vset_v_f32m1_f32m8(xv, 3, r3);
+        xv = __riscv_vset_v_f32m1_f32m8(xv, 4, r4);
+        xv = __riscv_vset_v_f32m1_f32m8(xv, 5, r5);
+        xv = __riscv_vset_v_f32m1_f32m8(xv, 6, r6);
+        xv = __riscv_vset_v_f32m1_f32m8(xv, 7, r7);
+        __riscv_vse32_v_f32m8(x + c0, xv, vl);
+    }
+    for (int64_t b0 = 0; b0 < K; b0 += B) {
+        float * v = x + b0;
+        for (int64_t h = 256; h < B; h *= 2) {
+            for (int64_t i = 0; i < B; i += 2 * h) {
+                for (int64_t j = 0; j < h; j += 256) {
+                    const auto a = __riscv_vle32_v_f32m8(v + i + j, vl);
+                    const auto c = __riscv_vle32_v_f32m8(v + i + j + h, vl);
+                    __riscv_vse32_v_f32m8(v + i + j, __riscv_vfadd_vv_f32m8(a, c, vl), vl);
+                    __riscv_vse32_v_f32m8(v + i + j + h, __riscv_vfsub_vv_f32m8(a, c, vl), vl);
+                }
+            }
+        }
+    }
+}
+
 // Quantize one activation row to symmetric INT8 with a single scale and scatter
-// its 16 B k-chunks into row `rr` of a 16-row A group. `line` is K bytes scratch.
-static void quantize_row(const float * x, int64_t K, int8_t * group, int64_t rr, float * scale, int8_t * line) {
+// its 16 B k-chunks into row `rr` of a 16-row A group. `scratch` is 5K bytes:
+// the rotated row as floats, then the K int8 codes.
+static void quantize_row(const float * x, int64_t K, int8_t * group, int64_t rr, float * scale, uint8_t * scratch) {
+    auto *      f    = reinterpret_cast<float *>(scratch);
+    auto *      line = reinterpret_cast<int8_t *>(scratch + K * sizeof(float));
+    const int64_t B  = rot_block(K);
+    float       norm = 1.0f;
+    if (B != 0) {
+        rotate_vec(x, f, K);
+        x    = f;
+        norm = 1.0f / std::sqrt((float) (B / rot_h0()));
+    }
     const size_t vlmax = __riscv_vsetvlmax_e32m8();
     vfloat32m8_t mx    = __riscv_vfmv_v_f_f32m8(0.0f, vlmax);
     for (int64_t c = 0; c < K;) {
@@ -1644,7 +1905,7 @@ static void quantize_row(const float * x, int64_t K, int8_t * group, int64_t rr,
         __riscv_vfmv_f_s_f32m1_f32(__riscv_vfredmax_vs_f32m8_f32m1(mx, __riscv_vfmv_v_f_f32m1(0.0f, 1), vlmax));
     const float d  = amax / 127.0f;
     const float id = d != 0.0f ? 1.0f / d : 0.0f;
-    *scale         = d;
+    *scale         = d * norm;
     for (int64_t c = 0; c < K;) {
         const size_t vl = __riscv_vsetvl_e32m8(K - c);
         auto         q  = __riscv_vfcvt_x_f_v_i32m8(__riscv_vfmul_vf_f32m8(__riscv_vle32_v_f32m8(x + c, vl), id, vl), vl);
@@ -1736,6 +1997,64 @@ static void a_reserve(int64_t M, int64_t K) {
     g_a.data = nullptr;
 }
 
+// GGML_SPACEMIT_PERROW_CHECK=<calls>: for the first <calls> matmuls, worker 0
+// recomputes three rows in scalar code and prints the kernel's error against the
+// exact integer result of its own quantized inputs (kernel bugs, including the
+// vector rotation, which the reference redoes with rotate_ref), and the error of
+// the activation quantization against float activations with the stored weights.
+template <typename XRow>
+static void check(ggml::spacemit::context & ctx, const ggml_tensor * op, const XRow & x_row, const int8_t * w,
+                  const float * ws, const int8_t * ap, const float * as) {
+    static const int limit = [] {
+        const char * env = std::getenv("GGML_SPACEMIT_PERROW_CHECK");
+        return env ? std::atoi(env) : 0;
+    }();
+    static int calls = 0;
+    if (limit <= 0) {
+        return;
+    }
+    ctx.sync();
+    if (ctx.ith == 0 && calls < limit) {
+        ++calls;
+        const ggml_tensor * src0 = op->src[0];
+        const int64_t       K = src0->ne[0], N = src0->ne[1];
+        const int64_t       M = op->src[1]->ne[1] * op->src[1]->ne[2] * op->src[1]->ne[3];
+        const auto *        y = static_cast<const float *>(op->data);
+        double              e_kern = 0, e_act = 0, ref2 = 0, outlier = 0;
+        std::vector<float>  xr(K);
+        for (int64_t r : { (int64_t) 0, M / 2, M - 1 }) {
+            memcpy(xr.data(), x_row(r), K * sizeof(float));
+            rotate_ref(xr.data(), K);
+            double xmax = 0, x2 = 0;
+            for (int64_t k = 0; k < K; ++k) {
+                xmax = std::max(xmax, (double) std::fabs(xr[k]));
+                x2 += (double) xr[k] * xr[k];
+            }
+            outlier = std::max(outlier, xmax / std::sqrt(x2 / K));
+            for (int64_t n = 0; n < N; ++n) {
+                const int8_t * col = w + (n / 32) * 32 * K + (n % 32) * 16;
+                double         ref = 0;
+                int64_t        acc = 0;
+                for (int64_t k = 0; k < K; ++k) {
+                    const int wq = col[(k / 16) * 512 + k % 16];
+                    acc += (int64_t) wq * ap[(r / 16) * 16 * K + (k / 16) * 256 + (r % 16) * 16 + k % 16];
+                    ref += (double) wq * xr[k];
+                }
+                const double exact = (double) acc * ws[n] * as[r];
+                ref *= ws[n];
+                const double out = y[r * N + n];
+                e_kern += (out - exact) * (out - exact);
+                e_act += (exact - ref) * (exact - ref);
+                ref2 += ref * ref;
+            }
+        }
+        fprintf(stderr, "perrow check %-24s M=%lld N=%lld K=%lld rot=%d kernel=%.2e act=%.3e outlier=%.1f\n",
+                src0->name, (long long) M, (long long) N, (long long) K, rot_mode(), std::sqrt(e_kern / ref2),
+                std::sqrt(e_act / ref2), outlier);
+    }
+    ctx.sync();
+}
+
 static bool forward_mul_mat(ggml::spacemit::context & ctx, ggml_tensor * op) {
     const ggml_tensor * src0 = op->src[0];
     const ggml_tensor * src1 = op->src[1];
@@ -1753,7 +2072,7 @@ static bool forward_mul_mat(ggml::spacemit::context & ctx, ggml_tensor * op) {
 
     auto * tcm      = static_cast<uint8_t *>(ctx.shared.data);
     const size_t ts = ctx.shared.size;
-    GGML_ASSERT(tcm != nullptr && ts >= (size_t) K && ts >= 48 * 64);
+    GGML_ASSERT(tcm != nullptr && ts >= (size_t) K * 5 && ts >= 48 * 64);
 
     const auto * w  = static_cast<const int8_t *>(src0->data);
     const auto * ws = reinterpret_cast<const float *>(w + nstrip * 32 * K);
@@ -1791,7 +2110,7 @@ static bool forward_mul_mat(ggml::spacemit::context & ctx, ggml_tensor * op) {
         const int64_t u0    = nunit * ith / nth;
         const int64_t u1    = nunit * (ith + 1) / nth;
         for (int64_t r = u0 * 4; r < std::min(M, u1 * 4); ++r) {
-            quantize_row(x_row(r), K, ap + (r / 16) * 16 * K, r % 16, as + r, reinterpret_cast<int8_t *>(tcm));
+            quantize_row(x_row(r), K, ap + (r / 16) * 16 * K, r % 16, as + r, tcm);
         }
         mark(0);
         ctx.sync();
@@ -1875,6 +2194,7 @@ static bool forward_mul_mat(ggml::spacemit::context & ctx, ggml_tensor * op) {
             }
         }
     }
+    check(ctx, op, x_row, w, ws, ap, as);
     return true;
 }
 
@@ -1922,6 +2242,19 @@ class tensor_traits_q8_0 : public tensor_traits<block_q8_0, 32, 32> {
 };
 
 static const tensor_traits_q8_0 q8_0_32x32_q8_0_or_perrow;
+
+// F16 weights under GGML_SPACEMIT_PERROW=2: quantized per row at load time.
+class tensor_traits_f16_perrow : public tensor_traits_q8_0_perrow {
+    int repack(ggml_tensor * t, const void * data, size_t data_size) const override {
+        GGML_ASSERT(data_size == (size_t) (t->ne[0] * t->ne[1]) * sizeof(ggml_half));
+        perrow_q8::repack_f16(t, static_cast<const ggml_half *>(data));
+        t->extra = (void *) static_cast<const ggml::spacemit::tensor_traits_base *>(&q8_0_perrow);
+        GGML_LOG_DEBUG("%s: repack tensor %s from F16 as per-row INT8\n", __func__, t->name);
+        return 0;
+    }
+};
+
+static const tensor_traits_f16_perrow f16_perrow;
 #endif
 
 // Impl By IME1
@@ -2045,6 +2378,16 @@ const ggml::spacemit::tensor_traits_base * ggml_spacemit_get_optimal_repack_type
 #if defined(RISCV64_SPACEMIT_IME2)
                 if ((ggml::cpu::riscv64_spacemit::global_spine_env_info.use_ime2)) {
                     return &ggml::cpu::riscv64_spacemit::q8_0_32x32_q8_0_or_perrow;
+                }
+#endif
+            }
+            break;
+        case GGML_TYPE_F16:
+            {
+#if defined(RISCV64_SPACEMIT_IME2)
+                if (ggml::cpu::riscv64_spacemit::global_spine_env_info.use_ime2 &&
+                    ggml::cpu::riscv64_spacemit::perrow_q8::eligible_f16(cur)) {
+                    return &ggml::cpu::riscv64_spacemit::f16_perrow;
                 }
 #endif
             }
