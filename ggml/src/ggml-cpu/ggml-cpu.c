@@ -1460,6 +1460,14 @@ struct mmid_row_mapping {
     int32_t i2;
 };
 
+static ggml_cpu_moe_stream_callback moe_stream_callback = NULL;
+static void * moe_stream_user_data = NULL;
+
+void ggml_cpu_set_moe_stream_callback(ggml_cpu_moe_stream_callback callback, void * user_data) {
+    moe_stream_callback = callback;
+    moe_stream_user_data = user_data;
+}
+
 static void ggml_compute_forward_mul_mat_id_one_chunk(
     struct ggml_tensor * dst,
     const struct ggml_tensor * src0,
@@ -1534,6 +1542,10 @@ static void * incr_ptr_aligned(void ** p, size_t size, size_t align) {
 static void ggml_compute_forward_mul_mat_id(
         const struct ggml_compute_params * params,
               struct ggml_tensor * dst) {
+
+    if (moe_stream_callback && moe_stream_callback(dst, params->ith, params->nth, moe_stream_user_data)) {
+        return;
+    }
 
     const struct ggml_tensor * src0 = dst->src[0];
     const struct ggml_tensor * src1 = dst->src[1];

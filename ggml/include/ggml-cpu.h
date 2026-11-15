@@ -125,6 +125,10 @@ extern "C" {
 
     GGML_BACKEND_API void ggml_cpu_init(void);
 
+    // Experimental hook. Set only while no graph is running. Return false to use the normal kernel.
+    typedef bool (*ggml_cpu_moe_stream_callback)(struct ggml_tensor * dst, int ith, int nth, void * user_data);
+    GGML_BACKEND_API void ggml_cpu_set_moe_stream_callback(ggml_cpu_moe_stream_callback callback, void * user_data);
+
     //
     // CPU backend
     //

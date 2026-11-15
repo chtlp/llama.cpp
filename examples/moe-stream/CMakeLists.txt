@@ -1,0 +1,5 @@
+set(TARGET llama-moe-stream)
+add_executable(${TARGET} moe-stream.cpp)
+target_link_libraries(${TARGET} PRIVATE llama ggml-cpu ${CMAKE_THREAD_LIBS_INIT})
+target_compile_features(${TARGET} PRIVATE cxx_std_17)
+install(TARGETS ${TARGET} RUNTIME)
