@@ -76,6 +76,88 @@
 
 namespace ggml::cpu::riscv64_spacemit {
 
+static bool env_q41_m4() {
+    return spacemit_opt_flags::instance().q41_m4;
+}
+
+static bool env_q8_small_m() {
+    return spacemit_opt_flags::instance().q8_small_m;
+}
+
+static bool env_moe_small_m() {
+    return spacemit_opt_flags::instance().moe_small_m;
+}
+
+static bool env_mtp_head_q4() {
+    return spacemit_opt_flags::instance().mtp_head_q4;
+}
+
+static int64_t env_mtp_head_vocab() {
+    return spacemit_opt_flags::instance().mtp_head_vocab;
+}
+
+struct mtp_head_q4_cache {
+    const void *         src_data = nullptr;
+    int64_t              N        = 0;
+    int64_t              K        = 0;
+    int64_t              n_active = 0;
+    std::vector<uint8_t> blocks;
+};
+
+static mtp_head_q4_cache g_mtp_head_q4_cache;
+
+static void convert_q8_32x32_tile_to_q41(const uint8_t *       src_tile,
+                                         Q41Block<32, 32, 2> * dst_tile,
+                                         int64_t               k_blks) {
+    constexpr size_t q8_blk_bytes = 32 * sizeof(_Float16) + 32 * 32 * sizeof(int8_t);  // 1088
+    for (int64_t kb = 0; kb < k_blks; ++kb) {
+        const uint8_t *  sb  = src_tile + kb * q8_blk_bytes;
+        const _Float16 * d8  = reinterpret_cast<const _Float16 *>(sb);
+        const int8_t *   qs8 = reinterpret_cast<const int8_t *>(sb + 32 * sizeof(_Float16));
+        Q41Block<32, 32, 2> & blk = dst_tile[kb];
+        for (int i = 0; i < 32; ++i) {
+            // Repacked block_q8_0x32 (after q8_0x32_finish) stores each 8-row group as low K16 then high K16.
+            const size_t lane = static_cast<size_t>((i / 8) * 256 + (i % 8) * 16);
+            int8_t row[32];
+            for (int k = 0; k < 16; ++k) {
+                row[k]      = qs8[lane + k];
+                row[k + 16] = qs8[lane + 128 + k];
+            }
+            int qmin = row[0];
+            int qmax = row[0];
+            for (int k = 1; k < 32; ++k) {
+                if (row[k] < qmin) qmin = row[k];
+                if (row[k] > qmax) qmax = row[k];
+            }
+            const float scale8 = static_cast<float>(d8[i]);
+            uint8_t *   dst_row = reinterpret_cast<uint8_t *>(blk.data) + i * 16;
+            if (scale8 == 0.0f || (qmin == 0 && qmax == 0)) {
+                blk.scale[i] = static_cast<_Float16>(0.0f);
+                blk.zp[i]    = 0;
+                std::memset(dst_row, 0, 16);
+                continue;
+            }
+            // Zero-anchored asymmetric 4-bit quantization: exact 0 representation with tight [qmin, qmax] range.
+            const int   lo   = qmin < 0 ? qmin : 0;
+            const int   hi   = qmax > 0 ? qmax : 0;
+            const float step = static_cast<float>(hi - lo) / 15.0f;
+            const float inv  = step > 0.0f ? 1.0f / step : 0.0f;
+            int zp = static_cast<int>(std::lround(-static_cast<float>(lo) * inv));
+            if (zp < 0) zp = 0;
+            if (zp > 15) zp = 15;
+            blk.zp[i]    = static_cast<uint8_t>(zp);
+            blk.scale[i] = static_cast<_Float16>(step * scale8);
+            for (int p = 0; p < 16; ++p) {
+                int q0 = static_cast<int>(std::lround(static_cast<float>(row[2 * p]) * inv)) + zp;
+                int q1 = static_cast<int>(std::lround(static_cast<float>(row[2 * p + 1]) * inv)) + zp;
+                if (q0 < 0) q0 = 0; else if (q0 > 15) q0 = 15;
+                if (q1 < 0) q1 = 0; else if (q1 > 15) q1 = 15;
+                dst_row[p] = static_cast<uint8_t>((q0 & 0x0F) | ((q1 & 0x0F) << 4));
+            }
+        }
+    }
+}
+
 template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS> constexpr size_t get_repacked_block_type_size() {
     if constexpr (std::is_same_v<BLOC_TYPE, block_q6_K> || std::is_same_v<BLOC_TYPE, block_q8_0>) {
         return sizeof(block_q8_0);
@@ -232,12 +314,14 @@ struct gemm_path_f16 {
     mlir::speir::spekernel::spe_pack_cast_function_def dequantpack_b;  // Q41Block -> f16 [K/8][32][8]
     mlir::speir::spekernel::spe_reducesum_mxn_function_def reducesum;  // f16 partials -> f32 (split-K)
 
-    // Decode uses INT32 GEMV directly over Q41Block.
+    // Decode uses INT32 GEMV directly over Q41Block; small-M (2..4) uses INT32 M4 over Q41Block.
     spacemit_kernels::quantize_a_row_def quantize_a_gemv;
     using dot_gemv_def   = decltype(&spacemit_kernels::ime2::gemm_kernel_i8i4_m1_q41);
+    using dot_m4_def     = decltype(&spacemit_kernels::ime2::gemm_kernel_i8i4_m4_q41);
     using dot_f16acc_def = decltype(&spacemit_kernels::ime2::gemm_kernel_f16f16f16_m16_vfwmadot);
     using dot_f32acc_def = decltype(&spacemit_kernels::ime2::gemm_kernel_f16f16f32_m16_vfwmadot);
     dot_gemv_def   dot_gemv;
+    dot_m4_def     dot_m4;
     dot_f16acc_def dot_f16acc;  // F16 partial output.
     dot_f32acc_def dot_f32acc;  // F32 output, optionally accumulated.
 };
@@ -264,6 +348,7 @@ static gemm_path_f16 resolve_gemm_f16() {
         march.value, typeid(_spe_fp16_), typeid(float), 16, 32, 1, 1);
     o.quantize_a_gemv = &spacemit_kernels::rvv::quantize_a_i8_r1;
     o.dot_gemv        = &spacemit_kernels::ime2::gemm_kernel_i8i4_m1_q41;
+    o.dot_m4          = &spacemit_kernels::ime2::gemm_kernel_i8i4_m4_q41;
     o.dot_f16acc      = &spacemit_kernels::ime2::gemm_kernel_f16f16f16_m16_vfwmadot;
     o.dot_f32acc      = &spacemit_kernels::ime2::gemm_kernel_f16f16f32_m16_vfwmadot;
     if (!o.castpack_a || !o.dequantpack_b || !o.reducesum) {
@@ -375,7 +460,10 @@ private:
                         size =
                             spacemit_kernels::div_round_up(src1_nelements, QK_K) * spacemit_kernels::q8k_blk_size(QK_K);
                     } else if constexpr (INTER_SIZE == QK4_0) {
-                        size = spacemit_kernels::div_round_up(src1_nelements, QK4_0) *
+                        const int64_t ne10        = op->src[1]->ne[0];
+                        const int64_t ne1_rows    = ne10 > 0 ? src1_nelements / ne10 : 0;
+                        const int64_t padded_rows = (q8_al_layout() && ne1_rows >= 2 && ne1_rows < 4) ? 4 : ne1_rows;
+                        size = spacemit_kernels::div_round_up(ne10, QK4_0) * padded_rows *
                                (q8_al_layout() ? spacemit_kernels::q8_m4al_row_blk_size :
                                            spacemit_kernels::q8_blk_size(QK4_0, true));
                     } else if constexpr (INTER_SIZE == 256) {
@@ -530,8 +618,116 @@ private:
         const int64_t a_k_blks = spacemit_kernels::div_round_up(gemm_k, a_blk_len);
         const int64_t b_k_blks = spacemit_kernels::div_round_up(gemm_k, b_blk_len);
 
+        // SpecPilot-style lossless MTP drafter acceleration:
+        // For draft-only MTP lm_head (src1->name == "mtp_shared_head_norm"), lazily build a compact
+        // Q41Block copy (optionally vocab-capped) and compute directly from DRAM without touching
+        // the exact Q6_K/Q8_0 target output.weight.
+        if constexpr ((std::is_same_v<BLOC_TYPE, block_q6_K> || std::is_same_v<BLOC_TYPE, block_q8_0>) &&
+                      INTER_SIZE == 32 && NB_COLS == 32) {
+            if (env_mtp_head_q4() && gemm_m >= 1 && gemm_m <= 4 && gemm_k % 32 == 0 && gemm_n % 32 == 0 &&
+                std::strcmp(src1->name, "mtp_shared_head_norm") == 0) {
+                const int64_t vocab_cap = env_mtp_head_vocab();
+                int64_t       n_active  = gemm_n;
+                if (vocab_cap > 0 && vocab_cap < gemm_n) {
+                    n_active = ((vocab_cap + 31) / 32) * 32;
+                    if (n_active > gemm_n) {
+                        n_active = gemm_n;
+                    }
+                }
+                const int64_t n_tiles = n_active / 32;
+
+                const bool need_build =
+                    (g_mtp_head_q4_cache.src_data != w_data || g_mtp_head_q4_cache.N != gemm_n ||
+                     g_mtp_head_q4_cache.K != gemm_k || g_mtp_head_q4_cache.n_active != n_active);
+                if (need_build) {
+                    if (ith == 0) {
+                        g_mtp_head_q4_cache.blocks.resize(
+                            static_cast<size_t>(n_tiles * b_k_blks) * sizeof(Q41Block<32, 32, 2>));
+                    }
+                    ctx.sync();
+                    constexpr size_t q8_tile_bytes = 32 * sizeof(_Float16) + 32 * 32 * sizeof(int8_t);
+                    auto * dst_blocks = reinterpret_cast<Q41Block<32, 32, 2> *>(g_mtp_head_q4_cache.blocks.data());
+                    for (int64_t nt = ith; nt < n_tiles; nt += nth) {
+                        const uint8_t * src_tile =
+                            reinterpret_cast<const uint8_t *>(w_data) + nt * b_k_blks * q8_tile_bytes;
+                        convert_q8_32x32_tile_to_q41(src_tile, dst_blocks + nt * b_k_blks, b_k_blks);
+                    }
+                    ctx.sync();
+                    if (ith == 0) {
+                        g_mtp_head_q4_cache.src_data = w_data;
+                        g_mtp_head_q4_cache.N        = gemm_n;
+                        g_mtp_head_q4_cache.K        = gemm_k;
+                        g_mtp_head_q4_cache.n_active = n_active;
+                        fprintf(stderr,
+                                "ggml-spacemit: built draft-only MTP Q41 head: vocab=%lld/%lld K=%lld (%.1f MiB)\n",
+                                (long long) n_active, (long long) gemm_n, (long long) gemm_k,
+                                (double) g_mtp_head_q4_cache.blocks.size() / (1024.0 * 1024.0));
+                    }
+                    ctx.sync();
+                }
+
+                uintptr_t ws_p = reinterpret_cast<uintptr_t>(ctx.workspace);
+                ws_p           = (ws_p + 63) & ~(uintptr_t) 63;
+                auto * quant_a = reinterpret_cast<uint8_t *>(ws_p);
+                const uint8_t * b_q41 = reinterpret_cast<const uint8_t *>(g_mtp_head_q4_cache.blocks.data());
+                constexpr size_t q41_row_pitch = sizeof(Q41Block<32, 32, 2>) / 32;
+
+                int task_per_thread = spacemit_kernels::div_round_up((int) a_k_blks, nth);
+                int a_blk_start     = ith * task_per_thread;
+                int a_blk_end       = std::min(a_blk_start + task_per_thread, (int) a_k_blks);
+
+                if (gemm_m == 1) {
+                    const int64_t blk_stride_1row = (int64_t) spacemit_kernels::q8_blk_size(a_blk_len, true);
+                    if (a_blk_start < a_blk_end) {
+                        quantize_a_i8_r1(a_blk_len, feature + a_blk_start * a_blk_len,
+                                         (a_blk_end - a_blk_start) * a_blk_len,
+                                         quant_a + a_blk_start * blk_stride_1row);
+                    }
+                    ctx.sync();
+                    const size_t b_row_stride = (size_t) b_k_blks * q41_row_pitch;
+                    for (int64_t ni = (int64_t) ith * 32; ni < n_active; ni += (int64_t) 32 * nth) {
+                        const int64_t nb_real = std::min(n_active - ni, (int64_t) 32);
+                        spacemit_kernels::ime2::gemm_kernel_i8i4_m1_q41(
+                            quant_a, b_q41 + ni * b_row_stride, output + ni, (size_t) nb_real, (size_t) b_k_blks);
+                    }
+                } else {
+                    if (a_blk_start < a_blk_end) {
+                        spacemit_kernels::rvv::quantize_a_i8_r4_al_partial(
+                            a_blk_len, feature, (size_t) gemm_k * sizeof(float), (size_t) gemm_m,
+                            (size_t) a_blk_start * a_blk_len, (size_t) (a_blk_end - a_blk_start) * a_blk_len,
+                            quant_a + a_blk_start * spacemit_kernels::q8_m4al_blk_size);
+                    }
+                    ctx.sync();
+                    const size_t b_row_stride = (size_t) b_k_blks * q41_row_pitch;
+                    for (int64_t ni = (int64_t) ith * 32; ni < n_active; ni += (int64_t) 32 * nth) {
+                        const int64_t nb_real = std::min(n_active - ni, (int64_t) 32);
+                        spacemit_kernels::ime2::gemm_kernel_i8i4_m4_q41(
+                            quant_a, b_q41 + ni * b_row_stride, output + ni, (size_t) gemm_m, (size_t) nb_real,
+                            (size_t) b_k_blks, (size_t) gemm_n);
+                    }
+                }
+
+                if (n_active < gemm_n) {
+                    const int64_t tail = gemm_n - n_active;
+                    const int64_t per  = (tail + nth - 1) / nth;
+                    const int64_t c0   = n_active + ith * per;
+                    const int64_t c1   = std::min(gemm_n, c0 + per);
+                    for (int64_t mi = 0; mi < gemm_m; ++mi) {
+                        float * row = output + mi * gemm_n;
+                        for (int64_t ci = c0; ci < c1; ++ci) {
+                            row[ci] = -1e30f;
+                        }
+                    }
+                }
+                return;
+            }
+        }
+
+        const bool    q8_small_m          = q8_al_layout() && env_q8_small_m() && gemm_m >= 2 && gemm_m <= 4 &&
+                                            gemm_k % a_blk_len == 0;
+        const int64_t a_rows_packed       = q8_small_m ? 4 : gemm_m;
         const int64_t row_stride_a        = a_k_blks * block_stride_a;
-        const int64_t gemm_workspace_size = GGML_PAD(gemm_m * row_stride_a, alignof(int64_t));
+        const int64_t gemm_workspace_size = GGML_PAD(a_rows_packed * row_stride_a, alignof(int64_t));
 
         if (ith == 0 && ctx.workspace_size < gemm_workspace_size) {
             GGML_ABORT("wsize less than gemm_workspace_size");
@@ -570,6 +766,16 @@ private:
             if (a_blk_start < a_blk_end) {
                 quantize_a_i8_r1(a_blk_len, feature + a_blk_start * a_blk_len, (a_blk_end - a_blk_start) * a_blk_len,
                                   quant_a_buffer + a_blk_start * blk_stride_1row);
+            }
+        } else if (q8_small_m) {
+            int task_per_thread = spacemit_kernels::div_round_up(a_k_blks, nth);
+            int a_blk_start     = ith * task_per_thread;
+            int a_blk_end       = std::min(a_blk_start + task_per_thread, (int) a_k_blks);
+            if (a_blk_start < a_blk_end) {
+                spacemit_kernels::rvv::quantize_a_i8_r4_al_partial(
+                    a_blk_len, feature, (size_t) gemm_k * sizeof(float), (size_t) gemm_m,
+                    (size_t) a_blk_start * a_blk_len, (size_t) (a_blk_end - a_blk_start) * a_blk_len,
+                    quant_a_buffer + a_blk_start * spacemit_kernels::q8_m4al_blk_size);
             }
         } else {
             int task_per_thread = spacemit_kernels::div_round_up(row_blks, nth);
@@ -613,9 +819,10 @@ private:
                 uint8_t * b_col_zp = block_type_has_zp<BLOC_TYPE>() ? b_col : nullptr;
 
                 int64_t m_row_real = std::min(gemm_m - m_start, row_align);
+                const int64_t copy_rows = q8_small_m ? 4 : m_row_real;
 
                 spacemit_kernels::rvv::memcpy1d(tcm_buffer, quant_a_buffer + m_start * row_stride_a,
-                                                m_row_real * row_stride_a);
+                                                copy_rows * row_stride_a);
 
                 int64_t n_blk_real = 0;
                 for (int64_t ni = 0; ni < gemm_n; ni += n_blk_real, b_col += n_blk_real * row_stride_b) {
@@ -627,9 +834,10 @@ private:
                     int32_t rows_remaining = m_row_real;
 
                     while (rows_remaining > 0) {
-                        auto rows_handled = gemm_kernel(rows_remaining >= 4 ? a_pack_r4 : spacemit_kernels::a_pack::r1,
-                                                        b_blk_len, a_row_ptr, b_col, b_col_zp, c_blk, rows_remaining,
-                                                        n_blk_real, b_k_blks, gemm_n);
+                        auto rows_handled =
+                            gemm_kernel((rows_remaining >= 4 || q8_small_m) ? a_pack_r4 : spacemit_kernels::a_pack::r1,
+                                        b_blk_len, a_row_ptr, b_col, b_col_zp, c_blk, rows_remaining, n_blk_real,
+                                        b_k_blks, gemm_n);
 
                         c_blk += rows_handled * gemm_n;
                         a_row_ptr += rows_handled * row_stride_a;
@@ -707,9 +915,10 @@ private:
                     auto *  a_row_cur      = a_row;
 
                     while (rows_remaining > 0) {
-                        auto rows_handled = gemm_kernel(rows_remaining >= 4 ? a_pack_r4 : spacemit_kernels::a_pack::r1,
-                                                        b_blk_len, a_row_cur, b_col, b_col_zp, c_blk, rows_remaining,
-                                                        nb_real, b_k_blks, gemm_n);
+                        auto rows_handled =
+                            gemm_kernel((rows_remaining >= 4 || q8_small_m) ? a_pack_r4 : spacemit_kernels::a_pack::r1,
+                                        b_blk_len, a_row_cur, b_col, b_col_zp, c_blk, rows_remaining, nb_real, b_k_blks,
+                                        gemm_n);
 
                         c_blk += rows_handled * gemm_n;
                         a_row_cur += rows_handled * row_stride_a;
@@ -766,9 +975,10 @@ private:
                     uint8_t * b_col_zp_cur = b_col_zp;
 
                     while (rows_remaining > 0) {
-                        auto rows_handled = gemm_kernel(rows_remaining >= 4 ? a_pack_r4 : spacemit_kernels::a_pack::r1,
-                                                        b_blk_len, a_row, b_col_cur, b_col_zp_cur, c_blk,
-                                                        rows_remaining, n_blk_real, b_k_blks, gemm_n);
+                        auto rows_handled =
+                            gemm_kernel((rows_remaining >= 4 || q8_small_m) ? a_pack_r4 : spacemit_kernels::a_pack::r1,
+                                        b_blk_len, a_row, b_col_cur, b_col_zp_cur, c_blk, rows_remaining, n_blk_real,
+                                        b_k_blks, gemm_n);
 
                         c_blk += rows_handled * gemm_n;
                         a_row += rows_handled * row_stride_a;
@@ -827,9 +1037,14 @@ private:
         const uintptr_t ws_ptr         = reinterpret_cast<uintptr_t>(ctx.workspace);
         auto *          quant_a_buffer = reinterpret_cast<uint8_t *>(ws_ptr);
 
-        bool pad8_all = false;
+        bool pad8_all   = false;
+        bool pad4_small = false;
         if constexpr (std::is_same_v<BLOC_TYPE, block_q4_0> && INTER_SIZE == 256) {
-            pad8_all = ids->ne[1] > 1 && quantize_a_i8_r4 != nullptr && ne01 % 32 == 0 && hp_aligned();
+            const bool moe_small_m = env_moe_small_m();
+            pad8_all = (ids->ne[1] >= 8 || !moe_small_m) && ids->ne[1] > 1 && quantize_a_i8_r4 != nullptr &&
+                       ne01 % 32 == 0 && hp_aligned();
+            pad4_small = !pad8_all && moe_small_m && ids->ne[1] > 1 && quantize_a_i8_r4 != nullptr &&
+                         ne01 % 32 == 0 && hp_aligned();
         }
 
         if (!pad8_all && ne11 == 1) {
@@ -949,6 +1164,14 @@ private:
                         n_groups++;
                         offset += 4 * nbw1_m4;
                     }
+                    if (pad4_small && r < cne1 && (cne1 - r) >= 2) {
+                        m4_groups[3 * n_groups + 0] = cur_a;
+                        m4_groups[3 * n_groups + 1] = (int32_t) r;
+                        m4_groups[3 * n_groups + 2] = (int32_t) (cne1 - r);
+                        n_groups++;
+                        offset += 4 * nbw1_m4;
+                        r = cne1;
+                    }
                 }
                 m4_n_groups[0] = n_groups;
             }
@@ -981,6 +1204,9 @@ private:
                     spacemit_kernels::rvv::quantize_a_i8_r8_hp(a_blk_len, m4_a_f32, ne10, out);
                 } else if (nr == 8) {
                     spacemit_kernels::rvv::quantize_a_i8_r8_hp(a_blk_len, m4_a_f32, ne10, out);
+                } else if (nr < 4 && pad4_small) {
+                    memset(m4_a_f32 + nr * ne10, 0, (4 - nr) * ne10 * sizeof(float));
+                    quantize_a_i8_r4(a_blk_len, m4_a_f32, ne10, out);
                 } else {
                     quantize_a_i8_r4(a_blk_len, m4_a_f32, ne10, out);
                 }
@@ -1118,7 +1344,7 @@ private:
                 if (pad8_all) {
                     GGML_ASSERT(use_m8 && n_cols % 32 == 0);
                 }
-                if (use_m4 && n_cols % 32 == 0 && (cne1 >= 4 || pad8_all)) {
+                if (use_m4 && n_cols % 32 == 0 && (cne1 >= 4 || pad8_all || (pad4_small && cne1 >= 2))) {
                     const uint8_t * a_grp = m4_quant + m4_expert_offset[cur_a];
                     for (; use_m8 && ir1 + 8 <= src1_cur_end; ir1 += 8, a_grp += m8_grp_bytes) {
                         gemm_kernel(a_pack_r8, b_blk_len, a_grp, src0_cur, nullptr, m4_c_tmp, 8, n_cols, b_k_blks,
@@ -1149,6 +1375,21 @@ private:
                             memcpy(dst_row, m4_c_tmp + r * n_cols, n_cols * sizeof(float));
                         }
                     }
+                    if (pad4_small && ir1 < src1_cur_end && (src1_cur_end - ir1) >= 2) {
+                        const int nr = (int) (src1_cur_end - ir1);
+                        gemm_kernel(a_pack_r4, b_blk_len, a_grp, src0_cur, b_col_zp, m4_c_tmp, 4, n_cols, b_k_blks,
+                                    n_cols);
+                        for (int r = 0; r < nr; ++r) {
+                            const mmid_row_mapping rm = MMID_MATRIX_ROW(cur_a, ir1 + r);
+                            float * dst_row = (float *) ((char *) dst->data + (rm.i1 * nb1 + rm.i2 * nb2)) + src0_cur_start;
+                            memcpy(dst_row, m4_c_tmp + r * n_cols, n_cols * sizeof(float));
+                        }
+                        ir1 = src1_cur_end;
+                    }
+                }
+
+                if (ir1 >= src1_cur_end) {
+                    continue;
                 }
 
                 if (extra_tcm_buffer_size >= nbw1 && extra_tcm_buffer != nullptr) {
@@ -1835,7 +2076,9 @@ private:
         const size_t M         = static_cast<size_t>(op->src[1]->ne[1] * op->src[1]->ne[2] * op->src[1]->ne[3]);
         const size_t K         = static_cast<size_t>(op->src[1]->ne[0]);
         const size_t gemv_size = ((K + KB - 1) / KB) * 38;
-        size = std::max(partial_workspace_size(M, N, n_threads), GGML_PAD(gemv_size, sizeof(int64_t)));
+        const size_t m4_size   = ((K + KB - 1) / KB) * spacemit_kernels::q8_m4al_blk_size + 64;
+        size = std::max(partial_workspace_size(M, N, n_threads),
+                        GGML_PAD(std::max(gemv_size, m4_size), sizeof(int64_t)));
         return true;
     }
 
@@ -1918,6 +2161,45 @@ private:
                     const uint8_t * b_row = b_src + ni * b_row_stride;
                     auto *          c_row = reinterpret_cast<float *>(out) + ni;
                     gemv_func(quant_a, b_row, c_row, (size_t) nb_real, k_blks);
+                }
+                return true;
+            }
+        }
+
+        // Small-M verify decode (M = 2..4): direct INT8xINT4 GEMM over Q41Block,
+        // avoiding FP16 dequant, TCM staging, and Split-K reduction cliff.
+        if (M >= 2 && M <= 4 && src1->ne[2] == 1 && src1->ne[3] == 1 && K % KB == 0 && env_q41_m4() &&
+            out_row_stride % sizeof(float) == 0) {
+            constexpr size_t a_blk_len    = 32;
+            const size_t     a_k_blks     = K / KB;
+            const size_t     k_blks       = K / KB;
+            const size_t     m4_ws_needed = a_k_blks * spacemit_kernels::q8_m4al_blk_size + 64;
+            if (ctx.workspace_size >= m4_ws_needed) {
+                uintptr_t ws_p    = reinterpret_cast<uintptr_t>(ctx.workspace);
+                ws_p              = (ws_p + 63) & ~(uintptr_t) 63;
+                auto *    quant_a = reinterpret_cast<uint8_t *>(ws_p);
+
+                int task_per_thread = spacemit_kernels::div_round_up((int) a_k_blks, nth);
+                int a_blk_start     = ith * task_per_thread;
+                int a_blk_end       = std::min(a_blk_start + task_per_thread, (int) a_k_blks);
+                if (a_blk_start < a_blk_end) {
+                    spacemit_kernels::rvv::quantize_a_i8_r4_al_partial(
+                        a_blk_len, reinterpret_cast<const float *>(a_src), a_src_stride, M,
+                        (size_t) a_blk_start * a_blk_len, (size_t) (a_blk_end - a_blk_start) * a_blk_len,
+                        quant_a + a_blk_start * spacemit_kernels::q8_m4al_blk_size);
+                }
+
+                ctx.sync();
+
+                const size_t     b_row_stride = k_blks * ROW_PITCH;
+                const size_t     ldc          = out_row_stride / sizeof(float);
+                constexpr size_t tile_cols    = 32;
+                for (int64_t ni = (int64_t) ith * tile_cols; ni < (int64_t) N;
+                     ni += (int64_t) tile_cols * nth) {
+                    const int64_t   nb_real = std::min((int64_t) N - ni, (int64_t) tile_cols);
+                    const uint8_t * b_row   = b_src + ni * b_row_stride;
+                    auto *          c_row   = reinterpret_cast<float *>(out) + ni;
+                    ops.dot_m4(quant_a, b_row, c_row, M, (size_t) nb_real, k_blks, ldc);
                 }
                 return true;
             }

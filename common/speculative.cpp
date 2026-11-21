@@ -1835,6 +1835,8 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
     int32_t n_batch_tgt = 0;
     std::vector<int32_t> verify_row0; // [n_seq] device row of the first verify row, see verify_h_rows
 
+    bool fast_argmax_enabled = true;
+
     common_speculative_impl_draft_mtp(const common_params_speculative & params, uint32_t n_seq)
         : common_speculative_impl(COMMON_SPECULATIVE_TYPE_DRAFT_MTP, n_seq, params.draft.n_max)
         , params(params.draft)
@@ -1900,6 +1902,10 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             }
         }
         this->n_max = this->params.n_max;
+        {
+            const char * v = std::getenv("GGML_SPACEMIT_MTP_FAST_ARGMAX");
+            this->fast_argmax_enabled = (v == nullptr || std::atoi(v) != 0);
+        }
 
         pending_h.assign(n_seq, std::vector<float>(n_embd, 0.0f));
 
@@ -2189,41 +2195,100 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                 }
 
                 auto * smpl = smpls[seq_id].get();
-
-                const llama_token id_sampled = common_sampler_sample(smpl, ctx_dft, i_last[seq_id], true);
+                auto & dp   = dparams.at(seq_id);
                 const float * h_row = llama_get_embeddings_nextn_ith(ctx_dft, i_last[seq_id]);
 
-                const auto * cur_p = common_sampler_get_candidates(smpl, true);
+                llama_token id = LLAMA_TOKEN_NULL;
+                if (this->fast_argmax_enabled && !dp.result_q && backend_chains[seq_id] == nullptr) {
+                    const float * logits  = llama_get_logits_ith(ctx_dft, i_last[seq_id]);
+                    const int32_t n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(llama_get_model(ctx_dft)));
 
-                for (int k = 0; k < std::min(3, (int) cur_p->size); ++k) {
-                    SPC_DBG(" - seq_id %d, draft candidate %3d, pos %3d: %6d (%8.3f) '%s'\n",
-                            seq_id, k, i, cur_p->data[k].id, cur_p->data[k].p,
-                            common_token_to_piece(ctx_dft, cur_p->data[k].id).c_str());
+                    int32_t best_id  = 0;
+                    float   best_val = logits[0];
+
+                    if (params.p_min <= 0.0f) {
+                        for (int32_t v = 1; v < n_vocab; ++v) {
+                            const float val = logits[v];
+                            if (val > best_val) {
+                                best_val = val;
+                                best_id  = v;
+                            }
+                        }
+                        id = best_id;
+                    } else {
+                        constexpr int K_TOP = 10;
+                        float top_v[K_TOP];
+                        for (int k = 0; k < K_TOP; ++k) {
+                            top_v[k] = -INFINITY;
+                        }
+                        int   min_idx = 0;
+                        float min_val = -INFINITY;
+                        for (int32_t v = 0; v < n_vocab; ++v) {
+                            const float val = logits[v];
+                            if (val > best_val) {
+                                best_val = val;
+                                best_id  = v;
+                            }
+                            if (val > min_val) {
+                                top_v[min_idx] = val;
+                                min_idx = 0;
+                                min_val = top_v[0];
+                                for (int k = 1; k < K_TOP; ++k) {
+                                    if (top_v[k] < min_val) {
+                                        min_val = top_v[k];
+                                        min_idx = k;
+                                    }
+                                }
+                            }
+                        }
+                        float sum_exp = 0.0f;
+                        for (int k = 0; k < K_TOP; ++k) {
+                            if (top_v[k] > -INFINITY) {
+                                sum_exp += std::exp(top_v[k] - best_val);
+                            }
+                        }
+                        const float p_max = sum_exp > 0.0f ? (1.0f / sum_exp) : 0.0f;
+                        if (p_max < params.p_min) {
+                            drafting[seq_id] = false;
+                            n_drafting--;
+                            continue;
+                        }
+                        id = best_id;
+                    }
+                } else {
+                    const llama_token id_sampled = common_sampler_sample(smpl, ctx_dft, i_last[seq_id], true);
+
+                    const auto * cur_p = common_sampler_get_candidates(smpl, true);
+
+                    for (int k = 0; k < std::min(3, (int) cur_p->size); ++k) {
+                        SPC_DBG(" - seq_id %d, draft candidate %3d, pos %3d: %6d (%8.3f) '%s'\n",
+                                seq_id, k, i, cur_p->data[k].id, cur_p->data[k].p,
+                                common_token_to_piece(ctx_dft, cur_p->data[k].id).c_str());
+                    }
+
+                    // add drafted token for each sequence
+                    id = dp.result_q ? id_sampled : cur_p->data[0].id;
+
+                    // only collect very high-confidence draft tokens
+                    if (cur_p->data[0].p < params.p_min) {
+                        drafting[seq_id] = false;
+                        n_drafting--;
+
+                        continue;
+                    }
+
+                    common_sampler_accept(smpl, id, true);
+
+                    if (dp.result_q) {
+                        dp.result_q->emplace_back(cur_p->data, cur_p->data + cur_p->size);
+                    }
                 }
 
-                // add drafted token for each sequence
-                const llama_token id = dparams.at(seq_id).result_q ? id_sampled : cur_p->data[0].id;
-
-                // only collect very high-confidence draft tokens
-                if (cur_p->data[0].p < params.p_min) {
-                    drafting[seq_id] = false;
-                    n_drafting--;
-
-                    continue;
-                }
-
-                common_sampler_accept(smpl, id, true);
-
-                auto & dp = dparams.at(seq_id);
                 auto & result = *dp.result;
 
                 result.push_back(id);
 
-                if (dp.result_q) {
-                    dp.result_q->emplace_back(cur_p->data, cur_p->data + cur_p->size);
-                }
-
-                if (params.n_max <= (int) result.size()) {
+                if (this->params.n_max <= (int) result.size()) {
                     drafting[seq_id] = false;
                     n_drafting--;
                     continue;

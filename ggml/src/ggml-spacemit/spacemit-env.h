@@ -5,6 +5,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
 #include <vector>
 
 namespace ggml::cpu::riscv64_spacemit {
@@ -36,5 +37,42 @@ struct spine_env_info {
 };
 
 extern spine_env_info global_spine_env_info;
+
+struct spacemit_opt_flags {
+    bool    q41_m4          = true;
+    bool    q8_small_m      = true;
+    bool    moe_small_m     = true;
+    bool    gdn_mtp         = true;
+    bool    fa_splitkv      = true;
+    bool    fa_tiled_nozero = true;
+    bool    mtp_head_q4     = true;
+    int64_t mtp_head_vocab  = 0;
+
+    static bool read_env_bool(const char * name, bool def_val) {
+        const char * v = std::getenv(name);
+        return v == nullptr ? def_val : (std::atoi(v) != 0);
+    }
+
+    static int64_t read_env_i64(const char * name, int64_t def_val) {
+        const char * v = std::getenv(name);
+        return v == nullptr ? def_val : std::atoll(v);
+    }
+
+    spacemit_opt_flags() {
+        q41_m4          = read_env_bool("GGML_SPACEMIT_Q41_M4", true);
+        q8_small_m      = read_env_bool("GGML_SPACEMIT_Q8_SMALLM", true);
+        moe_small_m     = read_env_bool("GGML_SPACEMIT_MOE_SMALLM", true);
+        gdn_mtp         = read_env_bool("GGML_SPACEMIT_GDN_MTP", true);
+        fa_splitkv      = read_env_bool("GGML_SPACEMIT_FA_SPLITKV_PAIR", true);
+        fa_tiled_nozero = read_env_bool("GGML_SPACEMIT_FA_TILED_NOZERO", true);
+        mtp_head_q4     = read_env_bool("GGML_SPACEMIT_MTP_HEAD_Q4", true);
+        mtp_head_vocab  = read_env_i64("GGML_SPACEMIT_MTP_HEAD_VOCAB", 0);
+    }
+
+    static spacemit_opt_flags & instance() {
+        static spacemit_opt_flags inst;
+        return inst;
+    }
+};
 
 }  // namespace ggml::cpu::riscv64_spacemit

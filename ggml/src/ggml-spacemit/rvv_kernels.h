@@ -59,6 +59,13 @@ static_assert(q8_m4al_hdr_size == 64 && q8_m4al_blk_size == 192, "i8i8 group lay
 
 namespace rvv {
 void quantize_a_i8_r4_al(size_t blk_len, const float * a_ptr, size_t count_k, uint8_t * quant_a_ptr);
+void quantize_a_i8_r4_al_partial(size_t        blk_len,
+                                 const float * a_ptr,
+                                 size_t        a_row_stride_bytes,
+                                 size_t        count_m,
+                                 size_t        k_start,
+                                 size_t        k_count,
+                                 uint8_t *     quant_a_ptr);
 void quantize_a_i8_r4_hp_al(size_t blk_len, const float * a_ptr, size_t count_k, uint8_t * quant_a_ptr);
 void quantize_a_i8_r8_hp(size_t blk_len, const float * a_ptr, size_t count_k, uint8_t * quant_a_ptr);
 

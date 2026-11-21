@@ -186,6 +186,15 @@ void gemm_kernel_i8i4_m1_q41(const uint8_t * quant_a_ptr,
                            size_t          count_n,
                            size_t          k_blks);
 
+// Q41Block small-M (1..4 rows) direct INT8xINT4 GEMM with q8_m4al packed A.
+void gemm_kernel_i8i4_m4_q41(const uint8_t * quant_a_ptr,
+                             const uint8_t * quant_b_data,
+                             float *         c_ptr,
+                             size_t          count_m,
+                             size_t          count_n,
+                             size_t          k_blks,
+                             size_t          ldc);
+
 // A/B layouts: [K/8][M16|N32][K8]; gemm_k is the K extent.
 void gemm_kernel_f16f16f16_m16_vfwmadot(size_t           gemm_k,
                                         const _Float16 * b_f16_k8,

@@ -693,6 +693,7 @@ llama_model_qwen35moe::graph_mtp::graph_mtp(const llm_graph_params & params)
     res->t_h_nextn= cur;
 
     cur = ggml_get_rows(ctx0, cur, inp_out_ids);
+    ggml_set_name(cur, "mtp_shared_head_norm");
     cb(cur, "mtp_shared_head_norm", -1);
 
     ggml_tensor * head_w = layer.nextn.shared_head_head ? layer.nextn.shared_head_head : model.output;

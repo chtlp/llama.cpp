@@ -787,7 +787,8 @@ static void flash_attn_ext_f16_one_chunk_inner_vlen1024_vf16_mrow(float **      
     // its own mask row at mp + m * mask_row_stride bytes; a KV position is packed if any token can see it.
     // With partial != nullptr row i writes {M, S, unnormalized VKQ[DV]} to partial[i] (for a later split-KV
     // reduction) instead of the normalized output to dst[i].
-    static_assert(QLEN == 2 || QLEN == 4 || QLEN == 8 || QLEN == 16, "unsupported QLEN");
+    static_assert(QLEN == 2 || QLEN == 4 || QLEN == 8 || QLEN == 12 || QLEN == 16 || QLEN == 24 || QLEN == 32,
+                  "unsupported QLEN");
     GGML_ASSERT(n_mask_rows >= 1 && QLEN % n_mask_rows == 0 && n_mask_rows <= 16);
     const int64_t rows_per_mask = QLEN / n_mask_rows;
     auto          mask_at       = [&](int64_t m, int64_t ic) -> float {
@@ -1461,15 +1462,18 @@ void forward_flash_attn_ext_f16_split_kv_partial_vlen1024_vf16(ggml::spacemit::c
 
     const int64_t chunk  = (n_kv + n_chunks - 1) / n_chunks;
 
-    std::array<float *, 16> pq;
-    std::array<float *, 16> pr;
-    std::array<float *, 16> unused = {};
+    std::array<float *, 32> pq;
+    std::array<float *, 32> pr;
+    std::array<float *, 32> unused = {};
 
-    // all query tokens of a unit in one pass (one K/V pack) when rk2 * nq is a supported row count
-    const int64_t rows   = rk2 * nq;
-    const bool    fused  = rows == 2 || rows == 4 || rows == 8 || rows == 16;
-    const int64_t n_pass = fused ? 1 : nq;
-    const int64_t prows  = fused ? rows : rk2;
+    const bool fa_splitkv_pair = ggml::cpu::riscv64_spacemit::spacemit_opt_flags::instance().fa_splitkv;
+
+    // all query tokens of a unit in one pass (one K/V pack) when rk2 * nq is a supported row count;
+    // when fa_splitkv_pair is enabled, extend single-pass support to QLEN = 12, 24, 32 so MTP verify
+    // (nq = 3 -> 24 rows, nq = 4 -> 32 rows for rk2 = 8) reads the entire KV cache only ONCE!
+    const int64_t rows      = rk2 * nq;
+    const bool    fused_16  = rows == 2 || rows == 4 || rows == 8 || rows == 16;
+    const bool    fused_all = fused_16 || (fa_splitkv_pair && (rows == 12 || rows == 24 || rows == 32));
 
     for (int64_t u = ctx.ith; u < n_kvh * n_chunks; u += ctx.nth) {
         const int64_t kvh = u / n_chunks;
@@ -1480,17 +1484,25 @@ void forward_flash_attn_ext_f16_split_kv_partial_vlen1024_vf16(ggml::spacemit::c
         const char *  kd  = (const char *) k->data + kvh * k->nb[2] + c0 * k->nb[1];
         const char *  vd  = (const char *) v->data + kvh * v->nb[2] + c0 * v->nb[1];
 
-        for (int64_t p = 0; p < n_pass; ++p) {
+        for (int64_t t0 = 0; t0 < nq; ) {
+            int64_t nt = 1;
+            if (fused_all) {
+                nt = nq;
+            } else if (fa_splitkv_pair) {
+                while (nt * 2 <= nq - t0 && rk2 * (nt * 2) <= 32) {
+                    nt *= 2;
+                }
+            }
+            const int64_t prows = rk2 * nt;
             for (int64_t r = 0; r < prows; ++r) {
-                const int64_t t = fused ? r / rk2 : p;
-                const int64_t i = fused ? r % rk2 : r;
+                const int64_t t = t0 + r / rk2;
+                const int64_t i = r % rk2;
                 pq[r] = (float *) ((char *) q->data + t * q->nb[1] + (h0 + i) * q->nb[2]);
                 pr[r] = partials + ((t * nh + h0 + i) * n_chunks + c) * (2 + DV);
             }
-            const int64_t       t0 = fused ? 0 : p;
             const ggml_fp16_t * mp =
                 mask ? (const ggml_fp16_t *) ((const char *) mask->data + t0 * mask->nb[1]) + c0 : nullptr;
-            const int64_t n_mask_rows = fused ? nq : 1;
+            const int64_t n_mask_rows = nt;
             const size_t  mstride     = mask ? mask->nb[1] : 0;
 
 #define FA_SPLIT_MROW(QL)                                                                                          \
@@ -1502,9 +1514,14 @@ void forward_flash_attn_ext_f16_split_kv_partial_vlen1024_vf16(ggml::spacemit::c
                 case 2: FA_SPLIT_MROW(2); break;
                 case 4: FA_SPLIT_MROW(4); break;
                 case 8: FA_SPLIT_MROW(8); break;
+                case 12: FA_SPLIT_MROW(12); break;
+                case 16: FA_SPLIT_MROW(16); break;
+                case 24: FA_SPLIT_MROW(24); break;
+                case 32: FA_SPLIT_MROW(32); break;
                 default: FA_SPLIT_MROW(16); break;
             }
 #undef FA_SPLIT_MROW
+            t0 += nt;
         }
     }
 }
@@ -1724,13 +1741,12 @@ void forward_flash_attn_ext_f16_tiled_vlen1024_vf16(ggml::spacemit::context & ct
             memcpy2d(Q_f32, DK * sizeof(float), pq, nbq1, tile_rows, DK * sizeof(float));
         }
 
+        const bool fa_tiled_nozero = ggml::cpu::riscv64_spacemit::spacemit_opt_flags::instance().fa_tiled_nozero;
+
         for (int64_t ic = 0; ic < nek1; ic += KV_TILE_SZ) {
             const int kv_tile = (int) std::min((int64_t) KV_TILE_SZ, nek1 - ic);
             int       active_kv[Q_TILE_SZ];
             int       max_active_kv = kv_tile;
-
-            rvv_zero_f32(K_f32, DK * KV_TILE_SZ);
-            rvv_zero_f32(V32, KV_TILE_SZ * DV);
 
             // skip the tile entirely if all the masks are -inf
             if (mask) {
@@ -1755,6 +1771,13 @@ void forward_flash_attn_ext_f16_tiled_vlen1024_vf16(ggml::spacemit::context & ct
                 }
             } else {
                 std::fill_n(active_kv, tile_rows, kv_tile);
+            }
+
+            // F16 QK/PV kernels only read [0..max_active_kv) which is fully overwritten below;
+            // skip the redundant 128 KB zero-fill per tile.
+            if (!fa_tiled_nozero || kv_type != GGML_TYPE_F16) {
+                rvv_zero_f32(K_f32, DK * KV_TILE_SZ);
+                rvv_zero_f32(V32, KV_TILE_SZ * DV);
             }
 
             if (kv_type == GGML_TYPE_F16) {
@@ -3893,7 +3916,94 @@ static __attribute__((noinline)) void gdn_recurrent_rows_lookahead(float *      
     }
 }
 
+// Multi-token verify decode (2..4 tokens, scalar decay, full m4 row):
+// Keep each state row register-resident across all n_tokens and write rollback snapshots directly,
+// eliminating both state_work scratch allocation and K x state_size memcpy traffic.
+static __attribute__((noinline)) void gdn_recurrent_rows_multi_token(const float *  src,
+                                                                     int64_t        n_tokens,
+                                                                     const float * const * k_ptrs,
+                                                                     const float * const * q_ptrs,
+                                                                     const float * const * v_ptrs,
+                                                                     const float *         decays,
+                                                                     const float *         betas,
+                                                                     const float *         kqs,
+                                                                     float                 scale,
+                                                                     int64_t               d,
+                                                                     float * const *       attn_ptrs,
+                                                                     float * const *       snap_ptrs) {
+    const size_t vl   = __riscv_vsetvl_e32m4(d);
+    const auto   zero = __riscv_vfmv_v_f_f32m1(0.0f, 1);
+
+    if (d % 2 == 0) {
+        auto s0 = __riscv_vle32_v_f32m4(src, vl);
+        auto s1 = __riscv_vle32_v_f32m4(src + d, vl);
+        for (int64_t j = 0; j < d; j += 2) {
+            auto next0 = s0;
+            auto next1 = s1;
+            if (j + 2 < d) {
+                next0 = __riscv_vle32_v_f32m4(src + (j + 2) * d, vl);
+                next1 = __riscv_vle32_v_f32m4(src + (j + 3) * d, vl);
+                asm volatile("" : "+vr"(next0), "+vr"(next1));
+            }
+            for (int64_t t = 0; t < n_tokens; ++t) {
+                const auto kv    = __riscv_vle32_v_f32m4(k_ptrs[t], vl);
+                const auto qv    = __riscv_vle32_v_f32m4(q_ptrs[t], vl);
+                const float dec  = decays[t];
+                const float beta = betas[t];
+                const float kq   = kqs[t];
+                const float * vt = v_ptrs[t];
+
+                s0 = __riscv_vfmul_vf_f32m4(s0, dec, vl);
+                s1 = __riscv_vfmul_vf_f32m4(s1, dec, vl);
+                const auto  pk0    = __riscv_vfmul_vv_f32m4(s0, kv, vl);
+                const auto  pk1    = __riscv_vfmul_vv_f32m4(s1, kv, vl);
+                const auto  sk0    = __riscv_vfredusum_vs_f32m4_f32m1(pk0, zero, vl);
+                const auto  sk1    = __riscv_vfredusum_vs_f32m4_f32m1(pk1, zero, vl);
+                const auto  pq0    = __riscv_vfmul_vv_f32m4(s0, qv, vl);
+                const auto  pq1    = __riscv_vfmul_vv_f32m4(s1, qv, vl);
+                const auto  sq0    = __riscv_vfredusum_vs_f32m4_f32m1(pq0, zero, vl);
+                const auto  sq1    = __riscv_vfredusum_vs_f32m4_f32m1(pq1, zero, vl);
+                const float delta0 = (vt[j] - __riscv_vfmv_f_s_f32m1_f32(sk0)) * beta;
+                const float delta1 = (vt[j + 1] - __riscv_vfmv_f_s_f32m1_f32(sk1)) * beta;
+                s0 = __riscv_vfmacc_vf_f32m4(s0, delta0, kv, vl);
+                s1 = __riscv_vfmacc_vf_f32m4(s1, delta1, kv, vl);
+                if (snap_ptrs[t] != nullptr) {
+                    __riscv_vse32_v_f32m4(snap_ptrs[t] + j * d, s0, vl);
+                    __riscv_vse32_v_f32m4(snap_ptrs[t] + (j + 1) * d, s1, vl);
+                }
+                attn_ptrs[t][j]     = (__riscv_vfmv_f_s_f32m1_f32(sq0) + delta0 * kq) * scale;
+                attn_ptrs[t][j + 1] = (__riscv_vfmv_f_s_f32m1_f32(sq1) + delta1 * kq) * scale;
+            }
+            if (j + 2 < d) {
+                s0 = next0;
+                s1 = next1;
+            }
+        }
+    } else {
+        for (int64_t j = 0; j < d; ++j) {
+            auto s0 = __riscv_vle32_v_f32m4(src + j * d, vl);
+            for (int64_t t = 0; t < n_tokens; ++t) {
+                const auto kv    = __riscv_vle32_v_f32m4(k_ptrs[t], vl);
+                const auto qv    = __riscv_vle32_v_f32m4(q_ptrs[t], vl);
+                s0               = __riscv_vfmul_vf_f32m4(s0, decays[t], vl);
+                const auto  pk0  = __riscv_vfmul_vv_f32m4(s0, kv, vl);
+                const auto  sk0  = __riscv_vfredusum_vs_f32m4_f32m1(pk0, zero, vl);
+                const auto  pq0  = __riscv_vfmul_vv_f32m4(s0, qv, vl);
+                const auto  sq0  = __riscv_vfredusum_vs_f32m4_f32m1(pq0, zero, vl);
+                const float d0   = (v_ptrs[t][j] - __riscv_vfmv_f_s_f32m1_f32(sk0)) * betas[t];
+                s0               = __riscv_vfmacc_vf_f32m4(s0, d0, kv, vl);
+                if (snap_ptrs[t] != nullptr) {
+                    __riscv_vse32_v_f32m4(snap_ptrs[t] + j * d, s0, vl);
+                }
+                attn_ptrs[t][j] = (__riscv_vfmv_f_s_f32m1_f32(sq0) + d0 * kqs[t]) * scale;
+            }
+        }
+    }
+}
+
 void forward_gated_delta_net(ggml::spacemit::context & ctx, ggml_tensor * op) {
+    const bool gdn_mtp_opt = ggml::cpu::riscv64_spacemit::spacemit_opt_flags::instance().gdn_mtp;
+
     const ggml_tensor * src_q     = op->src[0];
     const ggml_tensor * src_k     = op->src[1];
     const ggml_tensor * src_v     = op->src[2];
@@ -3929,7 +4039,7 @@ void forward_gated_delta_net(ggml::spacemit::context & ctx, ggml_tensor * op) {
     const uintptr_t shared_begin = reinterpret_cast<uintptr_t>(ctx.shared.data);
     const size_t    tcm_offset   = align_up(shared_begin, GDN_TCM_ALIGNMENT) - shared_begin;
     const size_t    tcm_bytes    = (S_v * S_v + 3 * S_v) * sizeof(float);
-    const bool      transposed   = K == 1 && !kda && n_tokens >= GDN_CHUNK_SIZE && S_v % 4 == 0 &&
+    const bool      transposed   = (K == 1 || (gdn_mtp_opt && n_tokens >= K)) && !kda && n_tokens >= GDN_CHUNK_SIZE && S_v % 4 == 0 &&
                             S_v >= (int64_t) __riscv_vsetvlmax_e32m2() && S_v <= (int64_t) __riscv_vsetvlmax_e32m4() &&
                             ctx.shared.data && tcm_offset <= ctx.shared.size &&
                             tcm_bytes <= ctx.shared.size - tcm_offset;
@@ -3955,22 +4065,66 @@ void forward_gated_delta_net(ggml::spacemit::context & ctx, ggml_tensor * op) {
         }
         return;
     }
-    // Decode (n_tokens == 1, any n_seqs) and prefill tail chunks up to 4 tokens
-    // run the fused single-pass row update: the state is read/written once per
-    // token instead of once per phase, which halves the kernel time at
-    // n_tokens == 1. Larger chunks keep the reference two-pass form — its early
-    // state store keeps row loads pipelined, and with the chunk state L2
-    // resident it already runs at the DRAM floor, so the fused form cannot win
-    // there (measured crossover ~8 tokens; chunks are 64, or 16 with kda).
-    // The fused form keeps a whole row in registers; wider rows (e.g. S_v = 128
-    // at VLEN = 256) take the two-pass form, whose helpers strip-mine the row.
-    const bool         fused = n_tokens <= 4 && S_v <= (int64_t) __riscv_vsetvlmax_e32m8();
+    const bool fused = n_tokens <= 4 && S_v <= (int64_t) __riscv_vsetvlmax_e32m8();
+    const bool fused_multi = gdn_mtp_opt && !transposed && fused && !kda && n_tokens >= 2 && n_tokens <= 4 &&
+                             S_v <= (int64_t) __riscv_vsetvlmax_e32m4();
+    if (fused_multi) {
+        const int64_t rq3 = src_v->ne[3] / src_q->ne[3];
+        const int64_t rk3 = src_v->ne[3] / src_k->ne[3];
+        for (int64_t ir = ir0; ir < ir1; ++ir) {
+            const int64_t iv1 = ir % H;
+            const int64_t iv3 = ir / H;
+            const int64_t iq1 = iv1 % src_q->ne[1];
+            const int64_t ik1 = iv1 % src_k->ne[1];
+            const int64_t iq3 = iv3 / rq3;
+            const int64_t ik3 = iv3 / rk3;
+
+            const float * s_in = state_in_base + iv3 * state_seq_stride + iv1 * S_v * S_v;
+            const float * k_ptrs[4];
+            const float * q_ptrs[4];
+            const float * v_ptrs[4];
+            float *       attn_ptrs[4];
+            float *       snap_ptrs[4];
+            float         decays[4];
+            float         betas[4];
+            float         kqs[4];
+
+            float * attn_base = attn_out_base + (iv3 * n_tokens * H + iv1) * S_v;
+            for (int64_t t = 0; t < n_tokens; ++t) {
+                q_ptrs[t] = (const float *) ((const char *) src_q->data + iq3 * src_q->nb[3] + t * src_q->nb[2] +
+                                             iq1 * src_q->nb[1]);
+                k_ptrs[t] = (const float *) ((const char *) src_k->data + ik3 * src_k->nb[3] + t * src_k->nb[2] +
+                                             ik1 * src_k->nb[1]);
+                v_ptrs[t] = (const float *) ((const char *) src_v->data + iv3 * src_v->nb[3] + t * src_v->nb[2] +
+                                             iv1 * src_v->nb[1]);
+                betas[t]  = *(const float *) ((const char *) src_beta->data + iv3 * src_beta->nb[3] +
+                                              t * src_beta->nb[2] + iv1 * src_beta->nb[1]);
+                const float * g = (const float *) ((const char *) src_g->data + iv3 * src_g->nb[3] + t * src_g->nb[2] +
+                                                   iv1 * src_g->nb[1]);
+                decays[t]       = expf(g[0]);
+                kqs[t]          = rvv_gdn_dot_f32(k_ptrs[t], q_ptrs[t], S_v);
+                attn_ptrs[t]    = attn_base + t * (S_v * H);
+
+                const int64_t target_slot = n_tokens - 1 - t;
+                if (target_slot >= 0 && target_slot < K) {
+                    snap_ptrs[t] =
+                        state_out_base + target_slot * state_size_per_snap + (iv3 * H + iv1) * S_v * S_v;
+                } else {
+                    snap_ptrs[t] = nullptr;
+                }
+            }
+            gdn_recurrent_rows_multi_token(s_in, n_tokens, k_ptrs, q_ptrs, v_ptrs, decays, betas, kqs, scale, S_v,
+                                           attn_ptrs, snap_ptrs);
+        }
+        return;
+    }
+
     // KDA needs the per-column decay vector for every state row; the fused
     // row update consumes it as a vector, so only this small buffer remains
     // of the reference implementation's scratch space.
     std::vector<float> kda_decay(kda && fused ? (size_t) S_v : 0);
     // K > 1 (chunked prefill snapshots) evolves a private working copy.
-    std::vector<float> state_work((fused && K > 1) ? (size_t) (S_v * S_v) : 0);
+    std::vector<float> state_work((fused && !transposed && K > 1) ? (size_t) (S_v * S_v) : 0);
     // Two-pass scratch: per-row delta and attention sums, plus its own K > 1
     // working copy of the state.
     std::vector<float> scratch(!fused && !transposed ? (size_t) (3 * S_v + (K > 1 ? S_v * S_v : 0)) : 0);
@@ -4091,11 +4245,15 @@ void forward_gated_delta_net(ggml::spacemit::context & ctx, ggml_tensor * op) {
                 if (target_slot >= 0 && target_slot < K) {
                     float * state_snapshot =
                         state_out_base + target_slot * state_size_per_snap + (iv3 * H + iv1) * S_v * S_v;
-                    memcpy(state_snapshot, s_out, (size_t) (S_v * S_v) * sizeof(float));
+                    if (transposed) {
+                        gdn_transpose(S_v, S_v, s_out, S_v, state_snapshot, S_v);
+                    } else {
+                        memcpy(state_snapshot, s_out, (size_t) (S_v * S_v) * sizeof(float));
+                    }
                 }
             }
         }
-        if (transposed) {
+        if (transposed && K == 1) {
             gdn_transpose(S_v, S_v, s_out, S_v, state_out_base + (iv3 * H + iv1) * S_v * S_v, S_v);
         }
     }
@@ -4108,8 +4266,10 @@ void forward_scale_f32(ggml::spacemit::context & ctx, ggml_tensor * op) {
     GGML_ASSERT(ggml_are_same_shape(src0, dst));
     GGML_ASSERT(src0->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32);
 
-    float scale;
+    float scale = 1.0f;
+    float bias  = 0.0f;
     memcpy(&scale, op->op_params, sizeof(float));
+    memcpy(&bias, (const char *) op->op_params + sizeof(float), sizeof(float));
 
     const int64_t ith = ctx.ith;
     const int64_t nth = ctx.nth;
@@ -4136,6 +4296,9 @@ void forward_scale_f32(ggml::spacemit::context & ctx, ggml_tensor * op) {
             const size_t vl = __riscv_vsetvl_e32m4(remaining);
             vfloat32m4_t v  = __riscv_vle32_v_f32m4(src_row, vl);
             v               = __riscv_vfmul_vf_f32m4(v, scale, vl);
+            if (bias != 0.0f) {
+                v = __riscv_vfadd_vf_f32m4(v, bias, vl);
+            }
             __riscv_vse32_v_f32m4(dst_row, v, vl);
             src_row   += vl;
             dst_row   += vl;
@@ -5455,6 +5618,53 @@ void quantize_a_i8_r4_al(size_t blk_len, const float * a_ptr, size_t count_k, ui
             a_sum_ptr[mi]      = -__riscv_vmv_x_s_i16m1_i16(v_a_sum);
 
             __riscv_vse8_v_i8mf4(quant_a_blk + mi * blk_len, v_a_quant_i8, vl);
+        }
+    }
+}
+
+void quantize_a_i8_r4_al_partial(size_t        blk_len,
+                                 const float * a_ptr,
+                                 size_t        a_row_stride_bytes,
+                                 size_t        count_m,
+                                 size_t        k_start,
+                                 size_t        k_count,
+                                 uint8_t *     quant_a_ptr) {
+    GGML_ASSERT(blk_len == 32 && __riscv_vlenb() == 128 && count_m >= 1 && count_m <= 4);
+    const auto * a_bytes = reinterpret_cast<const uint8_t *>(a_ptr);
+    const size_t k_end   = k_start + k_count;
+    for (size_t k = k_start; k < k_end; k += blk_len, quant_a_ptr += q8_m4al_blk_size) {
+        float *   scale_a_ptr = reinterpret_cast<float *>(quant_a_ptr);
+        int16_t * a_sum_ptr   = reinterpret_cast<int16_t *>(quant_a_ptr + sizeof(float) * 4);
+        int8_t *  quant_a_blk = reinterpret_cast<int8_t *>(quant_a_ptr + q8_m4al_hdr_size);
+
+        for (size_t mi = 0; mi < count_m; mi++) {
+            const float * row     = reinterpret_cast<const float *>(a_bytes + mi * a_row_stride_bytes) + k;
+            size_t        vl      = __riscv_vsetvl_e32m1(blk_len);
+            vfloat32m1_t  v_a     = __riscv_vle32_v_f32m1(row, vl);
+            vfloat32m1_t  v_a_abs = __riscv_vfabs_v_f32m1(v_a, vl);
+
+            vfloat32m1_t tmp       = __riscv_vfmv_v_f_f32m1(0.0f, vl);
+            vfloat32m1_t v_a_max   = __riscv_vfredmax_vs_f32m1_f32m1(v_a_abs, tmp, vl);
+            float        max_abs_a = __riscv_vfmv_f_s_f32m1_f32(v_a_max);
+
+            float scale_a     = max_abs_a / ((1 << 7) - 1);
+            float rep_scale_a = scale_a ? 1.0f / scale_a : 0.0f;
+            scale_a_ptr[mi]   = scale_a;
+
+            vfloat32m1_t v_a_scale    = __riscv_vfmul_vf_f32m1(v_a, rep_scale_a, vl);
+            vint16mf2_t  v_a_quant    = __riscv_vfncvt_x_f_w_i16mf2(v_a_scale, vl);
+            vint8mf4_t   v_a_quant_i8 = __riscv_vncvt_x_x_w_i8mf4(v_a_quant, vl);
+
+            vint16m1_t tmp_sum = __riscv_vmv_v_x_i16m1(0, vl);
+            vint16m1_t v_a_sum = __riscv_vwredsum_vs_i8mf4_i16m1(v_a_quant_i8, tmp_sum, vl);
+            a_sum_ptr[mi]      = -__riscv_vmv_x_s_i16m1_i16(v_a_sum);
+
+            __riscv_vse8_v_i8mf4(quant_a_blk + mi * blk_len, v_a_quant_i8, vl);
+        }
+        for (size_t mi = count_m; mi < 4; mi++) {
+            scale_a_ptr[mi] = 0.0f;
+            a_sum_ptr[mi]   = 0;
+            std::memset(quant_a_blk + mi * blk_len, 0, blk_len);
         }
     }
 }

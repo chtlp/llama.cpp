@@ -2039,6 +2039,140 @@ void gemm_kernel_i8i4_m1_q41(const uint8_t * quant_a_ptr,
     }
 }
 
+// Compute 1..4 rows directly over Q41Block with exact INT32 dot + per-row uint8 zp correction.
+void gemm_kernel_i8i4_m4_q41(const uint8_t * quant_a_ptr,
+                             const uint8_t * quant_b_data,
+                             float *         c_ptr,
+                             size_t          count_m,
+                             size_t          count_n,
+                             size_t          k_blks,
+                             size_t          ldc) {
+    using block_type = ggml::cpu::riscv64_spacemit::Q41Block<32, 32, 2>;
+    constexpr size_t b_data_bytes  = 32 * 32 / 2 * sizeof(uint8_t);
+    constexpr size_t b_zp_bytes    = 32 * sizeof(uint8_t);
+    constexpr size_t b_scale_bytes = 32 * sizeof(_Float16);
+    static_assert(sizeof(block_type) == b_data_bytes + b_zp_bytes + b_scale_bytes &&
+                  offsetof(block_type, zp) == b_data_bytes &&
+                  offsetof(block_type, scale) == b_data_bytes + b_zp_bytes);
+    GGML_ASSERT(count_m >= 1 && count_m <= 4);
+
+    for (size_t n = 0; n < count_n; n += 32) {
+        const size_t    nblks = std::min<size_t>(count_n - n, 32);
+        const uint8_t * a     = quant_a_ptr;
+        const uint8_t * b     = quant_b_data + (n / 32) * k_blks * sizeof(block_type);
+        float *         c     = c_ptr + n;
+        size_t          bk    = k_blks;
+        // clang-format off
+        __asm__ volatile(
+            "vsetvli        t0, x0, e32, m1         \n\t"
+            "vxor.vv        v28, v28, v28           \n\t"
+            "vxor.vv        v29, v29, v29           \n\t"
+            "vxor.vv        v30, v30, v30           \n\t"
+            "vxor.vv        v31, v31, v31           \n\t"
+
+            ".align 4                               \n\t"
+            "Q4_AFFINE_M4_K%=:                      \n\t"
+            "flw            fa0, 0(%[A])            \n\t"
+            "flw            fa1, 4(%[A])            \n\t"
+            "flw            fa2, 8(%[A])            \n\t"
+            "flw            fa3, 12(%[A])           \n\t"
+            "lh             t1, 16(%[A])            \n\t"
+            "lh             t2, 18(%[A])            \n\t"
+            "lh             t3, 20(%[A])            \n\t"
+            "lh             t4, 22(%[A])            \n\t"
+            "addi           %[A], %[A], %[a_hdr]    \n\t"
+
+            "vsetvli        t0, x0, e8, m1          \n\t"
+            "vl1r.v         v0, (%[A])              \n\t"
+            "addi           %[A], %[A], 128         \n\t"
+            "vl4r.v         v4, (%[B])              \n\t"
+            "vsrl.vi        v1, v0, 4               \n\t"
+            "vnpack4.vv     v12, v0, v1, 3          \n\t"
+            "vupack.vv      v2, v12, v12, 2         \n\t"
+
+            "vsetvli        t0, x0, e32, m1         \n\t"
+            "vxor.vv        v16, v16, v16           \n\t"
+            "vxor.vv        v18, v18, v18           \n\t"
+            "vxor.vv        v20, v20, v20           \n\t"
+            "vxor.vv        v22, v22, v22           \n\t"
+
+            "vmadotsu       v16, v3, v4, i4         \n\t"
+            "vmadotsu       v18, v3, v5, i4         \n\t"
+            "vmadotsu       v20, v3, v6, i4         \n\t"
+            "vmadotsu       v22, v3, v7, i4         \n\t"
+            "vsll.vi        v16, v16, 4             \n\t"
+            "vsll.vi        v18, v18, 4             \n\t"
+            "vsll.vi        v20, v20, 4             \n\t"
+            "vsll.vi        v22, v22, 4             \n\t"
+            "vmadotu        v16, v2, v4, i4         \n\t"
+            "vmadotu        v18, v2, v5, i4         \n\t"
+            "vmadotu        v20, v2, v6, i4         \n\t"
+            "vmadotu        v22, v2, v7, i4         \n\t"
+
+            "vpack.vv       v0, v16, v18, 2         \n\t"
+            "vpack.vv       v2, v20, v22, 2         \n\t"
+            "vpack.vv       v16, v0, v2, 3          \n\t"
+            "vpack.vv       v18, v1, v3, 3          \n\t"
+
+            "vsetvli        t0, x0, e16, mf2        \n\t"
+            "addi           t5, %[B], %[b_zp_off]   \n\t"
+            "vle8.v         v24, (t5)               \n\t"
+            "vzext.vf2      v26, v24                \n\t"
+            "vwmacc.vx      v16, t1, v26            \n\t"
+            "vwmacc.vx      v17, t2, v26            \n\t"
+            "vwmacc.vx      v18, t3, v26            \n\t"
+            "vwmacc.vx      v19, t4, v26            \n\t"
+
+            "addi           t5, %[B], %[b_scale_off]\n\t"
+            "vle16.v        v24, (t5)               \n\t"
+            "vfwcvt.f.f.v   v14, v24                \n\t"
+
+            "vsetvli        t0, x0, e32, m1         \n\t"
+            "vfcvt.f.x.v    v16, v16                \n\t"
+            "vfcvt.f.x.v    v17, v17                \n\t"
+            "vfcvt.f.x.v    v18, v18                \n\t"
+            "vfcvt.f.x.v    v19, v19                \n\t"
+            "vfmul.vv       v16, v16, v14           \n\t"
+            "vfmul.vv       v17, v17, v14           \n\t"
+            "vfmul.vv       v18, v18, v14           \n\t"
+            "vfmul.vv       v19, v19, v14           \n\t"
+            "vfmacc.vf      v28, fa0, v16           \n\t"
+            "vfmacc.vf      v29, fa1, v17           \n\t"
+            "vfmacc.vf      v30, fa2, v18           \n\t"
+            "vfmacc.vf      v31, fa3, v19           \n\t"
+
+            "addi           %[B], %[B], %[block_bytes]\n\t"
+            "addi           %[BK], %[BK], -1        \n\t"
+            "bgtz           %[BK], Q4_AFFINE_M4_K%= \n\t"
+
+            "vsetvli        t0, %[NBLKS], e32, m1   \n\t"
+            "vse32.v        v28, (%[DST])           \n\t"
+            "li             t1, 1                   \n\t"
+            "ble            %[CM], t1, Q4_AFFINE_M4_DONE%=\n\t"
+            "add            t2, %[DST], %[LDC]      \n\t"
+            "vse32.v        v29, (t2)               \n\t"
+            "li             t1, 2                   \n\t"
+            "ble            %[CM], t1, Q4_AFFINE_M4_DONE%=\n\t"
+            "add            t2, t2, %[LDC]          \n\t"
+            "vse32.v        v30, (t2)               \n\t"
+            "li             t1, 3                   \n\t"
+            "ble            %[CM], t1, Q4_AFFINE_M4_DONE%=\n\t"
+            "add            t2, t2, %[LDC]          \n\t"
+            "vse32.v        v31, (t2)               \n\t"
+            "Q4_AFFINE_M4_DONE%=:                   \n\t"
+            : [A] "+r"(a), [B] "+r"(b), [BK] "+r"(bk)
+            : [DST] "r"(c), [LDC] "r"(ldc * sizeof(float)), [NBLKS] "r"(nblks), [CM] "r"(count_m),
+              [block_bytes] "i"(sizeof(block_type)), [b_zp_off] "i"(offsetof(block_type, zp)),
+              [b_scale_off] "i"(offsetof(block_type, scale)), [a_hdr] "i"(q8_m4al_hdr_size)
+            : "cc", "memory", "t0", "t1", "t2", "t3", "t4", "t5",
+              "fa0", "fa1", "fa2", "fa3",
+              "v0", "v1", "v2", "v3", "v4", "v5", "v6", "v7", "v8", "v9", "v10", "v11",
+              "v12", "v13", "v14", "v15", "v16", "v17", "v18", "v19", "v20", "v21", "v22", "v23",
+              "v24", "v25", "v26", "v27", "v28", "v29", "v30", "v31");
+        // clang-format on
+    }
+}
+
 void gemm_kernel_i8i4_m4(const uint8_t * quant_a_ptr,
                          const uint8_t * quant_b_data,
                          const uint8_t * quant_b_zp,
@@ -3872,19 +4006,22 @@ void gemm_kernel_i8i5_m4(const uint8_t * quant_a_ptr,
     }
 }
 
-static void gemm_kernel_i8i8_m4(const uint8_t * quant_a_ptr,
-                                const uint8_t * quant_b_data,
-                                float *         c_ptr,
-                                size_t          count_n,
-                                size_t          k_blks,
-                                size_t          ldc) {
+static void gemm_kernel_i8i8_m4_partial(const uint8_t * quant_a_ptr,
+                                        const uint8_t * quant_b_data,
+                                        float *         c_ptr,
+                                        size_t          count_m,
+                                        size_t          count_n,
+                                        size_t          k_blks,
+                                        size_t          ldc) {
     constexpr size_t blk_len = 32;
+    GGML_ASSERT(count_m >= 1 && count_m <= 4);
     int64_t b_data_stride = k_blks * sizeof(ggml_fp16_t) + k_blks * blk_len;
     for (size_t ni = 0; ni < count_n; ni += 32) {
-        uint8_t * b_data = (uint8_t *) quant_b_data + ni * b_data_stride;
-        int8_t *  a_data = (int8_t *) quant_a_ptr;
-        float *   dst_c  = c_ptr + ni;
-        size_t    bk     = k_blks;
+        const size_t nblks  = std::min<size_t>(count_n - ni, 32);
+        uint8_t *    b_data = (uint8_t *) quant_b_data + ni * b_data_stride;
+        int8_t *     a_data = (int8_t *) quant_a_ptr;
+        float *      dst_c  = c_ptr + ni;
+        size_t       bk     = k_blks;
 
         asm volatile(
             "vsetvli        t0, x0, e32, m1       \n\t"
@@ -3954,17 +4091,24 @@ static void gemm_kernel_i8i8_m4(const uint8_t * quant_a_ptr,
 
             "bgtz           %[BK], BLK_LOOP%=     \n\t"
 
-            "vsetvli        t0, x0, e32, m1       \n\t"
-            "add            t2, %[LDC], %[DST]    \n\t"
+            "vsetvli        t0, %[NBLKS], e32, m1 \n\t"
             "vse32.v        v28, (%[DST])         \n\t"
-            "add            t3, %[LDC], t2        \n\t"
+            "li             t1, 1                 \n\t"
+            "ble            %[CM], t1, I8I8_M4_DONE%=\n\t"
+            "add            t2, %[LDC], %[DST]    \n\t"
             "vse32.v        v29, (t2)             \n\t"
-            "add            t2, %[LDC], t3        \n\t"
-            "vse32.v        v30, (t3)             \n\t"
+            "li             t1, 2                 \n\t"
+            "ble            %[CM], t1, I8I8_M4_DONE%=\n\t"
+            "add            t2, %[LDC], t2        \n\t"
+            "vse32.v        v30, (t2)             \n\t"
+            "li             t1, 3                 \n\t"
+            "ble            %[CM], t1, I8I8_M4_DONE%=\n\t"
+            "add            t2, %[LDC], t2        \n\t"
             "vse32.v        v31, (t2)             \n\t"
+            "I8I8_M4_DONE%=:                      \n\t"
             : [A] "+r"(a_data), [B] "+r"(b_data), [BK] "+r"(bk)
-            : [DST] "r"(dst_c), [LDC] "r"(ldc * 4), [AHDR] "i"(64)
-            : "t0", "t1", "t2", "t3", "v0", "v1", "v2", "v3", "v4", "v5", "v6", "v7", "v8", "v9", "v10", "v11", "v12",
+            : [DST] "r"(dst_c), [LDC] "r"(ldc * 4), [AHDR] "i"(64), [NBLKS] "r"(nblks), [CM] "r"(count_m)
+            : "cc", "t0", "t1", "t2", "t3", "v0", "v1", "v2", "v3", "v4", "v5", "v6", "v7", "v8", "v9", "v10", "v11", "v12",
               "v13", "v14", "v15", "v16", "v17", "v18", "v19", "v20", "v21", "v22", "v23", "v24", "v25", "v26", "v27",
               "v28", "v29", "v30", "v31", "fa0", "fa1", "fa2", "fa3", "memory");
     }
@@ -4068,10 +4212,13 @@ size_t gemm_i8i8_k32(a_pack          ap,
                      size_t          ldc) {
     GGML_UNUSED(quant_b_zp);
     GGML_ASSERT(blk_len == 32);
+    if (ap == a_pack::r4_al) {
+        const size_t rows = std::min<size_t>(count_m, 4);
+        gemm_kernel_i8i8_m4_partial(quant_a_ptr, quant_b_data, c_ptr, rows, count_n, k_blks, ldc);
+        return rows;
+    }
     if (count_m >= 4) {
         GGML_ASSERT(ap == a_pack::r4_al);
-        gemm_kernel_i8i8_m4(quant_a_ptr, quant_b_data, c_ptr, count_n, k_blks, ldc);
-        return 4;
     }
     gemm_kernel_i8i8_m1(quant_a_ptr, quant_b_data, c_ptr, count_n, k_blks);
     return 1;
