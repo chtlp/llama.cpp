@@ -1779,6 +1779,24 @@ class tensor_traits_common : public ggml::spacemit::tensor_traits_base {
                             spacemit_kernels::rvv::forward_cpy_f16_to_f32(ctx, op);
                             return true;
                         }
+                        if (op->type == GGML_TYPE_I32 && src0->type == GGML_TYPE_F32) {
+                            const float * s = (const float *) src0->data;
+                            int32_t *     d = (int32_t *) op->data;
+                            const int64_t n = ggml_nelements(op);
+                            for (int64_t i = ctx.ith; i < n; i += ctx.nth) {
+                                d[i] = (int32_t) s[i];
+                            }
+                            return true;
+                        }
+                        if (op->type == GGML_TYPE_F32 && src0->type == GGML_TYPE_I32) {
+                            const int32_t * s = (const int32_t *) src0->data;
+                            float *         d = (float *) op->data;
+                            const int64_t   n = ggml_nelements(op);
+                            for (int64_t i = ctx.ith; i < n; i += ctx.nth) {
+                                d[i] = (float) s[i];
+                            }
+                            return true;
+                        }
                     }
                     return false;
                 }
@@ -1901,6 +1919,9 @@ class tensor_traits_common : public ggml::spacemit::tensor_traits_base {
                 return true;
             case GGML_OP_CLAMP:
                 spacemit_kernels::scalar::forward_clamp_f32(ctx, op);
+                return true;
+            case GGML_OP_ARANGE:
+                spacemit_kernels::scalar::forward_arange_f32(ctx, op);
                 return true;
             case GGML_OP_SSM_CONV:
                 if (!spacemit_kernels::rvv::forward_ssm_conv_f32(ctx, op)) {
@@ -3179,7 +3200,10 @@ const ggml::spacemit::tensor_traits_base * ggml_spacemit_get_tensor_traits(const
             }
             if (op->src[0] &&
                 ((op->type == GGML_TYPE_F16 && op->src[0]->type == GGML_TYPE_F32) ||
-                 (op->type == GGML_TYPE_F32 && op->src[0]->type == GGML_TYPE_F16)) &&
+                 (op->type == GGML_TYPE_F32 && op->src[0]->type == GGML_TYPE_F16) ||
+                 (ggml::cpu::riscv64_spacemit::spacemit_opt_flags::instance().arange_cast &&
+                  ((op->type == GGML_TYPE_I32 && op->src[0]->type == GGML_TYPE_F32) ||
+                   (op->type == GGML_TYPE_F32 && op->src[0]->type == GGML_TYPE_I32)))) &&
                 ggml_is_contiguous(op) && ggml_is_contiguous(op->src[0]) &&
                 ggml_nelements(op->src[0]) == ggml_nelements(op)) {
                 return common;
@@ -3332,6 +3356,11 @@ const ggml::spacemit::tensor_traits_base * ggml_spacemit_get_tensor_traits(const
         case GGML_OP_CLAMP:
             if (op->src[0] && op->src[0]->type == GGML_TYPE_F32 && op->type == GGML_TYPE_F32 &&
                 op->src[0]->nb[0] == sizeof(float) && op->nb[0] == sizeof(float) && ggml_are_same_shape(op, op->src[0]))
+                return common;
+            break;
+        case GGML_OP_ARANGE:
+            if (ggml::cpu::riscv64_spacemit::spacemit_opt_flags::instance().arange_cast &&
+                op->type == GGML_TYPE_F32 && op->nb[0] == sizeof(float))
                 return common;
             break;
         case GGML_OP_MUL_MAT:

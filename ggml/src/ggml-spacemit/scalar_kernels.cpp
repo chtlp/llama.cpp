@@ -747,4 +747,17 @@ void forward_gated_delta_net(ggml::spacemit::context & ctx, ggml_tensor * op) {
     }
 }
 
+void forward_arange_f32(ggml::spacemit::context & ctx, ggml_tensor * op) {
+    GGML_ASSERT(op->type == GGML_TYPE_F32 && op->nb[0] == sizeof(float));
+    const float start = ggml_get_op_params_f32(op, 0);
+    const float stop  = ggml_get_op_params_f32(op, 1);
+    const float step  = ggml_get_op_params_f32(op, 2);
+    const int64_t steps = (int64_t) ceilf((stop - start) / step);
+    GGML_ASSERT(ggml_nelements(op) == steps);
+    float * dst = (float *) op->data;
+    for (int64_t i = ctx.ith; i < steps; i += ctx.nth) {
+        dst[i] = start + step * (float) i;
+    }
+}
+
 } // namespace spacemit_kernels::scalar

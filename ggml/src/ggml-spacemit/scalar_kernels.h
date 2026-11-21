@@ -21,5 +21,6 @@ void forward_gated_delta_net(ggml::spacemit::context & ctx, ggml_tensor * op);
 void forward_ssm_conv_f32  (ggml::spacemit::context & ctx, ggml_tensor * op);
 void forward_argsort_f32  (ggml::spacemit::context & ctx, ggml_tensor * op);
 void forward_clamp_f32    (ggml::spacemit::context & ctx, ggml_tensor * op);
+void forward_arange_f32   (ggml::spacemit::context & ctx, ggml_tensor * op);
 
 } // namespace spacemit_kernels::scalar

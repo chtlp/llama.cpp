@@ -8,6 +8,7 @@
 #include <memory>
 #include <mutex>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 struct spacemit_session {
@@ -27,10 +28,12 @@ struct spacemit_session {
     size_t workspace_size = 0;
     std::vector<ggml::spacemit::context> contexts;
 
-    struct {
-        uint64_t uid = 0;
+    struct cached_graph_entry {
         std::vector<spacemit_opnode> nodes;
-    } cached_graph;
+        size_t                       workspace_size = 0;
+    };
+    std::unordered_map<uint64_t, cached_graph_entry> cached_graphs;
+    cached_graph_entry                               uncached_graph;
 
     spacemit_session() = default;
     ~spacemit_session();

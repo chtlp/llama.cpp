@@ -220,17 +220,30 @@ static bool is_transposed_concat_f32(const ggml_tensor * t) {
 }
 
 // First column of concat c covered by view v, or -1 if v is not a plain window of whole rows' trailing
-// columns (same row/plane strides, starting in row 0).
+// columns (same row/plane strides, starting in row 0). Supports both 3D non-rollback views and 4D
+// sliding-window rollback views [n_cols, Kw, channels, n_seqs] emitted by build_conv_state_store.
 static int64_t concat_view_first_col(const ggml_tensor * c, const ggml_tensor * v) {
-    if (v->type != c->type || v->nb[0] != c->nb[0] || (v->ne[1] > 1 && v->nb[1] != c->nb[1]) ||
-        (v->ne[2] > 1 && v->nb[2] != c->nb[2]) || v->ne[3] != 1 || v->view_offs / c->nb[1] != 0) {
+    if (v->type != c->type || v->nb[0] != c->nb[0] || v->view_offs / c->nb[1] != 0) {
         return -1;
     }
     const int64_t col = (int64_t) ((v->view_offs % c->nb[1]) / c->nb[0]);
-    if (col + v->ne[0] > c->ne[0] || v->ne[1] > c->ne[1] || v->ne[2] > c->ne[2]) {
+    if ((v->ne[1] == 1 || v->nb[1] == c->nb[1]) &&
+        (v->ne[2] == 1 || v->nb[2] == c->nb[2]) &&
+        v->ne[3] == 1) {
+        if (col + v->ne[0] <= c->ne[0] && v->ne[1] <= c->ne[1] && v->ne[2] <= c->ne[2]) {
+            return col;
+        }
         return -1;
     }
-    return col;
+    if (ggml::cpu::riscv64_spacemit::spacemit_opt_flags::instance().arange_cast &&
+        v->nb[1] == c->nb[0] &&
+        (v->ne[2] == 1 || v->nb[2] == c->nb[1]) &&
+        (v->ne[3] == 1 || v->nb[3] == c->nb[2]) &&
+        col + v->ne[0] + v->ne[1] - 1 <= c->ne[0] &&
+        v->ne[2] <= c->ne[1] && v->ne[3] <= c->ne[2]) {
+        return col;
+    }
+    return -1;
 }
 
 // SSM_CONV op param set by graph_optimize when the concat inputs are kept allocated until the ssm_conv
@@ -571,12 +584,29 @@ static ggml_status ggml_backend_spacemit_graph_compute(ggml_backend_t backend, g
 
     // Build (or reuse) the opnode list for this graph. The graph uid identifies a
     // stable shape-class, so the list is only rebuilt when the topology changes.
-    // try_fuse_node folds matching patterns into fused opnodes and consumes their
-    // nodes; non-matching nodes are appended as single ops.
-    if (!(graph->uid != 0 && sess->cached_graph.uid == graph->uid)) {
-        sess->cached_graph.uid = graph->uid;
-        sess->cached_graph.nodes.clear();
-        sess->cached_graph.nodes.reserve(graph->n_nodes);
+    // Cache multiple graphs (e.g. target + draft MTP contexts) so alternating
+    // target/draft calls do not evict each other on every decode step.
+    int n_threads = sess->num_cores > 0 ? sess->num_cores : 1;
+    spacemit_session::cached_graph_entry * entry = nullptr;
+    bool need_build = true;
+    if (graph->uid != 0) {
+        auto it = sess->cached_graphs.find(graph->uid);
+        if (it != sess->cached_graphs.end()) {
+            entry      = &it->second;
+            need_build = false;
+        } else {
+            if (sess->cached_graphs.size() >= 16) {
+                sess->cached_graphs.clear();
+            }
+            entry = &sess->cached_graphs[graph->uid];
+        }
+    } else {
+        entry = &sess->uncached_graph;
+    }
+
+    if (need_build) {
+        entry->nodes.clear();
+        entry->nodes.reserve(graph->n_nodes);
         std::unordered_set<ggml_tensor *> emitted;  // nodes already emitted by try_fuse_node
         for (int i = 0; i < graph->n_nodes; ++i) {
             ggml_tensor * n = graph->nodes[i];
@@ -585,31 +615,29 @@ static ggml_status ggml_backend_spacemit_graph_compute(ggml_backend_t backend, g
             }
             // On a match, try_fuse_node pushes the fused opnodes and advances i past
             // the nodes it consumed; otherwise the node is appended as a single op.
-            if (try_fuse_node(graph, i, sess->cached_graph.nodes, emitted)) {
+            if (try_fuse_node(graph, i, entry->nodes, emitted)) {
                 continue;
             }
-            sess->cached_graph.nodes.emplace_back(n);
+            entry->nodes.emplace_back(n);
         }
 
+        size_t ws_sz = 0;
         int n_fused = 0;
-        for (const auto & node : sess->cached_graph.nodes) {
+        for (const auto & node : entry->nodes) {
+            size_t node_workspace_size = 0;
+            if (ggml_spacemit_get_work_size(n_threads, node.node, &node_workspace_size)) {
+                ws_sz = std::max(ws_sz, node_workspace_size);
+            }
             if (!node.fused.empty() || node.opcode != SPACEMIT_OP_INVALID) {
                 n_fused++;
             }
         }
+        entry->workspace_size = ws_sz;
         GGML_LOG_DEBUG("ggml-spacemit: %s graph %llu: %zu opnodes, %d fused\n", sess->c_name(),
-                       (unsigned long long) graph->uid, sess->cached_graph.nodes.size(), n_fused);
+                       (unsigned long long) graph->uid, entry->nodes.size(), n_fused);
     }
-    const auto & opnodes = sess->cached_graph.nodes;
-
-    int n_threads = sess->num_cores > 0 ? sess->num_cores : 1;
-    size_t workspace_size = 0;
-    for (const auto & node : opnodes) {
-        size_t node_workspace_size = 0;
-        if (ggml_spacemit_get_work_size(n_threads, node.node, &node_workspace_size)) {
-            workspace_size = std::max(workspace_size, node_workspace_size);
-        }
-    }
+    const auto & opnodes  = entry->nodes;
+    size_t workspace_size = entry->workspace_size;
 
     if (sess->workspace_size < workspace_size) {
         void * new_workspace = realloc(sess->workspace, workspace_size);
@@ -866,6 +894,7 @@ static bool ggml_backend_spacemit_device_supports_op(ggml_backend_dev_t dev, con
         case GGML_OP_SSM_CONV:
         case GGML_OP_ARGSORT:
         case GGML_OP_CLAMP:
+        case GGML_OP_ARANGE:
             supp = ggml_spacemit_get_tensor_traits(op) != nullptr;
             break;
 

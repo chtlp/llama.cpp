@@ -47,6 +47,7 @@ struct spacemit_opt_flags {
     bool    fa_tiled_nozero = true;
     bool    mtp_head_q4     = true;
     int64_t mtp_head_vocab  = 0;
+    bool    arange_cast     = true;
 
     static bool read_env_bool(const char * name, bool def_val) {
         const char * v = std::getenv(name);
@@ -67,6 +68,7 @@ struct spacemit_opt_flags {
         fa_tiled_nozero = read_env_bool("GGML_SPACEMIT_FA_TILED_NOZERO", true);
         mtp_head_q4     = read_env_bool("GGML_SPACEMIT_MTP_HEAD_Q4", true);
         mtp_head_vocab  = read_env_i64("GGML_SPACEMIT_MTP_HEAD_VOCAB", 0);
+        arange_cast     = read_env_bool("GGML_SPACEMIT_ARANGE_CAST", true);
     }
 
     static spacemit_opt_flags & instance() {
