@@ -1,6 +1,7 @@
 #include "rvv_kernels.h"
 
 #include "common.h"
+#include "ime_kernels.h"
 #include "spacemit-env.h"
 #include "ggml.h"
 #include "ggml-impl.h"
@@ -41,7 +42,7 @@ auto align_up(size_t value, size_t alignment) {
 // head dims above vlmax(e16m2) = 128 are processed in 128-wide segments
 static constexpr int64_t FA_VLEN1024_MAX_D = 256;
 // split-KV decode handles up to this many query tokens (speculative-decoding verification)
-static constexpr int64_t FA_SPLIT_KV_MAX_Q = 4;
+static constexpr int64_t FA_SPLIT_KV_MAX_Q = 16;
 
 static inline bool flash_attn_ext_supported_d_vlen1024_vf16(int64_t d) {
     return d > 0 && d <= FA_VLEN1024_MAX_D;
@@ -787,7 +788,8 @@ static void flash_attn_ext_f16_one_chunk_inner_vlen1024_vf16_mrow(float **      
     // its own mask row at mp + m * mask_row_stride bytes; a KV position is packed if any token can see it.
     // With partial != nullptr row i writes {M, S, unnormalized VKQ[DV]} to partial[i] (for a later split-KV
     // reduction) instead of the normalized output to dst[i].
-    static_assert(QLEN == 2 || QLEN == 4 || QLEN == 8 || QLEN == 12 || QLEN == 16 || QLEN == 24 || QLEN == 32,
+    static_assert(QLEN == 2 || QLEN == 4 || QLEN == 8 || QLEN == 12 || QLEN == 16 || QLEN == 24 || QLEN == 32 ||
+                      QLEN == 40 || QLEN == 48 || QLEN == 56 || QLEN == 64,
                   "unsupported QLEN");
     GGML_ASSERT(n_mask_rows >= 1 && QLEN % n_mask_rows == 0 && n_mask_rows <= 16);
     const int64_t rows_per_mask = QLEN / n_mask_rows;
@@ -1041,6 +1043,249 @@ static void flash_attn_ext_f16_one_chunk_inner_vlen1024_vf16_mrow(float **      
         }
     }
 }
+
+#if defined(RISCV64_SPACEMIT_IME2)
+static inline void pack_k_row_f16_to_k8(_Float16 * dst_k, const _Float16 * k_data, int64_t dk_k8) {
+    // Each K8 chunk is 8 x fp16 = 16 bytes = 2 x uint64_t.
+    // vlseg2e64 splits all dk_k8 pairs into (lo[0..dk_k8-1], hi[0..dk_k8-1]),
+    // then two strided vsse64 (stride = 256 fp16 = 512 bytes) scatter into [dk_k8][32][8].
+    for (int64_t kc = 0; kc < dk_k8;) {
+        const size_t vl = __riscv_vsetvl_e64m2((size_t) (dk_k8 - kc));
+        const vuint64m2x2_t pair = __riscv_vlseg2e64_v_u64m2x2(
+            reinterpret_cast<const uint64_t *>(k_data) + kc * 2, vl);
+        const vuint64m2_t lo = __riscv_vget_v_u64m2x2_u64m2(pair, 0);
+        const vuint64m2_t hi = __riscv_vget_v_u64m2x2_u64m2(pair, 1);
+        uint64_t * d64 = reinterpret_cast<uint64_t *>(dst_k) + kc * 64;
+        __riscv_vsse64_v_u64m2(d64 + 0, 512, lo, vl);
+        __riscv_vsse64_v_u64m2(d64 + 1, 512, hi, vl);
+        kc += (int64_t) vl;
+    }
+}
+
+static inline void pack_v_tile_8x32_ptrs_f16(_Float16 * dst, const _Float16 * const * v_ptrs, int64_t d0) {
+    const _Float16 * r0 = v_ptrs[0] + d0;
+    const _Float16 * r1 = v_ptrs[1] + d0;
+    const _Float16 * r2 = v_ptrs[2] + d0;
+    const _Float16 * r3 = v_ptrs[3] + d0;
+    const _Float16 * r4 = v_ptrs[4] + d0;
+    const _Float16 * r5 = v_ptrs[5] + d0;
+    const _Float16 * r6 = v_ptrs[6] + d0;
+    const _Float16 * r7 = v_ptrs[7] + d0;
+    asm volatile(
+        "li        t0, 32\n\t"
+        "vsetvli   zero, t0, e16, m1, ta, ma\n\t"
+        "vle16.v   v0, (%[r0])\n\t"
+        "vle16.v   v1, (%[r1])\n\t"
+        "vle16.v   v2, (%[r2])\n\t"
+        "vle16.v   v3, (%[r3])\n\t"
+        "vle16.v   v4, (%[r4])\n\t"
+        "vle16.v   v5, (%[r5])\n\t"
+        "vle16.v   v6, (%[r6])\n\t"
+        "vle16.v   v7, (%[r7])\n\t"
+        "vsseg8e16.v v0, (%[dst])\n\t"
+        :
+        : [dst] "r"(dst), [r0] "r"(r0), [r1] "r"(r1), [r2] "r"(r2), [r3] "r"(r3),
+          [r4] "r"(r4), [r5] "r"(r5), [r6] "r"(r6), [r7] "r"(r7)
+        : "t0", "v0", "v1", "v2", "v3", "v4", "v5", "v6", "v7", "memory");
+}
+
+// IME2 vfwmadot Split-KV FlashAttention kernel for multi-row speculative verification (QLEN = 8..64).
+// Uses IME2 16x32x8 FP16->FP32 matrix multiply for both QK and PV, keeping FP32 O and packed Q/K/V/P in TCM.
+template <size_t QLEN>
+static void flash_attn_ext_f16_one_chunk_inner_vlen1024_ime2_mrow(float **            pq,
+                                                                  const char *        k_data_row,
+                                                                  const char *        v_data_row,
+                                                                  const ggml_fp16_t * mp,
+                                                                  float **            partial,
+                                                                  float               scale,
+                                                                  float               logit_softcap,
+                                                                  float               slope,
+                                                                  int64_t             nek1,
+                                                                  int64_t             nbk1,
+                                                                  int64_t             nbv1,
+                                                                  int64_t             DV,
+                                                                  int64_t             DK,
+                                                                  void *              tcm_buffer,
+                                                                  size_t              tcm_buffer_size,
+                                                                  int64_t             n_mask_rows,
+                                                                  size_t              mask_row_stride) {
+    constexpr int64_t KV_TILE = 64;
+    constexpr int64_t M_TILES = (QLEN + 15) / 16;
+    const int64_t     dk_k8   = DK / 8;
+    const int64_t     dv_n32  = DV / 32;
+    const int64_t     rows_per_mask = (int64_t) QLEN / n_mask_rows;
+
+    auto mask_at = [&](int64_t m, int64_t ic) -> float {
+        return mp ? slope * ((const _Float16 *) ((const char *) mp + m * mask_row_stride))[ic] : 0.0f;
+    };
+
+    // Layout inside worker TCM (all 128-byte aligned):
+    uintptr_t p = align_up(reinterpret_cast<uintptr_t>(tcm_buffer), 128);
+    float *    o_f32      = reinterpret_cast<float *>(p);    p = align_up(p + QLEN * DV * sizeof(float), 128);
+    _Float16 * q_pack     = reinterpret_cast<_Float16 *>(p); p = align_up(p + M_TILES * dk_k8 * 128 * sizeof(_Float16), 128);
+    _Float16 * k_pack     = reinterpret_cast<_Float16 *>(p); p = align_up(p + 2 * dk_k8 * 256 * sizeof(_Float16), 128);
+    float *    kq_tile    = reinterpret_cast<float *>(p);    p = align_up(p + QLEN * KV_TILE * sizeof(float), 128);
+    _Float16 * p_pack     = reinterpret_cast<_Float16 *>(p); p = align_up(p + M_TILES * (KV_TILE / 8) * 128 * sizeof(_Float16), 128);
+    _Float16 * v_pack_d32 = reinterpret_cast<_Float16 *>(p); p = align_up(p + (KV_TILE / 8) * 256 * sizeof(_Float16), 128);
+    float *    mv_tile    = reinterpret_cast<float *>(p);    p = align_up(p + n_mask_rows * KV_TILE * sizeof(float), 128);
+    _Float16 * zero_vrow  = reinterpret_cast<_Float16 *>(p); p = align_up(p + DV * sizeof(_Float16), 128);
+    GGML_ASSERT(p <= reinterpret_cast<uintptr_t>(tcm_buffer) + tcm_buffer_size);
+    std::memset(zero_vrow, 0, (size_t) DV * sizeof(_Float16));
+
+    float S[QLEN];
+    float M[QLEN];
+    for (size_t i = 0; i < QLEN; ++i) {
+        S[i] = 0.0f;
+        M[i] = -INFINITY;
+    }
+    std::memset(o_f32, 0, QLEN * DV * sizeof(float));
+
+    // Pack Q once into [M_TILES][DK/8][16][8] FP16
+    const int64_t seg = (int64_t) __riscv_vsetvlmax_e16m2();
+    alignas(64) _Float16 q_tmp[FA_VLEN1024_MAX_D];
+    for (int64_t mt = 0; mt < M_TILES; ++mt) {
+        const int64_t m0 = mt * 16;
+        const int64_t mr = std::min<int64_t>(16, (int64_t) QLEN - m0);
+        _Float16 *    qm = q_pack + mt * dk_k8 * 128;
+        if (mr < 16) {
+            std::memset(qm, 0, (size_t) (dk_k8 * 128) * sizeof(_Float16));
+        }
+        for (int64_t r = 0; r < mr; ++r) {
+            const float * qsrc = pq[m0 + r];
+            for (int64_t d0 = 0; d0 < DK; d0 += seg) {
+                const size_t vl = __riscv_vsetvl_e16m2(DK - d0);
+                __riscv_vse16_v_f16m2(q_tmp + d0,
+                                      __riscv_vfncvt_f_f_w_f16m2(__riscv_vle32_v_f32m4(qsrc + d0, vl), vl), vl);
+            }
+            const uint64_t * q64   = reinterpret_cast<const uint64_t *>(q_tmp);
+            uint64_t *       dst64 = reinterpret_cast<uint64_t *>(qm + r * 8);
+            for (int64_t kc = 0; kc < dk_k8; ++kc) {
+                dst64[kc * 32 + 0] = q64[kc * 2 + 0];
+                dst64[kc * 32 + 1] = q64[kc * 2 + 1];
+            }
+        }
+    }
+
+    const _Float16 * v_ptrs[KV_TILE];
+    int64_t ic_step = 0;
+    for (int64_t ic = 0; ic < nek1; ++ic) {
+        float mvs[16];
+        bool  visible = false;
+        for (int64_t m = 0; m < n_mask_rows; ++m) {
+            mvs[m] = mask_at(m, ic);
+            visible |= mvs[m] != -INFINITY;
+        }
+        if (visible) {
+            const _Float16 * k_data = (const _Float16 *) (k_data_row + ic * nbk1);
+            const _Float16 * v_data = (const _Float16 *) (v_data_row + ic * nbv1);
+
+            // Pack K directly into [nt][DK/8][32][8] via vectorized vlseg2e64 + vsse64
+            const int64_t nt   = ic_step >> 5;
+            const int64_t n_in = ic_step & 31;
+            pack_k_row_f16_to_k8(k_pack + nt * dk_k8 * 256 + n_in * 8, k_data, dk_k8);
+
+            // Defer V read directly into vsseg8e16 pack (eliminates double TCM copy)
+            v_ptrs[ic_step] = v_data;
+            for (int64_t m = 0; m < n_mask_rows; ++m) {
+                mv_tile[m * KV_TILE + ic_step] = mvs[m];
+            }
+            ic_step++;
+        }
+
+        if (ic_step > 0 && (ic_step == KV_TILE || ic == (nek1 - 1))) {
+            const int64_t n_tiles = (ic_step + 31) / 32;
+            // 1. QK = Q * K^T via IME2 vfwmadot
+            for (int64_t nt = 0; nt < n_tiles; ++nt) {
+                const int64_t    n_cur = std::min<int64_t>(32, ic_step - nt * 32);
+                const _Float16 * kn    = k_pack + nt * dk_k8 * 256;
+                for (int64_t mt = 0; mt < M_TILES; ++mt) {
+                    const int64_t mr = std::min<int64_t>(16, (int64_t) QLEN - mt * 16);
+                    spacemit_kernels::ime2::gemm_kernel_f16f16f32_m16_vfwmadot(
+                        (size_t) DK, kn, q_pack + mt * dk_k8 * 128,
+                        kq_tile + mt * 16 * KV_TILE + nt * 32,
+                        (size_t) mr, (size_t) n_cur, (size_t) KV_TILE, false);
+                }
+            }
+
+            // 2. Scale, mask, online softmax, and rescale FP32 O
+            const int64_t k_pad = (ic_step + 7) & ~int64_t{ 7 };
+            const int64_t kp_k8 = k_pad / 8;
+            for (size_t i = 0; i < QLEN; ++i) {
+                float * row_ptr = kq_tile + i * KV_TILE;
+                rvv_scale_f32(row_ptr, scale, ic_step);
+                const float tile_max = rvv_softcap_add_max_inplace_f32(
+                    row_ptr, mv_tile + (i / rows_per_mask) * KV_TILE, ic_step, logit_softcap);
+
+                const float Mold = M[i];
+                if (tile_max > Mold) {
+                    if (S[i] > 0.0f) {
+                        const float ms = expf(Mold - tile_max);
+                        S[i] *= ms;
+                        rvv_scale_f32(o_f32 + i * DV, ms, DV);
+                    }
+                    M[i] = tile_max;
+                }
+                S[i] += rvv_softmax_exp_inplace_f32(row_ptr, ic_step, M[i]);
+                for (int64_t tk = ic_step; tk < k_pad; ++tk) {
+                    row_ptr[tk] = 0.0f;
+                }
+            }
+
+            // Pad remaining V pointers up to k_pad with zero_vrow
+            for (int64_t tk = ic_step; tk < k_pad; ++tk) {
+                v_ptrs[tk] = zero_vrow;
+            }
+
+            // 3. Pack P [QLEN, k_pad] F32 -> [M_TILES][kp_k8][16][8] FP16
+            alignas(64) _Float16 p_tmp[KV_TILE];
+            const size_t p_vl = __riscv_vsetvl_e16m1(k_pad);
+            for (int64_t mt = 0; mt < M_TILES; ++mt) {
+                const int64_t m0 = mt * 16;
+                const int64_t mr = std::min<int64_t>(16, (int64_t) QLEN - m0);
+                _Float16 *    pm = p_pack + mt * kp_k8 * 128;
+                if (mr < 16) {
+                    std::memset(pm, 0, (size_t) (kp_k8 * 128) * sizeof(_Float16));
+                }
+                for (int64_t r = 0; r < mr; ++r) {
+                    const float * pr_row = kq_tile + (m0 + r) * KV_TILE;
+                    __riscv_vse16_v_f16m1(p_tmp, __riscv_vfncvt_f_f_w_f16m1(__riscv_vle32_v_f32m2(pr_row, p_vl), p_vl),
+                                          p_vl);
+                    const uint64_t * p64   = reinterpret_cast<const uint64_t *>(p_tmp);
+                    uint64_t *       dst64 = reinterpret_cast<uint64_t *>(pm + r * 8);
+                    for (int64_t kc = 0; kc < kp_k8; ++kc) {
+                        dst64[kc * 32 + 0] = p64[kc * 2 + 0];
+                        dst64[kc * 32 + 1] = p64[kc * 2 + 1];
+                    }
+                }
+            }
+
+            // 4. Transpose V directly from DRAM pointers into [kp_k8][32][8] per D32 tile via vsseg8e16
+            //    and accumulate O += P * V via IME2
+            for (int64_t dt = 0; dt < dv_n32; ++dt) {
+                const int64_t d0 = dt * 32;
+                for (int64_t kc = 0; kc < kp_k8; ++kc) {
+                    pack_v_tile_8x32_ptrs_f16(v_pack_d32 + kc * 256, v_ptrs + kc * 8, d0);
+                }
+                for (int64_t mt = 0; mt < M_TILES; ++mt) {
+                    const int64_t mr = std::min<int64_t>(16, (int64_t) QLEN - mt * 16);
+                    spacemit_kernels::ime2::gemm_kernel_f16f16f32_m16_vfwmadot(
+                        (size_t) k_pad, v_pack_d32, p_pack + mt * kp_k8 * 128,
+                        o_f32 + mt * 16 * DV + d0, (size_t) mr, 32, (size_t) DV, true);
+                }
+            }
+
+            ic_step = 0;
+        }
+    }
+
+    for (size_t i = 0; i < QLEN; ++i) {
+        float * pr = partial[i];
+        pr[0]      = M[i];
+        pr[1]      = S[i];
+        std::memcpy(pr + 2, o_f32 + i * DV, (size_t) DV * sizeof(float));
+    }
+}
+#endif
 
 static void flash_attn_ext_f16_one_chunk_inner_vlen1024_vf16_m1(const float *       pq,
                                                                 const char *        k_data_row,
@@ -1462,18 +1707,26 @@ void forward_flash_attn_ext_f16_split_kv_partial_vlen1024_vf16(ggml::spacemit::c
 
     const int64_t chunk  = (n_kv + n_chunks - 1) / n_chunks;
 
-    std::array<float *, 32> pq;
-    std::array<float *, 32> pr;
-    std::array<float *, 32> unused = {};
+    std::array<float *, 64> pq;
+    std::array<float *, 64> pr;
+    std::array<float *, 64> unused = {};
 
-    const bool fa_splitkv_pair = ggml::cpu::riscv64_spacemit::spacemit_opt_flags::instance().fa_splitkv;
+    const bool    fa_splitkv_pair = ggml::cpu::riscv64_spacemit::spacemit_opt_flags::instance().fa_splitkv;
+    const int64_t fa_ime2_min_q   = ggml::cpu::riscv64_spacemit::spacemit_opt_flags::instance().fa_ime2_min_q;
+#if defined(RISCV64_SPACEMIT_IME2)
+    const bool    ime2_capable    = fa_ime2_min_q > 0 &&
+                                    ggml::cpu::riscv64_spacemit::global_spine_env_info.use_ime2 &&
+                                    DK % 8 == 0 && DV % 32 == 0 && tcm_buffer_size >= 240 * 1024;
+#endif
 
     // all query tokens of a unit in one pass (one K/V pack) when rk2 * nq is a supported row count;
-    // when fa_splitkv_pair is enabled, extend single-pass support to QLEN = 12, 24, 32 so MTP verify
-    // (nq = 3 -> 24 rows, nq = 4 -> 32 rows for rk2 = 8) reads the entire KV cache only ONCE!
+    // when fa_splitkv_pair is enabled, extend single-pass support up to QLEN = 64 so MTP & DFlash2 verify
+    // (e.g. nq = 3 -> 24, nq = 4 -> 32, nq = 8 -> 64 rows for rk2 = 8) reads the entire KV cache only ONCE!
     const int64_t rows      = rk2 * nq;
     const bool    fused_16  = rows == 2 || rows == 4 || rows == 8 || rows == 16;
-    const bool    fused_all = fused_16 || (fa_splitkv_pair && (rows == 12 || rows == 24 || rows == 32));
+    const bool    fused_all = fused_16 ||
+                              (fa_splitkv_pair && (rows == 12 || rows == 24 || rows == 32 || rows == 40 ||
+                                                   rows == 48 || rows == 56 || rows == 64));
 
     for (int64_t u = ctx.ith; u < n_kvh * n_chunks; u += ctx.nth) {
         const int64_t kvh = u / n_chunks;
@@ -1489,7 +1742,7 @@ void forward_flash_attn_ext_f16_split_kv_partial_vlen1024_vf16(ggml::spacemit::c
             if (fused_all) {
                 nt = nq;
             } else if (fa_splitkv_pair) {
-                while (nt * 2 <= nq - t0 && rk2 * (nt * 2) <= 32) {
+                while (nt * 2 <= nq - t0 && rk2 * (nt * 2) <= 64) {
                     nt *= 2;
                 }
             }
@@ -1505,6 +1758,31 @@ void forward_flash_attn_ext_f16_split_kv_partial_vlen1024_vf16(ggml::spacemit::c
             const int64_t n_mask_rows = nt;
             const size_t  mstride     = mask ? mask->nb[1] : 0;
 
+#if defined(RISCV64_SPACEMIT_IME2)
+            if (ime2_capable && prows >= fa_ime2_min_q) {
+#    define FA_SPLIT_IME2(QL)                                                                                       \
+        flash_attn_ext_f16_one_chunk_inner_vlen1024_ime2_mrow<QL>(pq.data(), kd, vd, mp, pr.data(), scale,          \
+                                                                  logit_softcap, 1.0f, c1 - c0, k->nb[1], v->nb[1], \
+                                                                  DV, DK, tcm_buffer, tcm_buffer_size, n_mask_rows, \
+                                                                  mstride)
+                switch (prows) {
+                    case 8: FA_SPLIT_IME2(8); break;
+                    case 12: FA_SPLIT_IME2(12); break;
+                    case 16: FA_SPLIT_IME2(16); break;
+                    case 24: FA_SPLIT_IME2(24); break;
+                    case 32: FA_SPLIT_IME2(32); break;
+                    case 40: FA_SPLIT_IME2(40); break;
+                    case 48: FA_SPLIT_IME2(48); break;
+                    case 56: FA_SPLIT_IME2(56); break;
+                    case 64: FA_SPLIT_IME2(64); break;
+                    default: FA_SPLIT_IME2(16); break;
+                }
+#    undef FA_SPLIT_IME2
+                t0 += nt;
+                continue;
+            }
+#endif
+
 #define FA_SPLIT_MROW(QL)                                                                                          \
     flash_attn_ext_f16_one_chunk_inner_vlen1024_vf16_mrow<QL>(pq.data(), kd, vd, mp, unused.data(), unused.data(),     \
                                                               scale, logit_softcap, 1.0f, c1 - c0, k->nb[1],          \
@@ -1518,6 +1796,10 @@ void forward_flash_attn_ext_f16_split_kv_partial_vlen1024_vf16(ggml::spacemit::c
                 case 16: FA_SPLIT_MROW(16); break;
                 case 24: FA_SPLIT_MROW(24); break;
                 case 32: FA_SPLIT_MROW(32); break;
+                case 40: FA_SPLIT_MROW(40); break;
+                case 48: FA_SPLIT_MROW(48); break;
+                case 56: FA_SPLIT_MROW(56); break;
+                case 64: FA_SPLIT_MROW(64); break;
                 default: FA_SPLIT_MROW(16); break;
             }
 #undef FA_SPLIT_MROW
@@ -4065,8 +4347,8 @@ void forward_gated_delta_net(ggml::spacemit::context & ctx, ggml_tensor * op) {
         }
         return;
     }
-    const bool fused = n_tokens <= 4 && S_v <= (int64_t) __riscv_vsetvlmax_e32m8();
-    const bool fused_multi = gdn_mtp_opt && !transposed && fused && !kda && n_tokens >= 2 && n_tokens <= 4 &&
+    const bool fused = n_tokens <= 16 && S_v <= (int64_t) __riscv_vsetvlmax_e32m8();
+    const bool fused_multi = gdn_mtp_opt && !transposed && fused && !kda && n_tokens >= 2 && n_tokens <= 16 &&
                              S_v <= (int64_t) __riscv_vsetvlmax_e32m4();
     if (fused_multi) {
         const int64_t rq3 = src_v->ne[3] / src_q->ne[3];
@@ -4080,14 +4362,14 @@ void forward_gated_delta_net(ggml::spacemit::context & ctx, ggml_tensor * op) {
             const int64_t ik3 = iv3 / rk3;
 
             const float * s_in = state_in_base + iv3 * state_seq_stride + iv1 * S_v * S_v;
-            const float * k_ptrs[4];
-            const float * q_ptrs[4];
-            const float * v_ptrs[4];
-            float *       attn_ptrs[4];
-            float *       snap_ptrs[4];
-            float         decays[4];
-            float         betas[4];
-            float         kqs[4];
+            const float * k_ptrs[16];
+            const float * q_ptrs[16];
+            const float * v_ptrs[16];
+            float *       attn_ptrs[16];
+            float *       snap_ptrs[16];
+            float         decays[16];
+            float         betas[16];
+            float         kqs[16];
 
             float * attn_base = attn_out_base + (iv3 * n_tokens * H + iv1) * S_v;
             for (int64_t t = 0; t < n_tokens; ++t) {

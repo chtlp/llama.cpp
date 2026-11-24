@@ -188,14 +188,31 @@ void forward_cumsum_f32(ggml::spacemit::context & ctx, ggml_tensor * op) {
 }
 
 // ── PAD ───────────────────────────────────────────────────────────────────────
+static inline int64_t wrap_around_pad(int64_t coord, int64_t size) {
+    return (coord + size) % size;
+}
+
 void forward_pad_f32(ggml::spacemit::context & ctx, ggml_tensor * op) {
     const ggml_tensor * src0 = op->src[0];
     GGML_ASSERT(src0->type == GGML_TYPE_F32 && op->type == GGML_TYPE_F32);
+    GGML_ASSERT(op->nb[0] == sizeof(float));
 
     const int64_t ne0 = op->ne[0], ne1 = op->ne[1], ne2 = op->ne[2], ne3 = op->ne[3];
     const int64_t ne00 = src0->ne[0], ne01 = src0->ne[1], ne02 = src0->ne[2], ne03 = src0->ne[3];
-    const size_t  nb01 = src0->nb[1], nb02 = src0->nb[2], nb03 = src0->nb[3];
+    const size_t  nb00 = src0->nb[0], nb01 = src0->nb[1], nb02 = src0->nb[2], nb03 = src0->nb[3];
     const size_t  nb1  = op->nb[1],   nb2  = op->nb[2],   nb3  = op->nb[3];
+
+    const int32_t lp0      = ggml_get_op_params_i32(op, 0);
+    const int32_t rp0      = ggml_get_op_params_i32(op, 1);
+    const int32_t lp1      = ggml_get_op_params_i32(op, 2);
+    const int32_t rp1      = ggml_get_op_params_i32(op, 3);
+    const int32_t lp2      = ggml_get_op_params_i32(op, 4);
+    const int32_t rp2      = ggml_get_op_params_i32(op, 5);
+    const int32_t lp3      = ggml_get_op_params_i32(op, 6);
+    const int32_t rp3      = ggml_get_op_params_i32(op, 7);
+    const bool    circular = (bool) ggml_get_op_params_i32(op, 8);
+
+    const bool src_row_contig = nb00 == sizeof(float);
 
     const int64_t nr  = ne1 * ne2 * ne3;
     const int64_t dr  = (nr + ctx.nth - 1) / ctx.nth;
@@ -208,13 +225,37 @@ void forward_pad_f32(ggml::spacemit::context & ctx, ggml_tensor * op) {
 
         float * dst_row = (float *)((char *)op->data + i3*nb3 + i2*nb2 + i1*nb1);
 
-        if (i3 < ne03 && i2 < ne02 && i1 < ne01) {
-            const float * src_row = (const float *)((const char *)src0->data + i1*nb01 + i2*nb02 + i3*nb03);
-            const int64_t copy_n = std::min(ne0, ne00);
-            for (int64_t i = 0; i < copy_n; ++i) dst_row[i] = src_row[i];
-            for (int64_t i = copy_n; i < ne0; ++i) dst_row[i] = 0.0f;
+        if (circular) {
+            const int64_t src_i1 = wrap_around_pad(i1 - lp1, ne01);
+            const int64_t src_i2 = wrap_around_pad(i2 - lp2, ne02);
+            const int64_t src_i3 = wrap_around_pad(i3 - lp3, ne03);
+            const char *  src_r  = (const char *)src0->data + src_i3*nb03 + src_i2*nb02 + src_i1*nb01;
+            for (int64_t i0 = 0; i0 < ne0; ++i0) {
+                const int64_t src_i0 = wrap_around_pad(i0 - lp0, ne00);
+                dst_row[i0] = *(const float *)(src_r + src_i0*nb00);
+            }
         } else {
-            for (int64_t i = 0; i < ne0; ++i) dst_row[i] = 0.0f;
+            const bool interior = (i1 >= lp1 && i1 < ne1 - rp1) &&
+                                  (i2 >= lp2 && i2 < ne2 - rp2) &&
+                                  (i3 >= lp3 && i3 < ne3 - rp3);
+            if (!interior) {
+                std::memset(dst_row, 0, (size_t) ne0 * sizeof(float));
+                continue;
+            }
+            const char * src_row = (const char *)src0->data + (i3 - lp3)*nb03 + (i2 - lp2)*nb02 + (i1 - lp1)*nb01;
+            if (src_row_contig && lp0 >= 0 && rp0 >= 0) {
+                if (lp0 > 0) std::memset(dst_row, 0, (size_t) lp0 * sizeof(float));
+                std::memcpy(dst_row + lp0, src_row, (size_t) ne00 * sizeof(float));
+                if (rp0 > 0) std::memset(dst_row + lp0 + ne00, 0, (size_t) rp0 * sizeof(float));
+            } else {
+                for (int64_t i0 = 0; i0 < ne0; ++i0) {
+                    if (i0 >= lp0 && i0 < ne0 - rp0) {
+                        dst_row[i0] = *(const float *)(src_row + (i0 - lp0)*nb00);
+                    } else {
+                        dst_row[i0] = 0.0f;
+                    }
+                }
+            }
         }
     }
 }

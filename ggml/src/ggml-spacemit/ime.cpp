@@ -80,12 +80,20 @@ static bool env_q41_m4() {
     return spacemit_opt_flags::instance().q41_m4;
 }
 
+static int64_t env_q41_m4_max() {
+    return spacemit_opt_flags::instance().q41_m4_max;
+}
+
 static bool env_q8_small_m() {
     return spacemit_opt_flags::instance().q8_small_m;
 }
 
 static bool env_moe_small_m() {
     return spacemit_opt_flags::instance().moe_small_m;
+}
+
+static int64_t env_moe_pad8_min_m() {
+    return spacemit_opt_flags::instance().moe_pad8_min_m;
 }
 
 static bool env_mtp_head_q4() {
@@ -462,7 +470,7 @@ private:
                     } else if constexpr (INTER_SIZE == QK4_0) {
                         const int64_t ne10        = op->src[1]->ne[0];
                         const int64_t ne1_rows    = ne10 > 0 ? src1_nelements / ne10 : 0;
-                        const int64_t padded_rows = (q8_al_layout() && ne1_rows >= 2 && ne1_rows < 4) ? 4 : ne1_rows;
+                        const int64_t padded_rows = (q8_al_layout() && ne1_rows >= 2) ? ((ne1_rows + 3) & ~int64_t{ 3 }) : ne1_rows;
                         size = spacemit_kernels::div_round_up(ne10, QK4_0) * padded_rows *
                                (q8_al_layout() ? spacemit_kernels::q8_m4al_row_blk_size :
                                            spacemit_kernels::q8_blk_size(QK4_0, true));
@@ -624,7 +632,7 @@ private:
         // the exact Q6_K/Q8_0 target output.weight.
         if constexpr ((std::is_same_v<BLOC_TYPE, block_q6_K> || std::is_same_v<BLOC_TYPE, block_q8_0>) &&
                       INTER_SIZE == 32 && NB_COLS == 32) {
-            if (env_mtp_head_q4() && gemm_m >= 1 && gemm_m <= 4 && gemm_k % 32 == 0 && gemm_n % 32 == 0 &&
+            if (env_mtp_head_q4() && gemm_m >= 1 && gemm_m <= 16 && gemm_k % 32 == 0 && gemm_n % 32 == 0 &&
                 std::strcmp(src1->name, "mtp_shared_head_norm") == 0) {
                 const int64_t vocab_cap = env_mtp_head_vocab();
                 int64_t       n_active  = gemm_n;
@@ -691,19 +699,28 @@ private:
                             quant_a, b_q41 + ni * b_row_stride, output + ni, (size_t) nb_real, (size_t) b_k_blks);
                     }
                 } else {
+                    const size_t chunk_bytes = (size_t) a_k_blks * spacemit_kernels::q8_m4al_blk_size;
                     if (a_blk_start < a_blk_end) {
-                        spacemit_kernels::rvv::quantize_a_i8_r4_al_partial(
-                            a_blk_len, feature, (size_t) gemm_k * sizeof(float), (size_t) gemm_m,
-                            (size_t) a_blk_start * a_blk_len, (size_t) (a_blk_end - a_blk_start) * a_blk_len,
-                            quant_a + a_blk_start * spacemit_kernels::q8_m4al_blk_size);
+                        for (int64_t m0 = 0; m0 < gemm_m; m0 += 4) {
+                            const size_t mr = (size_t) std::min<int64_t>(4, gemm_m - m0);
+                            spacemit_kernels::rvv::quantize_a_i8_r4_al_partial(
+                                a_blk_len, feature + m0 * gemm_k, (size_t) gemm_k * sizeof(float), mr,
+                                (size_t) a_blk_start * a_blk_len, (size_t) (a_blk_end - a_blk_start) * a_blk_len,
+                                quant_a + (size_t) (m0 / 4) * chunk_bytes +
+                                    a_blk_start * spacemit_kernels::q8_m4al_blk_size);
+                        }
                     }
                     ctx.sync();
                     const size_t b_row_stride = (size_t) b_k_blks * q41_row_pitch;
                     for (int64_t ni = (int64_t) ith * 32; ni < n_active; ni += (int64_t) 32 * nth) {
-                        const int64_t nb_real = std::min(n_active - ni, (int64_t) 32);
-                        spacemit_kernels::ime2::gemm_kernel_i8i4_m4_q41(
-                            quant_a, b_q41 + ni * b_row_stride, output + ni, (size_t) gemm_m, (size_t) nb_real,
-                            (size_t) b_k_blks, (size_t) gemm_n);
+                        const int64_t   nb_real = std::min(n_active - ni, (int64_t) 32);
+                        const uint8_t * b_tile  = b_q41 + ni * b_row_stride;
+                        for (int64_t m0 = 0; m0 < gemm_m; m0 += 4) {
+                            const size_t mr = (size_t) std::min<int64_t>(4, gemm_m - m0);
+                            spacemit_kernels::ime2::gemm_kernel_i8i4_m4_q41(
+                                quant_a + (size_t) (m0 / 4) * chunk_bytes, b_tile, output + m0 * gemm_n + ni,
+                                mr, (size_t) nb_real, (size_t) b_k_blks, (size_t) gemm_n);
+                        }
                     }
                 }
 
@@ -1040,8 +1057,9 @@ private:
         bool pad8_all   = false;
         bool pad4_small = false;
         if constexpr (std::is_same_v<BLOC_TYPE, block_q4_0> && INTER_SIZE == 256) {
-            const bool moe_small_m = env_moe_small_m();
-            pad8_all = (ids->ne[1] >= 8 || !moe_small_m) && ids->ne[1] > 1 && quantize_a_i8_r4 != nullptr &&
+            const bool    moe_small_m = env_moe_small_m();
+            const int64_t pad8_min_m  = env_moe_pad8_min_m();
+            pad8_all = (ids->ne[1] >= pad8_min_m || !moe_small_m) && ids->ne[1] > 1 && quantize_a_i8_r4 != nullptr &&
                        ne01 % 32 == 0 && hp_aligned();
             pad4_small = !pad8_all && moe_small_m && ids->ne[1] > 1 && quantize_a_i8_r4 != nullptr &&
                          ne01 % 32 == 0 && hp_aligned();
@@ -1553,8 +1571,8 @@ class tensor_traits_common : public ggml::spacemit::tensor_traits_base {
                     // Per-thread: VKQ accmulator (DV), partial M, partial S + intra-thread scratch for V, Q and VKQ
                     size_t n_chunks = n_tasks;
                     size_t decode   = sizeof(float) * n_tasks * (DK + 2 * DV + 64);
-                    // split-KV decode partials (up to 4 query tokens, FA_SPLIT_KV_MAX_Q)
-                    const size_t n_q = (size_t) std::min<int64_t>(op->src[0]->ne[1], 4);
+                    // split-KV decode partials (up to 16 query tokens, FA_SPLIT_KV_MAX_Q)
+                    const size_t n_q = (size_t) std::min<int64_t>(op->src[0]->ne[1], 16);
                     decode = MAX(decode, sizeof(float) * (n_q * neq2 * n_chunks * (2 + DV) + n_tasks * (DK + 2 * DV)));
 
                     size = MAX(prefill, decode);
@@ -2096,8 +2114,9 @@ private:
         const size_t N         = static_cast<size_t>(op->src[0]->ne[1]);
         const size_t M         = static_cast<size_t>(op->src[1]->ne[1] * op->src[1]->ne[2] * op->src[1]->ne[3]);
         const size_t K         = static_cast<size_t>(op->src[1]->ne[0]);
-        const size_t gemv_size = ((K + KB - 1) / KB) * 38;
-        const size_t m4_size   = ((K + KB - 1) / KB) * spacemit_kernels::q8_m4al_blk_size + 64;
+        const size_t gemv_size  = ((K + KB - 1) / KB) * 38;
+        const size_t m4_chunks  = (M >= 2 && M <= 16) ? (M + 3) / 4 : 1;
+        const size_t m4_size    = m4_chunks * ((K + KB - 1) / KB) * spacemit_kernels::q8_m4al_blk_size + 64;
         size = std::max(partial_workspace_size(M, N, n_threads),
                         GGML_PAD(std::max(gemv_size, m4_size), sizeof(int64_t)));
         return true;
@@ -2187,14 +2206,17 @@ private:
             }
         }
 
-        // Small-M verify decode (M = 2..4): direct INT8xINT4 GEMM over Q41Block,
+        // Small-M verify decode (M = 2..q41_m4_max, default 8): direct INT8xINT4 GEMM over Q41Block,
         // avoiding FP16 dequant, TCM staging, and Split-K reduction cliff.
-        if (M >= 2 && M <= 4 && src1->ne[2] == 1 && src1->ne[3] == 1 && K % KB == 0 && env_q41_m4() &&
+        const size_t m4_max = (size_t) env_q41_m4_max();
+        if (M >= 2 && M <= m4_max && src1->ne[2] == 1 && src1->ne[3] == 1 && K % KB == 0 && env_q41_m4() &&
             out_row_stride % sizeof(float) == 0) {
             constexpr size_t a_blk_len    = 32;
             const size_t     a_k_blks     = K / KB;
             const size_t     k_blks       = K / KB;
-            const size_t     m4_ws_needed = a_k_blks * spacemit_kernels::q8_m4al_blk_size + 64;
+            const size_t     chunk_bytes  = a_k_blks * spacemit_kernels::q8_m4al_blk_size;
+            const size_t     m4_chunks    = (M + 3) / 4;
+            const size_t     m4_ws_needed = m4_chunks * chunk_bytes + 64;
             if (ctx.workspace_size >= m4_ws_needed) {
                 uintptr_t ws_p    = reinterpret_cast<uintptr_t>(ctx.workspace);
                 ws_p              = (ws_p + 63) & ~(uintptr_t) 63;
@@ -2204,10 +2226,13 @@ private:
                 int a_blk_start     = ith * task_per_thread;
                 int a_blk_end       = std::min(a_blk_start + task_per_thread, (int) a_k_blks);
                 if (a_blk_start < a_blk_end) {
-                    spacemit_kernels::rvv::quantize_a_i8_r4_al_partial(
-                        a_blk_len, reinterpret_cast<const float *>(a_src), a_src_stride, M,
-                        (size_t) a_blk_start * a_blk_len, (size_t) (a_blk_end - a_blk_start) * a_blk_len,
-                        quant_a + a_blk_start * spacemit_kernels::q8_m4al_blk_size);
+                    for (size_t m0 = 0; m0 < M; m0 += 4) {
+                        const size_t mr = std::min<size_t>(4, M - m0);
+                        spacemit_kernels::rvv::quantize_a_i8_r4_al_partial(
+                            a_blk_len, reinterpret_cast<const float *>(a_src + m0 * a_src_stride), a_src_stride, mr,
+                            (size_t) a_blk_start * a_blk_len, (size_t) (a_blk_end - a_blk_start) * a_blk_len,
+                            quant_a + (m0 / 4) * chunk_bytes + a_blk_start * spacemit_kernels::q8_m4al_blk_size);
+                    }
                 }
 
                 ctx.sync();
@@ -2219,8 +2244,11 @@ private:
                      ni += (int64_t) tile_cols * nth) {
                     const int64_t   nb_real = std::min((int64_t) N - ni, (int64_t) tile_cols);
                     const uint8_t * b_row   = b_src + ni * b_row_stride;
-                    auto *          c_row   = reinterpret_cast<float *>(out) + ni;
-                    ops.dot_m4(quant_a, b_row, c_row, M, (size_t) nb_real, k_blks, ldc);
+                    for (size_t m0 = 0; m0 < M; m0 += 4) {
+                        const size_t mr    = std::min<size_t>(4, M - m0);
+                        auto *       c_row = reinterpret_cast<float *>(out + m0 * out_row_stride) + ni;
+                        ops.dot_m4(quant_a + (m0 / 4) * chunk_bytes, b_row, c_row, mr, (size_t) nb_real, k_blks, ldc);
+                    }
                 }
                 return true;
             }

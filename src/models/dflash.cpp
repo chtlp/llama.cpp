@@ -466,6 +466,7 @@ ggml_tensor * llama_model_dflash::graph_base::build_layers(ggml_tensor * inp_tok
 
 ggml_tensor * llama_model_dflash::graph_base::build_logits(ggml_tensor * cur) {
     const auto [output, output_s] = get_lm_head(*this, model);
+    ggml_set_name(cur, "mtp_shared_head_norm");
     cur = build_lora_mm(output, cur, output_s);
 
     // DFlash2 feeds these logits to the selector, so they need the target's output

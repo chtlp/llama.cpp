@@ -40,10 +40,13 @@ extern spine_env_info global_spine_env_info;
 
 struct spacemit_opt_flags {
     bool    q41_m4          = true;
+    int64_t q41_m4_max      = 8;
     bool    q8_small_m      = true;
     bool    moe_small_m     = true;
+    int64_t moe_pad8_min_m  = 32;
     bool    gdn_mtp         = true;
     bool    fa_splitkv      = true;
+    int64_t fa_ime2_min_q   = 16;
     bool    fa_tiled_nozero = true;
     bool    mtp_head_q4     = true;
     int64_t mtp_head_vocab  = 0;
@@ -61,10 +64,15 @@ struct spacemit_opt_flags {
 
     spacemit_opt_flags() {
         q41_m4          = read_env_bool("GGML_SPACEMIT_Q41_M4", true);
+        q41_m4_max      = read_env_i64("GGML_SPACEMIT_Q41_M4_MAX", 8);
+        if (q41_m4_max < 0) q41_m4_max = 0;
+        if (q41_m4_max > 16) q41_m4_max = 16;
         q8_small_m      = read_env_bool("GGML_SPACEMIT_Q8_SMALLM", true);
         moe_small_m     = read_env_bool("GGML_SPACEMIT_MOE_SMALLM", true);
+        moe_pad8_min_m  = read_env_i64("GGML_SPACEMIT_MOE_PAD8_MIN_M", 32);
         gdn_mtp         = read_env_bool("GGML_SPACEMIT_GDN_MTP", true);
         fa_splitkv      = read_env_bool("GGML_SPACEMIT_FA_SPLITKV_PAIR", true);
+        fa_ime2_min_q   = read_env_i64("GGML_SPACEMIT_FA_IME2_MIN_Q", 16);
         fa_tiled_nozero = read_env_bool("GGML_SPACEMIT_FA_TILED_NOZERO", true);
         mtp_head_q4     = read_env_bool("GGML_SPACEMIT_MTP_HEAD_Q4", true);
         mtp_head_vocab  = read_env_i64("GGML_SPACEMIT_MTP_HEAD_VOCAB", 0);
