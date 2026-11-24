@@ -93,4 +93,9 @@ if(CMAKE_SYSTEM_PROCESSOR MATCHES "riscv")
         set(SPACEMIT_MARCH "-march=rv64gcv_zfh_zvfh_zba_zbb_zbs_zicbop_zihintpause_zawrs_zicond_zvbb_xsmtvdotii")
     endif()
     target_compile_options(${TARGET_NAME} PRIVATE ${SPACEMIT_MARCH})
+    if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
+        # Prevent GCC 15+ auto-vectorization from degrading hand-tuned RVV/IME2 inner loops
+        # (e.g. FA prefill regressed 1.72x and FA M=1 decode regressed 1.22x without these flags).
+        target_compile_options(${TARGET_NAME} PRIVATE -fno-tree-vectorize -fno-tree-loop-vectorize)
+    endif()
 endif()

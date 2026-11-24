@@ -96,6 +96,9 @@ void forward_flash_attn_ext_f16_tiled_vlen1024_vf16(ggml::spacemit::context & ct
                                                     int                       ir0,
                                                     int                       ir1);
 
+bool forward_flash_attn_ext_f16_tiled_vlen1024_ime2(ggml::spacemit::context & ctx,
+                                                    ggml_tensor *             dst);
+
 void forward_rms_norm_f32(ggml::spacemit::context & ctx, ggml_tensor * op);
 
 void forward_norm_f32(ggml::spacemit::context & ctx, ggml_tensor * op);

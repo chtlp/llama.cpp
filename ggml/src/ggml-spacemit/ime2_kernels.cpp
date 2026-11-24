@@ -4910,9 +4910,14 @@ void gemm_kernel_f16f16f32_m16_vfwmadot(size_t           gemm_k,
     const _Float16 * b3            = b_f16_k8 + 192;
     size_t           kc_left       = gemm_k / 8;
     // Accumulator register pairs are not row-major; add existing C only after unpacking.
-    // The local tile also avoids writing beyond a partial-M output.
-    const bool       via_tile      = accumulate || count_m != 16;
-    const bool       store_vs8r    = count_m == 16 && count_n == 32 && ldc == 32 && !accumulate;
+    // For full count_m == 16 tiles, accumulate directly into C in registers (no stack tile).
+    // Only partial-M tiles (count_m < 16) stage through tile[] to avoid out-of-bounds stores.
+    const bool       via_tile      = count_m != 16;
+    const bool       is_contig32   = count_n == 32 && ldc == 32;
+    const int        store_mode    = via_tile
+                                         ? 1
+                                         : (accumulate ? (is_contig32 ? 3 : 2)
+                                                       : (is_contig32 ? 1 : 0));
     float *          out           = via_tile ? tile : c_ptr;
     const size_t     out_row_bytes = (via_tile ? size_t{ 32 } : ldc) * sizeof(float);
 
@@ -5236,7 +5241,103 @@ void gemm_kernel_f16f16f32_m16_vfwmadot(size_t           gemm_k,
         "vpack.vv  v26, v9, v11, 3\n\t"
         "vpack.vv  v28, v12, v14, 3\n\t"
         "vpack.vv  v30, v13, v15, 3\n\t"
-        "bnez      %[store_vs8r], .L_f16_store_whole_registers_%=\n\t"
+        "beqz      %[store_mode], .L_f16_store_strided_%=\n\t"
+        "li        t0, 1\n\t"
+        "beq       %[store_mode], t0, .L_f16_store_whole_registers_%=\n\t"
+        "li        t0, 2\n\t"
+        "beq       %[store_mode], t0, .L_f16_store_strided_acc_%=\n\t"
+        "vsetvli   t0, zero, e32, m8, tu, mu\n\t"
+        "vle32.v   v0, (%[out])\n\t"
+        "vfadd.vv  v16, v16, v0\n\t"
+        "vs8r.v    v16, (%[out])\n\t"
+        "addi      %[out], %[out], 1024\n\t"
+        "vle32.v   v0, (%[out])\n\t"
+        "vfadd.vv  v24, v24, v0\n\t"
+        "vs8r.v    v24, (%[out])\n\t"
+        "j         .L_f16_store_done_%=\n\t"
+        ".L_f16_store_strided_acc_%=:\n\t"
+        "vsetvli   t0, %[count_n], e32, m1, tu, mu\n\t"
+        "mv        t1, %[out]\n\t"
+        "vle32.v   v0, (t1)\n\t"
+        "add       t1, t1, %[out_stride]\n\t"
+        "vle32.v   v1, (t1)\n\t"
+        "add       t1, t1, %[out_stride]\n\t"
+        "vle32.v   v2, (t1)\n\t"
+        "add       t1, t1, %[out_stride]\n\t"
+        "vle32.v   v3, (t1)\n\t"
+        "add       t1, t1, %[out_stride]\n\t"
+        "vle32.v   v4, (t1)\n\t"
+        "add       t1, t1, %[out_stride]\n\t"
+        "vle32.v   v5, (t1)\n\t"
+        "add       t1, t1, %[out_stride]\n\t"
+        "vle32.v   v6, (t1)\n\t"
+        "add       t1, t1, %[out_stride]\n\t"
+        "vle32.v   v7, (t1)\n\t"
+        "add       t1, t1, %[out_stride]\n\t"
+        "vfadd.vv  v16, v16, v0\n\t"
+        "vfadd.vv  v17, v17, v1\n\t"
+        "vfadd.vv  v18, v18, v2\n\t"
+        "vfadd.vv  v19, v19, v3\n\t"
+        "vfadd.vv  v20, v20, v4\n\t"
+        "vfadd.vv  v21, v21, v5\n\t"
+        "vfadd.vv  v22, v22, v6\n\t"
+        "vfadd.vv  v23, v23, v7\n\t"
+        "vse32.v   v16, (%[out])\n\t"
+        "add       %[out], %[out], %[out_stride]\n\t"
+        "vse32.v   v17, (%[out])\n\t"
+        "add       %[out], %[out], %[out_stride]\n\t"
+        "vse32.v   v18, (%[out])\n\t"
+        "add       %[out], %[out], %[out_stride]\n\t"
+        "vse32.v   v19, (%[out])\n\t"
+        "add       %[out], %[out], %[out_stride]\n\t"
+        "vse32.v   v20, (%[out])\n\t"
+        "add       %[out], %[out], %[out_stride]\n\t"
+        "vse32.v   v21, (%[out])\n\t"
+        "add       %[out], %[out], %[out_stride]\n\t"
+        "vse32.v   v22, (%[out])\n\t"
+        "add       %[out], %[out], %[out_stride]\n\t"
+        "vse32.v   v23, (%[out])\n\t"
+        "add       %[out], %[out], %[out_stride]\n\t"
+        "vle32.v   v0, (t1)\n\t"
+        "add       t1, t1, %[out_stride]\n\t"
+        "vle32.v   v1, (t1)\n\t"
+        "add       t1, t1, %[out_stride]\n\t"
+        "vle32.v   v2, (t1)\n\t"
+        "add       t1, t1, %[out_stride]\n\t"
+        "vle32.v   v3, (t1)\n\t"
+        "add       t1, t1, %[out_stride]\n\t"
+        "vle32.v   v4, (t1)\n\t"
+        "add       t1, t1, %[out_stride]\n\t"
+        "vle32.v   v5, (t1)\n\t"
+        "add       t1, t1, %[out_stride]\n\t"
+        "vle32.v   v6, (t1)\n\t"
+        "add       t1, t1, %[out_stride]\n\t"
+        "vle32.v   v7, (t1)\n\t"
+        "vfadd.vv  v24, v24, v0\n\t"
+        "vfadd.vv  v25, v25, v1\n\t"
+        "vfadd.vv  v26, v26, v2\n\t"
+        "vfadd.vv  v27, v27, v3\n\t"
+        "vfadd.vv  v28, v28, v4\n\t"
+        "vfadd.vv  v29, v29, v5\n\t"
+        "vfadd.vv  v30, v30, v6\n\t"
+        "vfadd.vv  v31, v31, v7\n\t"
+        "vse32.v   v24, (%[out])\n\t"
+        "add       %[out], %[out], %[out_stride]\n\t"
+        "vse32.v   v25, (%[out])\n\t"
+        "add       %[out], %[out], %[out_stride]\n\t"
+        "vse32.v   v26, (%[out])\n\t"
+        "add       %[out], %[out], %[out_stride]\n\t"
+        "vse32.v   v27, (%[out])\n\t"
+        "add       %[out], %[out], %[out_stride]\n\t"
+        "vse32.v   v28, (%[out])\n\t"
+        "add       %[out], %[out], %[out_stride]\n\t"
+        "vse32.v   v29, (%[out])\n\t"
+        "add       %[out], %[out], %[out_stride]\n\t"
+        "vse32.v   v30, (%[out])\n\t"
+        "add       %[out], %[out], %[out_stride]\n\t"
+        "vse32.v   v31, (%[out])\n\t"
+        "j         .L_f16_store_done_%=\n\t"
+        ".L_f16_store_strided_%=:\n\t"
         "vsetvli   t0, %[count_n], e32, m1, tu, mu\n\t"
         "vse32.v   v16, (%[out])\n\t"
         "add       %[out], %[out], %[out_stride]\n\t"
@@ -5277,15 +5378,23 @@ void gemm_kernel_f16f16f32_m16_vfwmadot(size_t           gemm_k,
         ".L_f16_store_done_%=:\n\t"
         : [a0] "+&r"(a0), [a1] "+&r"(a1), [b0] "+&r"(b0), [b1] "+&r"(b1),
           [b2] "+&r"(b2), [b3] "+&r"(b3), [kc] "+&r"(kc_left), [out] "+&r"(out)
-        : [count_n] "r"(count_n), [out_stride] "r"(out_row_bytes), [store_vs8r] "r"(store_vs8r)
+        : [count_n] "r"(count_n), [out_stride] "r"(out_row_bytes), [store_mode] "r"(store_mode)
         : "cc", "memory", "t0", "t1", "v0", "v1", "v2", "v3", "v4", "v5", "v6", "v7", "v8", "v9", "v10", "v11", "v12", "v13",
           "v14", "v15", "v16", "v17", "v18", "v19", "v20", "v21", "v22", "v23", "v24", "v25", "v26", "v27", "v28",
           "v29", "v30", "v31");
 
     if (via_tile) {
-        for (size_t m = 0; m < count_m; ++m) {
-            for (size_t n = 0; n < count_n; ++n) {
-                c_ptr[m * ldc + n] = accumulate ? c_ptr[m * ldc + n] + tile[m * 32 + n] : tile[m * 32 + n];
+        const size_t vl = __riscv_vsetvl_e32m1(count_n);
+        if (accumulate) {
+            for (size_t m = 0; m < count_m; ++m) {
+                vfloat32m1_t vc = __riscv_vle32_v_f32m1(c_ptr + m * ldc, vl);
+                vfloat32m1_t vt = __riscv_vle32_v_f32m1(tile + m * 32, vl);
+                __riscv_vse32_v_f32m1(c_ptr + m * ldc, __riscv_vfadd_vv_f32m1(vc, vt, vl), vl);
+            }
+        } else {
+            for (size_t m = 0; m < count_m; ++m) {
+                vfloat32m1_t vt = __riscv_vle32_v_f32m1(tile + m * 32, vl);
+                __riscv_vse32_v_f32m1(c_ptr + m * ldc, vt, vl);
             }
         }
     }

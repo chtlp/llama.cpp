@@ -2022,6 +2022,10 @@ class tensor_traits_common : public ggml::spacemit::tensor_traits_base {
             return true;
         }
 
+        if (use_tiled && spacemit_kernels::rvv::forward_flash_attn_ext_f16_tiled_vlen1024_ime2(ctx, dst)) {
+            return true;
+        }
+
         int64_t nchunk = nth;
 
         // The number of elements in each chunk

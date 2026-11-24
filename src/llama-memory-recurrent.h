@@ -180,6 +180,7 @@ public:
     uint32_t get_head() const;
     int32_t  get_rs_z() const;
     uint32_t get_size() const;
+    bool     get_is_full() const { return is_full; }
 
     ggml_tensor * get_r_l(int32_t il) const;
     ggml_tensor * get_s_l(int32_t il) const;

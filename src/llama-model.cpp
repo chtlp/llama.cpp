@@ -3676,6 +3676,18 @@ int32_t llama_model_n_swa(const llama_model * model) {
     return model->hparams.n_swa;
 }
 
+bool llama_model_is_swa_all(const llama_model * model) {
+    if (llama_model_n_swa(model) <= 0 || model->hparams.n_layer() == 0) {
+        return false;
+    }
+    for (uint32_t il = 0; il < model->hparams.n_layer(); ++il) {
+        if (!model->hparams.is_swa(il)) {
+            return false;
+        }
+    }
+    return true;
+}
+
 
 uint32_t llama_model_n_cls_out(const struct llama_model * model) {
     return model->hparams.n_cls_out;

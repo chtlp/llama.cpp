@@ -4828,6 +4828,16 @@ private:
         //       for now, always re-evaluate for simplicity
         //       ref: https://github.com/ggml-org/llama.cpp/pull/22728#issuecomment-4400925384
         if (spec) {
+            for (const auto & slot : slots) {
+                llama_pos end_pos = -1;
+                if (slot.state == SLOT_STATE_PROCESSING_PROMPT && slot.task && slot.can_speculate()) {
+                    const int64_t rem = (int64_t) slot.task->n_tokens() - (int64_t) slot.prompt.n_tokens();
+                    if (rem > 0) {
+                        end_pos = slot.prompt.tokens.pos_next() + (llama_pos) rem - 1;
+                    }
+                }
+                common_speculative_set_prompt_end(spec.get(), slot.id, end_pos);
+            }
             bool ok = true;
             queue_tasks.yield_to_queue([&]() {
                 ok = common_speculative_process(spec.get(), batch.view);

@@ -47,6 +47,9 @@ struct spacemit_opt_flags {
     bool    gdn_mtp         = true;
     bool    fa_splitkv      = true;
     int64_t fa_ime2_min_q   = 16;
+    bool    fa_m1_ime2      = true;
+    bool    fa_ime2_stage   = true;
+    bool    fa_prefill_ime2 = true;
     bool    fa_tiled_nozero = true;
     bool    mtp_head_q4     = true;
     int64_t mtp_head_vocab  = 0;
@@ -73,6 +76,9 @@ struct spacemit_opt_flags {
         gdn_mtp         = read_env_bool("GGML_SPACEMIT_GDN_MTP", true);
         fa_splitkv      = read_env_bool("GGML_SPACEMIT_FA_SPLITKV_PAIR", true);
         fa_ime2_min_q   = read_env_i64("GGML_SPACEMIT_FA_IME2_MIN_Q", 16);
+        fa_m1_ime2      = read_env_bool("GGML_SPACEMIT_FA_M1_IME2", true);
+        fa_ime2_stage   = read_env_bool("GGML_SPACEMIT_FA_IME2_STAGE", true);
+        fa_prefill_ime2 = read_env_bool("GGML_SPACEMIT_FA_PREFILL_IME2", true);
         fa_tiled_nozero = read_env_bool("GGML_SPACEMIT_FA_TILED_NOZERO", true);
         mtp_head_q4     = read_env_bool("GGML_SPACEMIT_MTP_HEAD_Q4", true);
         mtp_head_vocab  = read_env_i64("GGML_SPACEMIT_MTP_HEAD_VOCAB", 0);

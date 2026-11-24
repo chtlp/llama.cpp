@@ -212,6 +212,9 @@ struct common_speculative_impl {
 
     virtual void accept(llama_seq_id seq_id, uint16_t n_accepted, bool is_other) = 0;
 
+    // (optional) hint the final prompt position during multi-batch prefill (end_pos < 0 clears)
+    virtual void set_prompt_end(llama_seq_id /*seq_id*/, llama_pos /*end_pos*/) {}
+
     // (optional) serialize/restore per-seq internal state (e.g. eagle3's deferred boundary).
     virtual bool get_state(llama_seq_id /*seq_id*/, std::vector<uint8_t> & /*data*/) const { return false; }
     virtual void set_state(llama_seq_id /*seq_id*/, const std::vector<uint8_t> & /*data*/) {}
@@ -1010,6 +1013,11 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
     // inject target features from the target's device buffer instead of host copies (env LLAMA_DFLASH_DEV=0 disables)
     bool use_dev_features = false;
 
+    // skip prefill KV injection for positions strictly outside an all-SWA draft's sliding window
+    // (env LLAMA_DFLASH_SWA_PRUNE=0 disables)
+    int32_t                n_swa_prune = 0;
+    std::vector<llama_pos> prompt_end_pos;
+
     common_speculative_impl_draft_dflash(const common_params_speculative & params, uint32_t n_seq)
         : common_speculative_impl_draft_dflash(params, n_seq, COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH)
     {
@@ -1138,6 +1146,16 @@ protected:
 
         llama_set_embeddings_nextn(ctx_dft, true, opt.nextn_masked);
         llama_set_causal_attn(ctx_dft, causal_attn); // DFlash needs non-causal attention unless the model says otherwise
+
+        prompt_end_pos.assign(n_seq, -1);
+        {
+            const char * env = getenv("LLAMA_DFLASH_SWA_PRUNE");
+            const bool allow = (env == nullptr || atoi(env) != 0);
+            if (allow && opt.dev_features && llama_model_is_swa_all(model_dft)) {
+                n_swa_prune = llama_model_n_swa(model_dft);
+                LOG_INF("%s: DFlash prefill SWA pruning enabled (n_swa=%d)\n", __func__, n_swa_prune);
+            }
+        }
     }
 
     // only LiliCorr uses this, to keep the context features for its scorer; the other heads only need the KV cache
@@ -1159,10 +1177,17 @@ public:
         backend_chains.clear();
     }
 
+    void set_prompt_end(llama_seq_id seq_id, llama_pos end_pos) override {
+        if (seq_id >= 0 && seq_id < (llama_seq_id) prompt_end_pos.size()) {
+            prompt_end_pos[seq_id] = end_pos;
+        }
+    }
+
     void begin(llama_seq_id seq_id, const llama_tokens & prompt) override {
         if (seq_id < 0 || seq_id >= (llama_seq_id) n_seq) {
             return;
         }
+        prompt_end_pos[seq_id] = -1;
 
         const int32_t N = (int32_t) prompt.size();
         if (N <= 0) {
@@ -1217,11 +1242,26 @@ public:
             if (i_batch_beg[seq_id] < 0) {
                 continue;
             }
-            const int32_t n_rows = i_batch_end[seq_id] - i_batch_beg[seq_id] + 1;
+            int32_t seq_beg = i_batch_beg[seq_id];
+            const int32_t seq_end = i_batch_end[seq_id];
+
+            // All-SWA draft prefill pruning: tokens with pos < end_pos - n_swa will be evicted before
+            // drafting starts at end_pos + 1, so skip injecting them (exact 1-token safety margin).
+            if (n_swa_prune > 0 && seq_id < (llama_seq_id) prompt_end_pos.size() && prompt_end_pos[seq_id] >= 0) {
+                const llama_pos keep_from = prompt_end_pos[seq_id] - (llama_pos) n_swa_prune;
+                while (seq_beg <= seq_end && batch_in.tokens[seq_beg].pos[0] < keep_from) {
+                    ++seq_beg;
+                }
+                if (seq_beg > seq_end) {
+                    continue;
+                }
+            }
+
+            const int32_t n_rows = seq_end - seq_beg + 1;
 
             // an M-RoPE image pins all its rows to one position, so a windowed draft
             // cache cannot free cells for it - skip it, the draft can jump over the gap
-            const bool pos_pinned = batch_in.tokens[i_batch_beg[seq_id]].pos[0] == batch_in.tokens[i_batch_end[seq_id]].pos[0];
+            const bool pos_pinned = batch_in.tokens[seq_beg].pos[0] == batch_in.tokens[seq_end].pos[0];
             if (has_embeddings && n_rows > 1 && pos_pinned) {
                 continue;
             }
@@ -1233,7 +1273,7 @@ public:
                     // the features are the target batch rows in the target's device buffer
                     batch_inject.clear();
                     for (int32_t i = 0; i < n_chunk; ++i) {
-                        const int32_t   row        = i_batch_beg[seq_id] + offset + i;
+                        const int32_t   row        = seq_beg + offset + i;
                         const llama_pos p          = batch_in.tokens[row].pos[0];
                         const llama_pos pos_arr[4] = { p, p, p, 0 };
                         batch_inject.add_embd_row(row, pos_arr, seq_id, false);
@@ -1258,14 +1298,14 @@ public:
                     }
                     for (int32_t i = 0; i < n_chunk; ++i) {
                         float       * dst = features_buf.data() + (size_t) i * n_embd_enc + k * (size_t) n_embd_tgt;
-                        const float * src = layer + (size_t) (i_batch_beg[seq_id] + offset + i) * n_embd_tgt;
+                        const float * src = layer + (size_t) (seq_beg + offset + i) * n_embd_tgt;
                         std::memcpy(dst, src, (size_t) n_embd_tgt * sizeof(float));
                     }
                 }
 
                 batch_inject.clear();
                 for (int32_t i = 0; i < n_chunk; ++i) {
-                    const llama_pos p = batch_in.tokens[i_batch_beg[seq_id] + offset + i].pos[0];
+                    const llama_pos p = batch_in.tokens[seq_beg + offset + i].pos[0];
                     const llama_pos pos_arr[4] = { p, p, p, 0 };
                     batch_inject.add_embd({ features_buf.data() + (size_t) i * n_embd_enc, 1, (size_t) n_embd_enc }, pos_arr, seq_id, false);
                 }
@@ -3477,6 +3517,16 @@ void common_speculative_begin(common_speculative * spec, llama_seq_id seq_id, co
         common_time_meas tm(impl->t_begin_us, !impl->gen_perf);
         impl->begin(seq_id, prompt);
         impl->n_call_begin++;
+    }
+}
+
+void common_speculative_set_prompt_end(common_speculative * spec, llama_seq_id seq_id, llama_pos end_pos) {
+    if (spec == nullptr) {
+        return;
+    }
+
+    for (auto & impl : spec->impls) {
+        impl->set_prompt_end(seq_id, end_pos);
     }
 }
 
