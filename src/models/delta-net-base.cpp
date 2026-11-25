@@ -95,11 +95,11 @@ ggml_tensor * llm_build_delta_net_base::build_recurrent_attn(
     const int64_t n_seqs       = s->ne[3];
     const int64_t n_seq_tokens = q->ne[2];
 
-    // llama_memory_recurrent only guarantees rollback snapshots when n_seq_tokens <= n_rs_seq + 1
-    // (longer prefill ubatches set rs_max = 0 and only read slot 0). Keep K snapshots during
-    // sched_reserve (get_is_full() == true) so gdn_out reserves enough space for verification batches.
+    // llama_memory_recurrent only guarantees rollback snapshots when 1 < n_seq_tokens <= n_rs_seq + 1
+    // (single-token decode only uses slot 0, and longer prefill ubatches set rs_max = 0). Keep K
+    // snapshots during sched_reserve (get_is_full() == true) so gdn_out reserves enough space.
     const bool keep = cparams.n_rs_seq > 0 &&
-                      (mctx_cur->get_is_full() || n_seq_tokens <= (int64_t) cparams.n_rs_seq + 1);
+                      (mctx_cur->get_is_full() || (n_seq_tokens > 1 && n_seq_tokens <= (int64_t) cparams.n_rs_seq + 1));
 
     if (!keep) {
         auto attn_out = build_delta_net(q, k, v, g, b, s);

@@ -1543,6 +1543,51 @@ struct common_speculative_impl_draft_dflash2 final : public common_speculative_i
     std::vector<std::mt19937> dflash2_rng;
     std::vector<int64_t>      dflash2_seed;
 
+    // P2-a: K3 cost-model adaptive n_max ({0, 3, n_max}) + lattice confidence prefix selection.
+    // Controlled by LLAMA_DFLASH2_ADAPTIVE (default: enabled when n_max >= 3; set 0 to disable).
+    bool adaptive_enabled = false;
+    int32_t adaptive_cooldown_steps = 6;
+
+    struct AdaptiveState {
+        int32_t cur_block       = 3;
+        int32_t last_submitted  = 0;
+        int32_t cooldown_left   = 0;
+        int32_t full3_streak    = 0;
+        int32_t low_streak      = 0;
+        int32_t trunc_n7_streak = 0;
+        int32_t steps_in_state  = 0;
+        float   ema_tau_n3      = 2.8f;
+        float   ema_tau_n7      = 5.2f;
+        float   ema_p_scale     = 0.90f;
+        float   ema_tps         = 0.010f; // rolling steady-state tokens / ms
+        float   last_exp_acc    = 0.0f;
+        float   last_step_ms    = 260.0f;
+        // per-request diagnostic counters
+        uint64_t cnt_cool       = 0;
+        uint64_t cnt_bail0      = 0;
+        uint64_t cnt_k3         = 0;
+        uint64_t cnt_k7         = 0;
+    };
+    std::vector<AdaptiveState> adaptive;
+
+    static float k3_verify_ms(int32_t k, float ctx_k) {
+        if (k <= 0) {
+            return 101.0f + 0.95f * ctx_k;
+        }
+        if (k <= 3) {
+            return 228.0f + 1.90f * ctx_k;
+        }
+        return 370.0f + 2.70f * ctx_k;
+    }
+
+    static float k3_draft_ms(int32_t n_block, float ctx_k) {
+        const float sw_k = std::min(ctx_k, 2.0f);
+        if (n_block <= 3) {
+            return 28.0f + 7.0f * sw_k;
+        }
+        return 39.0f + 8.5f * sw_k;
+    }
+
     common_speculative_impl_draft_dflash2(const common_params_speculative & params, uint32_t n_seq)
         : common_speculative_impl_draft_dflash(params, n_seq, COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH2)
     {
@@ -1557,15 +1602,111 @@ struct common_speculative_impl_draft_dflash2 final : public common_speculative_i
             /* .dev_features     = */ true,
             /* .nextn_masked     = */ false,
         });
+
+        const char * env_adapt = std::getenv("LLAMA_DFLASH2_ADAPTIVE");
+        adaptive_enabled = (this->params.n_max >= 3) && (!env_adapt || std::atoi(env_adapt) != 0);
+        if (const char * env_cool = std::getenv("LLAMA_DFLASH2_COOLDOWN")) {
+            adaptive_cooldown_steps = std::max(0, std::atoi(env_cool));
+        }
+        adaptive.resize(n_seq);
+        if (adaptive_enabled) {
+            LOG_INF("%s: DFlash2 adaptive n_max enabled (n_max=%d, sweet_spots={0,3,%d}, cooldown=%d)\n",
+                    __func__, this->params.n_max, this->params.n_max, adaptive_cooldown_steps);
+        }
+    }
+
+    void log_adaptive_stats(llama_seq_id seq_id) const {
+        if (!adaptive_enabled || seq_id < 0 || seq_id >= (llama_seq_id) adaptive.size()) {
+            return;
+        }
+        const auto & st = adaptive[seq_id];
+        const uint64_t total = st.cnt_cool + st.cnt_bail0 + st.cnt_k3 + st.cnt_k7;
+        if (total > 0) {
+            LOG_INF("dflash2_adaptive: seq=%d steps=%llu (cool=%llu bail0=%llu k3=%llu k7=%llu) p_scale=%.3f ema_tps=%.2f\n",
+                    (int) seq_id, (unsigned long long) total,
+                    (unsigned long long) st.cnt_cool, (unsigned long long) st.cnt_bail0,
+                    (unsigned long long) st.cnt_k3, (unsigned long long) st.cnt_k7,
+                    st.ema_p_scale, st.ema_tps * 1000.0f);
+        }
+    }
+
+    ~common_speculative_impl_draft_dflash2() override {
+        for (llama_seq_id s = 0; s < (llama_seq_id) adaptive.size(); ++s) {
+            log_adaptive_stats(s);
+        }
     }
 
     void begin(llama_seq_id seq_id, const llama_tokens & prompt) override {
         if (seq_id >= 0 && seq_id < (llama_seq_id) n_seq) {
             // reseed per request rather than per round, or two identical requests differ
             dflash2_seed[seq_id] = -1;
+            log_adaptive_stats(seq_id);
+            auto & st = adaptive[seq_id];
+            st = AdaptiveState{};
+            st.cur_block = std::min<int32_t>(params.n_max, 3);
         }
 
         common_speculative_impl_draft_dflash::begin(seq_id, prompt);
+    }
+
+    void accept(llama_seq_id seq_id, uint16_t n_accepted, bool /*is_other*/) override {
+        if (!adaptive_enabled || seq_id < 0 || seq_id >= (llama_seq_id) adaptive.size()) {
+            return;
+        }
+        auto & st = adaptive[seq_id];
+        if (st.last_submitted <= 0) {
+            return;
+        }
+
+        const float tau_obs = 1.0f + (float) n_accepted;
+        if (st.last_step_ms > 1.0f) {
+            const float step_tps = tau_obs / st.last_step_ms;
+            st.ema_tps = 0.80f * st.ema_tps + 0.20f * step_tps;
+        }
+
+        if (st.last_exp_acc > 0.25f) {
+            const float ratio = std::max(0.55f, std::min(1.12f,
+                    ((float) n_accepted + 0.20f) / (st.last_exp_acc + 0.20f)));
+            st.ema_p_scale = 0.85f * st.ema_p_scale + 0.15f * ratio;
+        }
+
+        st.steps_in_state++;
+
+        if (st.last_submitted <= 3) {
+            st.ema_tau_n3 = 0.72f * st.ema_tau_n3 + 0.28f * tau_obs;
+            if ((int32_t) n_accepted >= st.last_submitted) {
+                st.full3_streak++;
+                st.low_streak = 0;
+            } else {
+                st.full3_streak = 0;
+                if (n_accepted <= 1) {
+                    st.low_streak++;
+                } else {
+                    st.low_streak = 0;
+                }
+            }
+
+            if (params.n_max > 3 && (st.full3_streak >= 2 || st.ema_tau_n3 >= 3.55f)) {
+                st.cur_block       = params.n_max;
+                st.full3_streak    = 0;
+                st.trunc_n7_streak = 0;
+                st.steps_in_state  = 0;
+            } else if (adaptive_cooldown_steps > 0 &&
+                       (st.low_streak >= 3 || (st.steps_in_state >= 4 && st.ema_tau_n3 < 2.25f))) {
+                st.cooldown_left  = adaptive_cooldown_steps;
+                st.low_streak     = 0;
+                st.ema_tau_n3     = 2.65f;
+                st.steps_in_state = 0;
+            }
+        } else {
+            st.ema_tau_n7 = 0.72f * st.ema_tau_n7 + 0.28f * tau_obs;
+            if (n_accepted <= 2 || (st.steps_in_state >= 2 && st.ema_tau_n7 < 4.45f)) {
+                st.cur_block       = std::min<int32_t>(params.n_max, 3);
+                st.full3_streak    = 0;
+                st.trunc_n7_streak = 0;
+                st.steps_in_state  = 0;
+            }
+        }
     }
 
     void draft(common_speculative_draft_params_vec & dparams) override {
@@ -1584,11 +1725,23 @@ struct common_speculative_impl_draft_dflash2 final : public common_speculative_i
                 continue;
             }
 
+            if (adaptive_enabled) {
+                auto & st = adaptive[seq_id];
+                if (st.cooldown_left > 0) {
+                    st.cooldown_left--;
+                    st.last_submitted = 0;
+                    st.cnt_cool++;
+                    continue;
+                }
+            }
+
             common_sampler_reset(smpls[seq_id].get());
 
             const int32_t n = (int32_t) dp.pos0;
 
-            const int32_t n_draft = params.n_max;
+            const int32_t n_draft = adaptive_enabled
+                    ? std::min<int32_t>(params.n_max, adaptive[seq_id].cur_block)
+                    : params.n_max;
             const int32_t n_block_tokens = n_draft + 1;
             i_block_beg[seq_id] = batch.size();
             n_block    [seq_id] = n_block_tokens;
@@ -1636,6 +1789,10 @@ struct common_speculative_impl_draft_dflash2 final : public common_speculative_i
 
             std::vector<float>   probs;
             std::vector<int32_t> sorted_idx;
+            std::vector<float>   cand_p;
+            if (adaptive_enabled && !sample) {
+                cand_p.reserve(n_block_tokens - 1);
+            }
 
             int32_t predecessor = 0;
             for (int32_t i = 1; i < n_block_tokens; ++i) {
@@ -1645,7 +1802,9 @@ struct common_speculative_impl_draft_dflash2 final : public common_speculative_i
 
                 predecessor = (int32_t) std::distance(scores,
                         std::max_element(scores, scores + top_k));
-                if (params.p_min > 0.0f || sample) {
+                const bool need_prob = params.p_min > 0.0f || sample || (adaptive_enabled && !sample);
+                float p_top1 = 1.0f;
+                if (need_prob) {
                     // softmax(scores / temp) at the argmax, i.e. 1 / sum(exp((s_k - s_max) / temp))
                     probs.resize(top_k);
                     float sum = 0.0f;
@@ -1653,11 +1812,14 @@ struct common_speculative_impl_draft_dflash2 final : public common_speculative_i
                         probs[k] = std::exp((scores[k] - scores[predecessor]) / temp);
                         sum += probs[k];
                     }
-                    if (1.0f / sum < params.p_min) {
+                    p_top1 = 1.0f / sum;
+                    if (params.p_min > 0.0f && p_top1 < params.p_min) {
                         break;
                     }
-                    for (int32_t k = 0; k < top_k; ++k) {
-                        probs[k] /= sum;
+                    if (sample) {
+                        for (int32_t k = 0; k < top_k; ++k) {
+                            probs[k] /= sum;
+                        }
                     }
                 }
                 if (sample) {
@@ -1685,6 +1847,88 @@ struct common_speculative_impl_draft_dflash2 final : public common_speculative_i
                     }
                 }
                 result.push_back((llama_token) row[predecessor]);
+                if (adaptive_enabled && !sample) {
+                    cand_p.push_back(p_top1);
+                }
+            }
+
+            if (adaptive_enabled && !sample) {
+                auto & st = adaptive[seq_id];
+                const int32_t n_cand = (int32_t) result.size();
+                const float   ctx_k  = (float) dp.pos0 * 0.001f;
+                const float   t_v0   = k3_verify_ms(0, ctx_k);
+                const float   lam_base = 1.0f / t_v0;
+                const float   lam_ref  = std::max(lam_base, st.ema_tps);
+
+                // Compute calibrated expected accepted draft tokens E[acc(k)] for k = 0..n_cand
+                float exp_acc[16] = {};
+                float prod = 1.0f;
+                for (int32_t j = 1; j <= n_cand && j < 16; ++j) {
+                    const float p_hat = std::min(1.0f, st.ema_p_scale * cand_p[j - 1]);
+                    prod *= p_hat;
+                    exp_acc[j] = exp_acc[j - 1] + prod;
+                }
+
+                // Evaluate K3 hardware sweet spots: k in {0, min(3, n_cand), n_cand}
+                // Maximize renewal-reward surplus: (1 + E[acc(k)]) - lam_ref * T_verify(k, ctx_k)
+                int32_t cand_ks[3];
+                int32_t n_ks = 0;
+                cand_ks[n_ks++] = 0;
+                if (n_cand >= 3) {
+                    cand_ks[n_ks++] = 3;
+                }
+                if (n_cand > 0 && (n_ks == 1 || cand_ks[n_ks - 1] != n_cand)) {
+                    cand_ks[n_ks++] = n_cand;
+                }
+
+                int32_t best_k     = 0;
+                float   best_score = 1.0f - lam_ref * t_v0;
+                for (int32_t ci = 1; ci < n_ks; ++ci) {
+                    const int32_t k = cand_ks[ci];
+                    if (k < params.n_min) {
+                        continue;
+                    }
+                    const float score = (1.0f + exp_acc[k]) - lam_ref * k3_verify_ms(k, ctx_k);
+                    if (score > best_score) {
+                        best_score = score;
+                        best_k     = k;
+                    }
+                }
+
+                if (best_k < n_cand) {
+                    result.resize(best_k);
+                }
+
+                const float d_ms = k3_draft_ms(n_block_tokens - 1, ctx_k);
+                st.last_submitted = best_k;
+                st.last_exp_acc   = exp_acc[best_k];
+                st.last_step_ms   = d_ms + k3_verify_ms(best_k, ctx_k);
+
+                if (best_k == 0) {
+                    st.cnt_bail0++;
+                    st.full3_streak = 0;
+                    st.low_streak++;
+                    if (st.cur_block > 3) {
+                        st.cur_block = std::min<int32_t>(params.n_max, 3);
+                        st.trunc_n7_streak = 0;
+                    }
+                    if (adaptive_cooldown_steps > 0 && st.low_streak >= 3) {
+                        st.cooldown_left = adaptive_cooldown_steps;
+                        st.low_streak    = 0;
+                    }
+                } else if (best_k <= 3) {
+                    st.cnt_k3++;
+                    if (st.cur_block > 3) {
+                        st.trunc_n7_streak++;
+                        if (st.trunc_n7_streak >= 2) {
+                            st.cur_block = std::min<int32_t>(params.n_max, 3);
+                            st.trunc_n7_streak = 0;
+                        }
+                    }
+                } else {
+                    st.cnt_k7++;
+                    st.trunc_n7_streak = 0;
+                }
             }
 
             if (result.size() < (size_t) params.n_min) {
